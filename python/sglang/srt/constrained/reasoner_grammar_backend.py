@@ -168,6 +168,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
             else:
                 row.fill_(-1)
             return
+        if self.grammar.is_terminated():
+            row = vocab_mask[idx]
+            if row.dtype == torch.bool:
+                row.fill_(True)
+            else:
+                row.zero_()
+            return
         self.grammar.fill_vocab_mask(vocab_mask, idx)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -201,6 +208,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
             for entry in self._history
         ]
         return copied
+
+    def is_terminated(self):
+        return self.grammar.is_terminated()
 
     @property
     def finished(self):
