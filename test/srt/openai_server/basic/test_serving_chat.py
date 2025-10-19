@@ -18,6 +18,7 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ResponseFormat,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -124,6 +125,65 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
+
+    def test_glm45_structured_output_default_reasoning(self):
+        """GLM-4.5 should force reasoning even without explicit enable_thinking flag."""
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.chat.reasoning_parser = "glm45"
+
+        req = ChatCompletionRequest(
+            model="glm-test",
+            messages=[{"role": "user", "content": "Hi?"}],
+            response_format=ResponseFormat(type="json_object"),
+            separate_reasoning=True,
+        )
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                prompt="Prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        custom_params = adapted.sampling_params.get("custom_params", {})
+        self.assertTrue(
+            custom_params.get("reasoning_initial_in_reasoning"),
+            "reasoning_initial_in_reasoning should default to True for glm45 structured output",
+        )
+
+    def test_glm45_structured_output_respects_disable_reasoning(self):
+        """Explicitly disabling thinking should skip forcing reasoning for GLM-4.5."""
+        self.tm.server_args.reasoning_parser = "glm45"
+        self.chat.reasoning_parser = "glm45"
+
+        req = ChatCompletionRequest(
+            model="glm-test",
+            messages=[{"role": "user", "content": "Hi?"}],
+            response_format=ResponseFormat(type="json_object"),
+            separate_reasoning=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                prompt="Prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        custom_params = adapted.sampling_params.get("custom_params")
+        if custom_params is not None:
+            self.assertNotIn("reasoning_initial_in_reasoning", custom_params)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.

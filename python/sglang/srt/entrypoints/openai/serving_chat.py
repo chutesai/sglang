@@ -1056,16 +1056,30 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The boolean value of 'enable_thinking' if found, otherwise False.
         """
-        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
-            # For Qwen3 models, `enable_thinking` is supported.
+        chat_template_kwargs = (
+            request.chat_template_kwargs
+            if hasattr(request, "chat_template_kwargs")
+            else None
+        )
+        default_enable_thinking = False
+
+        # GLM-4.5/4.6 templates emit thinking tags by default, so honor that unless
+        # the user explicitly disables it.
+        if self.reasoning_parser in {"glm45"}:
+            default_enable_thinking = True
+
+        if chat_template_kwargs:
+            # For Qwen3/GLM models, `enable_thinking` controls reasoning.
             if self.reasoning_parser in ["qwen3", "glm45"]:
-                return request.chat_template_kwargs.get("enable_thinking", False)
+                return chat_template_kwargs.get(
+                    "enable_thinking", default_enable_thinking
+                )
             # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif self.reasoning_parser in ["deepseek-v3"]:
-                return request.chat_template_kwargs.get("thinking", False)
-            else:
-                return False
-        return False
+            if self.reasoning_parser in ["deepseek-v3"]:
+                return chat_template_kwargs.get("thinking", default_enable_thinking)
+            return default_enable_thinking
+
+        return default_enable_thinking
 
     async def _process_tool_call_stream(
         self,
