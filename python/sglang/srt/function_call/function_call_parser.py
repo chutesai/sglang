@@ -1,10 +1,11 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
-    StructuralTagResponseFormat,
+    LegacyStructuralTagResponseFormat,
     StructuresResponseFormat,
     Tool,
+    ToolCallConstraint,
     ToolChoice,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -55,7 +56,6 @@ class FunctionCallParser:
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detector: Type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             detector = detector_class()
@@ -127,7 +127,7 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> StructuralTagResponseFormat:
+    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
 
@@ -155,7 +155,9 @@ class FunctionCallParser:
             )
             tool_trigger_set.add(info.trigger)
 
-        return StructuralTagResponseFormat(
+        # TODO(dark): move this into new structural tag format
+        # This requires all grammar backend support the new format
+        return LegacyStructuralTagResponseFormat(
             type="structural_tag",
             structures=tool_structures,
             triggers=list(tool_trigger_set),
@@ -163,7 +165,7 @@ class FunctionCallParser:
 
     def get_structure_constraint(
         self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
-    ) -> Optional[Tuple[str, Any]]:
+    ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
         The constraint is used to guide the model's output format.
@@ -180,16 +182,17 @@ class FunctionCallParser:
         if self.detector.supports_structural_tag() and tool_choice == "auto":
             structural_tag = self.get_structure_tag()
             return ("structural_tag", structural_tag)
-        elif (
-            tool_choice == "required"
-            or isinstance(tool_choice, ToolChoice)
-            or (tool_choice == "auto" and isinstance(self.detector, LongCatDetector))
-        ):
+        elif isinstance(self.detector, LongCatDetector):
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            if not json_schema:
+                ebnf = self.get_ebnf(tool_choice)
+                if ebnf:
+                    return ("ebnf", ebnf)
             return ("json_schema", json_schema)
+
 
     def get_ebnf(
         self, tool_choice: Union[ToolChoice, Literal["required"]]
