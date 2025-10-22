@@ -18,7 +18,11 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
+from .base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
+    BaseGrammarBackend,
+    BaseGrammarObject,
+)
 
 
 @dataclass
@@ -260,12 +264,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.think_start_ids = list(think_start_ids or [])
         self.initial_in_reasoning = initial_in_reasoning
 
-    def _init_value_dispatch(
-        self, key: Tuple[str, str]
-    ) -> Optional[ReasonerGrammarObject]:
+    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
         ret = self.grammar_backend._init_value_dispatch(key)
-        if ret is None:
-            return None
+        if ret is None or ret is INVALID_GRAMMAR_OBJ:
+            return ret
         if not self.think_end_ids:
             return ret
         return ReasonerGrammarObject(

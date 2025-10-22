@@ -142,6 +142,7 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
@@ -227,6 +228,14 @@ class Envs:
     # VLM
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+
+    # Ktransformers
+    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
+    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
+    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
+    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
+    SGLANG_KT_AMX_METHOD = EnvStr(None)
+    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
 
     # fmt: on
 
