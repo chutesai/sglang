@@ -77,6 +77,34 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def local_or_cached_path(filename: str, repo_id: str, revision: str | None = None, token: str | None = None) -> str | None:
+    if os.path.exists(repo_id):
+        return os.path.join(repo_id, filename)
+    try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import LocalEntryNotFoundError
+    except Exception:
+        return False
+    try:
+        base_dir = snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            local_files_only=True,
+            token=token,
+        )
+        if base_dir is not None:
+            return os.path.join(base_dir, filename)
+        return None
+    except Exception as e:
+        try:
+            if isinstance(e, LocalEntryNotFoundError):
+                return None
+        except Exception:
+            pass
+        logger.debug(f"snapshot_download(local_files_only=True) failed for {repo_id}@{revision}: {e}")
+    return None
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -491,14 +519,12 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
-            is_local = os.path.exists(self.model_path)
-            if not is_local:
-                import huggingface_hub
-
+            target_path = local_or_cached_path("hf_quant_config.json", self.model_path, self.revision)
+            if target_path is None:
                 try:
                     from huggingface_hub import HfApi, hf_hub_download
-
                     hf_api = HfApi()
+
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(
@@ -526,11 +552,8 @@ class ModelConfig:
                     logger.warning(
                         f"Failed to check hf_quant_config.json: {self.model_path} {e}"
                     )
-            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_config_file = os.path.join(
-                    self.model_path, "hf_quant_config.json"
-                )
-                with open(quant_config_file) as f:
+            elif os.path.exists(target_path):
+                with open(target_path) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
@@ -925,6 +948,7 @@ multimodal_model_archs = [
 
 
 def is_multimodal_model(model_architectures: List[str]):
+
     if any(
         multi_model_arch in model_architectures
         for multi_model_arch in multimodal_model_archs
@@ -969,6 +993,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
 
 
 def is_hybrid_model(
