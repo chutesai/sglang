@@ -1343,6 +1343,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             BatchTokenIDOutput,
         ],
     ):
+        hs_iter = None
+        if getattr(recv_obj, "output_hidden_states", None):
+            hs_iter = iter(recv_obj.output_hidden_states)
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1379,8 +1383,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     }
                 )
 
-            if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+            if hs_iter is not None and getattr(state.obj, "return_hidden_states", False):
+                try:
+                    meta_info["hidden_states"] = next(hs_iter)
+                except StopIteration:
+                    logger.warning(
+                        "Hidden-states iterator exhausted before rids ended; "
+                        "some requests asked for hidden states but none were available."
+                    )
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
