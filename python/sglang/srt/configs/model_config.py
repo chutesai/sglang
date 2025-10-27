@@ -636,6 +636,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "auto-round",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -937,12 +938,13 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
-    "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
+    "NVILAForConditionalGeneration",
+    "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
 ]
 
