@@ -29,7 +29,7 @@ dependencies = [
   "flashinfer_python==0.4.1",
   "gguf",
   "hf_transfer",
-  "huggingface_hub",
+  "huggingface_hub<1.0",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
