@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 JINJA2_EXCEPTIONS = (
-    TypError,
+    TypeError,
     jinja2.exceptions.TemplateError,
     jinja2.exceptions.TemplateNotFound,
     jinja2.exceptions.TemplatesNotFound,
