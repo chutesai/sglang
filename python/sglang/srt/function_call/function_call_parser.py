@@ -195,7 +195,6 @@ class FunctionCallParser:
                     return ("ebnf", ebnf)
             return ("json_schema", json_schema)
 
-
     def get_ebnf(
         self, tool_choice: Union[ToolChoice, Literal["required"]]
     ) -> Optional[str]:

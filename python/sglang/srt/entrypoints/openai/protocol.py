@@ -37,7 +37,11 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
 
 from sglang.srt.entrypoints.openai.json_schema_utils import normalize_json_schema
 from sglang.utils import convert_json_schema_to_str
@@ -55,6 +59,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    parent: Optional[str] = None
     max_model_len: Optional[int] = None
 
 
@@ -109,6 +114,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):

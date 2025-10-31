@@ -77,7 +77,9 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-def local_or_cached_path(filename: str, repo_id: str, revision: str | None = None, token: str | None = None) -> str | None:
+def local_or_cached_path(
+    filename: str, repo_id: str, revision: str | None = None, token: str | None = None
+) -> str | None:
     if os.path.exists(repo_id):
         return os.path.join(repo_id, filename)
     try:
@@ -101,7 +103,9 @@ def local_or_cached_path(filename: str, repo_id: str, revision: str | None = Non
                 return None
         except Exception:
             pass
-        logger.debug(f"snapshot_download(local_files_only=True) failed for {repo_id}@{revision}: {e}")
+        logger.debug(
+            f"snapshot_download(local_files_only=True) failed for {repo_id}@{revision}: {e}"
+        )
     return None
 
 
@@ -232,6 +236,14 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
+
+        # matryoshka embeddings
+        self.matryoshka_dimensions = getattr(
+            self.hf_config, "matryoshka_dimensions", None
+        )
+        self.is_matryoshka = self.matryoshka_dimensions or getattr(
+            self.hf_config, "is_matryoshka", False
+        )
 
     @staticmethod
     def from_server_args(
@@ -519,10 +531,13 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
-            target_path = local_or_cached_path("hf_quant_config.json", self.model_path, self.revision)
+            target_path = local_or_cached_path(
+                "hf_quant_config.json", self.model_path, self.revision
+            )
             if target_path is None:
                 try:
                     from huggingface_hub import HfApi, hf_hub_download
+
                     hf_api = HfApi()
 
                     # Retry HF API call up to 3 times
@@ -544,10 +559,6 @@ class ModelConfig:
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
-                except huggingface_hub.errors.OfflineModeIsEnabled:
-                    logger.warning(
-                        "Offline mode is enabled, skipping hf_quant_config.json check"
-                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to check hf_quant_config.json: {self.model_path} {e}"
@@ -605,14 +616,20 @@ class ModelConfig:
             return
 
         # Check if ModelOpt quantization is specified
-        modelopt_quantization_specified = self.quantization in [
+        _MODELOPT_QUANTIZATION_METHODS = [
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
         ]
+        modelopt_quantization_specified = (
+            self.quantization in _MODELOPT_QUANTIZATION_METHODS
+        )
 
         if not modelopt_quantization_specified:
-            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+            raise ValueError(
+                "quantize_and_serve requires ModelOpt quantization (set with --quantization "
+                f"{{{', '.join(sorted(_MODELOPT_QUANTIZATION_METHODS))}}})"
+            )
 
         # quantize_and_serve is disabled due to compatibility issues
         raise NotImplementedError(
@@ -658,6 +675,7 @@ class ModelConfig:
             "petit_nvfp4",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -995,7 +1013,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
-
 
 
 def is_hybrid_model(
