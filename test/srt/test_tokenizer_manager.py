@@ -15,7 +15,9 @@ import unittest
 from typing import List, Optional, Union
 from unittest.mock import Mock, patch
 
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -272,6 +274,61 @@ class TestTokenizerResultExtraction(unittest.TestCase):
 
         self.assertEqual(result_input_ids, [101, 2129, 102])
         self.assertIsNone(result_token_type_ids)
+
+
+class TestMaxCompletionTokensCap(unittest.TestCase):
+    """Tests for the --max-completion-tokens enforcement helpers."""
+
+    def setUp(self):
+        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+            self.server_args = ServerArgs(
+                model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                max_completion_tokens=32,
+            )
+            self.port_args = PortArgs.init_new(self.server_args)
+
+        with patch("zmq.asyncio.Context"), patch(
+            "sglang.srt.utils.get_zmq_socket"
+        ), patch(
+            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+        ) as mock_tokenizer:
+            mock_tokenizer.return_value = Mock(vocab_size=32000)
+            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+
+    def test_request_dict_is_capped(self):
+        req = GenerateReqInput(
+            text="hi",
+            sampling_params={"max_new_tokens": 128},
+        )
+
+        self.tokenizer_manager._maybe_cap_request_max_new_tokens(req)
+
+        self.assertEqual(req.sampling_params["max_new_tokens"], 32)
+
+    def test_request_dict_below_cap_unchanged(self):
+        req = GenerateReqInput(
+            text="hi",
+            sampling_params={"max_new_tokens": 8},
+        )
+
+        self.tokenizer_manager._maybe_cap_request_max_new_tokens(req)
+
+        self.assertEqual(req.sampling_params["max_new_tokens"], 8)
+
+    def test_sampling_params_set_when_missing(self):
+        sampling_params = SamplingParams(max_new_tokens=None)
+
+        self.tokenizer_manager._enforce_sampling_max_completion_limit(sampling_params)
+
+        self.assertEqual(sampling_params.max_new_tokens, 32)
+
+    def test_sampling_params_min_tokens_violation(self):
+        sampling_params = SamplingParams(max_new_tokens=64, min_new_tokens=64)
+
+        with self.assertRaises(ValueError):
+            self.tokenizer_manager._enforce_sampling_max_completion_limit(
+                sampling_params
+            )
 
 
 class TestTokenizerManagerIntegration(unittest.TestCase):

@@ -266,6 +266,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
@@ -2123,6 +2124,13 @@ class ServerArgs:
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
             "This option is typically used for development and debugging purposes.",
+        )
+        parser.add_argument(
+            "--max-completion-tokens",
+            type=int,
+            default=ServerArgs.max_completion_tokens,
+            help="Hard upper bound for the number of new tokens each request is allowed to generate."
+            " Requests asking for more tokens will be capped at this value.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
