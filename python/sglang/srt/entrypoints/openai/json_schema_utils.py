@@ -39,6 +39,9 @@ def _enforce_no_additional_properties(schema: Dict[str, Any]) -> None:
 def normalize_json_schema(schema: Dict[str, Any], strict: bool) -> Dict[str, Any]:
     """Return a normalized copy of the schema with stricter defaults when requested."""
     normalized = copy.deepcopy(schema)
+    properties = normalized.get("properties")
+    if isinstance(properties, dict) and "strict" in properties:
+        properties.pop("strict", None)
     if strict:
         _enforce_no_additional_properties(normalized)
     return normalized

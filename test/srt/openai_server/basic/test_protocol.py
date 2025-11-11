@@ -190,6 +190,53 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request2.tool_choice, "auto")
 
+    def test_chat_completion_tool_choice_for_kimi_k2(self):
+        """Ensure Kimi K2 Thinking forces tool_choice to required when tools are present."""
+        messages = [{"role": "user", "content": "Hello"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_func",
+                    "description": "Test function",
+                },
+            }
+        ]
+
+        request_default = ChatCompletionRequest(
+            model="moonshotai/Kimi-K2-Thinking",
+            messages=messages,
+            tools=tools,
+        )
+        self.assertEqual(request_default.tool_choice, "required")
+
+        request_auto = ChatCompletionRequest(
+            model="moonshotai/Kimi-K2-Thinking",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+        )
+        self.assertEqual(request_auto.tool_choice, "required")
+
+        request_function = ChatCompletionRequest(
+            model="moonshotai/Kimi-K2-Thinking",
+            messages=messages,
+            tools=tools,
+            tool_choice={
+                "type": "function",
+                "function": {"name": "test_func"},
+            },
+        )
+        self.assertEqual(request_function.tool_choice.function.name, "test_func")
+
+        request_none = ChatCompletionRequest(
+            model="moonshotai/Kimi-K2-Thinking",
+            messages=messages,
+            tools=tools,
+            tool_choice="none",
+        )
+        self.assertEqual(request_none.tool_choice, "none")
+
     def test_chat_completion_sglang_extensions(self):
         """Test chat completion with SGLang extensions"""
         messages = [{"role": "user", "content": "Hello"}]
