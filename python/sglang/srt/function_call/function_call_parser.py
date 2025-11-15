@@ -24,7 +24,6 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
-from sglang.srt.function_call.tng_r1t2_detector import TngR1T2Detector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
@@ -46,7 +45,6 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "gpt-oss": GptOssDetector,
         "longcat": LongCatDetector,
-        "tng_r1t2": TngR1T2Detector,
         "kimi_k2": KimiK2Detector,
         "llama3": Llama32Detector,
         "mistral": MistralDetector,
