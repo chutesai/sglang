@@ -1,8 +1,6 @@
 import json
 import unittest
 
-from xgrammar import GrammarCompiler, TokenizerInfo
-
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
@@ -17,9 +15,6 @@ from sglang.srt.function_call.longcat_detector import LongCatDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -952,10 +947,6 @@ class TestBaseFormatDetector(unittest.TestCase):
                 return "<tool_call>" in text
 
             def structure_info(self):
-                # Not used in streaming tests
-                pass
-
-            def build_ebnf(self, tools):
                 # Not used in streaming tests
                 pass
 
@@ -2558,13 +2549,11 @@ class TestJsonArrayParser(unittest.TestCase):
         ]
         self.detector = JsonArrayParser()
 
-    def test_json_detector_ebnf(self):
-        """Test that the JsonArrayParser returns NotImplementedError for EBNF."""
-        with self.assertRaises(NotImplementedError) as context:
-            self.detector.build_ebnf(self.tools)
-        self.assertIn(
-            "EBNF generation is not supported for JSON schema constraints",
-            str(context.exception),
+    def test_json_detector_has_no_ebnf(self):
+        """JsonArrayParser no longer exposes EBNF generation helpers."""
+        self.assertFalse(
+            hasattr(self.detector, "build_ebnf"),
+            "JsonArrayParser should not expose EBNF helpers after cleanup",
         )
 
     def test_parse_streaming_increment_malformed_json(self):
