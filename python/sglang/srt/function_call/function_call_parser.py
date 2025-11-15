@@ -187,13 +187,6 @@ class FunctionCallParser:
         if self.detector.supports_structural_tag() and tool_choice == "auto":
             structural_tag = self.get_structure_tag()
             return ("structural_tag", structural_tag)
-        elif isinstance(self.detector, LongCatDetector):
-            ebnf = self.get_ebnf(tool_choice)
-            return ("ebnf", ebnf) if ebnf is not None else None
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
-            if not json_schema:
-                ebnf = self.get_ebnf(tool_choice)
-                if ebnf:
-                    return ("ebnf", ebnf)
             return ("json_schema", json_schema)
