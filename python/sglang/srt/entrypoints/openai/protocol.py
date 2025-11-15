@@ -545,8 +545,25 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+        model_name = str(values.get("model") or "").lower()
+        tools = values.get("tools")
+        tool_choice = values.get("tool_choice")
+
+        def _is_auto(choice):
+            return isinstance(choice, str) and choice.lower() == "auto"
+
+        is_kimi_thinking = model_name == "moonshotai/kimi-k2-thinking"
+
+        if (
+            is_kimi_thinking
+            and tools is not None
+            and (tool_choice is None or _is_auto(tool_choice))
+        ):
+            values["tool_choice"] = "required"
+            return values
+
+        if tool_choice is None:
+            if tools is None:
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
