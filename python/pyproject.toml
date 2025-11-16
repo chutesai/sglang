@@ -67,7 +67,7 @@ dependencies = [
   "torchvision",
   "torchao==0.9.0",
   "tqdm",
-  "git+https://github.com/huggingface/transformers@66d57110f089789ae285cc9d54d3bf051123246b",
+  "transformers @ git+https://github.com/huggingface/transformers.git@66d57110f089789ae285cc9d54d3bf051123246b",
   "uvicorn",
   "uvloop==0.21.0",
   "xgrammar==0.1.25",
