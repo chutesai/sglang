@@ -914,7 +914,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._maybe_cap_request_max_new_tokens(req)
-            self._validate_one_request(req, input_ids_list[i])
+            self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
