@@ -480,6 +480,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
+    enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -525,6 +526,7 @@ class ServerArgs:
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
+    enable_attn_tp_input_scattered: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -2713,7 +2715,7 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["flashinfer", "pytorch"],
+            choices=["flashinfer", "pytorch", "ascend"],
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
@@ -3248,6 +3250,11 @@ class ServerArgs:
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
+            "--enable-layerwise-nvtx-marker",
+            action="store_true",
+            help="Enable layerwise NVTX profiling annotations for the model.",
+        )
+        parser.add_argument(
             "--enable-nccl-nvls",
             action="store_true",
             help="Enable NCCL NVLS for prefill heavy requests when available.",
@@ -3488,6 +3495,11 @@ class ServerArgs:
             default=ServerArgs.rl_on_policy_target,
             choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
+        )
+        parser.add_argument(
+            "--enable-attn-tp-input-scattered",
+            action="store_true",
+            help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
 
         # Dynamic batch tokenizer
