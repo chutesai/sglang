@@ -152,25 +152,6 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
-        if self.reasoning_parser:
-            should_force_reasoning = False
-            if self.template_manager.force_reasoning:
-                should_force_reasoning = True
-            elif self._get_enable_thinking_from_request(request):
-                should_force_reasoning = True
-            if should_force_reasoning:
-                custom_params = sampling_params.get("custom_params")
-                if isinstance(custom_params, dict):
-                    custom_params = dict(custom_params)
-                elif custom_params:
-                    try:
-                        custom_params = dict(custom_params)
-                    except Exception:
-                        custom_params = {}
-                else:
-                    custom_params = {}
-                custom_params["reasoning_initial_in_reasoning"] = True
-                sampling_params["custom_params"] = custom_params
 
         # Handle single vs multiple requests
         if is_multimodal:
@@ -1098,12 +1079,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # GLM-4.5/4.6 templates emit thinking tags by default, so honor that unless
         # the user explicitly disables it.
-        if self.reasoning_parser in {"glm45"}:
+        if self.reasoning_parser in {"glm", "glm45"}:
             default_enable_thinking = True
 
         if chat_template_kwargs:
             # For Qwen3/GLM models, `enable_thinking` controls reasoning.
-            if self.reasoning_parser in ["qwen3", "glm45"]:
+            if self.reasoning_parser in ["qwen3", "glm45", "glm"]:
                 return chat_template_kwargs.get(
                     "enable_thinking", default_enable_thinking
                 )

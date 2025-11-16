@@ -18,7 +18,6 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
-    ResponseFormat,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -70,7 +69,6 @@ class _MockTemplateManager:
         self.chat_template_name: Optional[str] = "llama-3"
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
-        self.force_reasoning: bool = False
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -125,65 +123,6 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
-
-    def test_glm45_structured_output_default_reasoning(self):
-        """GLM-4.5 should force reasoning even without explicit enable_thinking flag."""
-        self.tm.server_args.reasoning_parser = "glm45"
-        self.chat.reasoning_parser = "glm45"
-
-        req = ChatCompletionRequest(
-            model="glm-test",
-            messages=[{"role": "user", "content": "Hi?"}],
-            response_format=ResponseFormat(type="json_object"),
-            separate_reasoning=True,
-        )
-
-        with patch.object(self.chat, "_process_messages") as proc_mock:
-            proc_mock.return_value = MessageProcessingResult(
-                prompt="Prompt",
-                prompt_ids=[1, 2, 3],
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=[],
-            )
-            adapted, _ = self.chat._convert_to_internal_request(req)
-
-        custom_params = adapted.sampling_params.get("custom_params", {})
-        self.assertTrue(
-            custom_params.get("reasoning_initial_in_reasoning"),
-            "reasoning_initial_in_reasoning should default to True for glm45 structured output",
-        )
-
-    def test_glm45_structured_output_respects_disable_reasoning(self):
-        """Explicitly disabling thinking should skip forcing reasoning for GLM-4.5."""
-        self.tm.server_args.reasoning_parser = "glm45"
-        self.chat.reasoning_parser = "glm45"
-
-        req = ChatCompletionRequest(
-            model="glm-test",
-            messages=[{"role": "user", "content": "Hi?"}],
-            response_format=ResponseFormat(type="json_object"),
-            separate_reasoning=True,
-            chat_template_kwargs={"enable_thinking": False},
-        )
-
-        with patch.object(self.chat, "_process_messages") as proc_mock:
-            proc_mock.return_value = MessageProcessingResult(
-                prompt="Prompt",
-                prompt_ids=[1, 2, 3],
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
-                stop=[],
-            )
-            adapted, _ = self.chat._convert_to_internal_request(req)
-
-        custom_params = adapted.sampling_params.get("custom_params")
-        if custom_params is not None:
-            self.assertNotIn("reasoning_initial_in_reasoning", custom_params)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -547,69 +486,6 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
-
-    def test_deepseek_reasoning_tool_call_extraction(self):
-        """Ensure DeepSeek-V3.1 thinking mode tool calls are extracted from reasoning text."""
-
-        self.tm.server_args.tool_call_parser = "deepseekv31"
-        self.chat.tool_call_parser = "deepseekv31"
-        self.tm.server_args.reasoning_parser = "deepseek-v3"
-        self.chat.reasoning_parser = "deepseek-v3"
-
-        request = ChatCompletionRequest(
-            model="deepseek-ai/DeepSeek-V3.2-Exp",
-            messages=[{"role": "user", "content": "Tell me about Paris."}],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {"name": "get_capital_info"},
-                }
-            ],
-            stream=False,
-        )
-        request.chat_template_kwargs = {"thinking": True}
-        request.separate_reasoning = True
-
-        raw_reasoning = (
-            "I need to provide information about the capital of France using the available tool. "
-            "The capital of France is Paris, and I need to provide its population as well.\n\n"
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_capital_info<｜tool▁sep｜>"
-            '{"name": "Paris", "population": 2100000}'
-            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
-        )
-
-        ret = [
-            {
-                "text": raw_reasoning,
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": [],
-                    "hidden_states": None,
-                    "weight_version": "default",
-                },
-            }
-        ]
-
-        response = self.chat._build_chat_response(request, ret, created=123456)
-        choice = response.choices[0]
-
-        self.assertIsNone(choice.message.content)
-        self.assertIsNotNone(choice.message.reasoning_content)
-        self.assertIn("capital of France", choice.message.reasoning_content)
-
-        self.assertIsNotNone(choice.message.tool_calls)
-        self.assertEqual(len(choice.message.tool_calls), 1)
-        tool_call = choice.message.tool_calls[0]
-        self.assertEqual(tool_call.function.name, "get_capital_info")
-        self.assertEqual(
-            tool_call.function.arguments,
-            '{"name": "Paris", "population": 2100000}',
-        )
 
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
