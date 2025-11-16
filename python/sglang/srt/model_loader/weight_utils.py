@@ -70,6 +70,7 @@ enable_hf_transfer()
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
+        kwargs.pop("disable", None)
         super().__init__(*args, **kwargs, disable=True)
 
 
