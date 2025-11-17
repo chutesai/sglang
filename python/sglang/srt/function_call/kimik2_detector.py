@@ -42,19 +42,24 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*"
+            r"(?P<tool_call_id>(?:functions\.)?(?P<function_name>[\w\.]+):(?P<function_idx>\d+))\s*"
+            r"<\|tool_call_argument_begin\|>\s*"
+            r"(?P<function_arguments>\{.*?\})\s*"
+            r"(?:<\|tool_call_end\|>|"
+            r"<\|tool_call_begin\|>|"
+            r"<\|tool_calls_section_end\|>|$)",
+            re.DOTALL,
         )
-
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)"
+            r"<\|tool_call_begin\|>\s*"
+            r"(?P<tool_call_id>(?:functions\.)?(?P<function_name>[\w\.]+):(?P<function_idx>\d+))\s*"
+            r"<\|tool_call_argument_begin\|>\s*"
+            r"(?P<function_arguments>\s*\{.*)",
+            re.DOTALL,
         )
 
         self._last_arguments = ""
-
-        # Robust parser for ids like "functions.search:0" or fallback "search:0"
-        self.tool_call_id_regex = re.compile(
-            r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$"
-        )
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -72,22 +77,11 @@ class KimiK2Detector(BaseFormatDetector):
             tool_indices = self._get_tool_indices(tools)
 
             # Match each tool call individually, both complete and incomplete
-            pattern = re.compile(
-                r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
-                r"<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?)(?:<\|tool_call_end\|>|<\|tool_call_begin\|>|<\|tool_calls_section_end\|>|$)",
-                re.DOTALL,
-            )
-
-            for match in pattern.finditer(text):
-                function_id = match.group("tool_call_id")
+            for match in self.tool_call_regex.finditer(text):
+                function_id = match.group("tool_call_id").strip()
                 function_args = match.group("function_arguments").strip()
-
-                m = self.tool_call_id_regex.match(function_id)
-                if not m:
-                    logger.warning("Unexpected tool_call_id format: %s", function_id)
-                    continue
-                function_name = m.group("name")
-                function_idx = int(m.group("index"))
+                function_name = match.group("function_name").strip()
+                function_idx = match.group("function_idx").strip()
 
                 if function_name not in tool_indices:
                     logger.warning(
@@ -164,13 +158,7 @@ class KimiK2Detector(BaseFormatDetector):
             if match:
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
-
-                m = self.tool_call_id_regex.match(function_id)
-                if not m:
-                    logger.warning("Unexpected tool_call_id format: %s", function_id)
-                    return StreamingParseResult(normal_text="", calls=calls)
-                function_name = m.group("name")
-
+                function_name = match.group("function_name")
                 if function_name not in self._tool_indices:
                     logger.warning(
                         "Model attempted to call undefined function: %s",
