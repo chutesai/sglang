@@ -1339,9 +1339,10 @@ def launch_server(
     """
     os.environ["SGL_MODEL_NAME"] = server_args.model_path
     os.environ["SGL_REVISION"] = server_args.revision
-    if not server_args.api_key:
-        if (env_api_key := os.environ.pop("SGLANG_API_KEY", None)) is not None:
-            server_args.api_key = env_api_key
+    if server_args.api_key:
+        current_proctitle = setproctitle.getproctitle()
+        clean_proctitle = current_proctitle.replace(server_args.api_key, "*" * len(server_args.api_key))
+        setproctitle.setproctitle(clean_proctitle)
 
     tokenizer_manager, template_manager, scheduler_info, port_args = (
         _launch_subprocesses(server_args=server_args)
