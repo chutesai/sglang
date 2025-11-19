@@ -17,6 +17,7 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements HTTP APIs for the inference engine via fastapi.
 """
 
+import setproctitle
 import asyncio
 import dataclasses
 import logging
