@@ -446,7 +446,7 @@ def terminate_process(process):
         release_port(lock_socket)
 
 
-def wait_for_server(base_url: str, timeout: int = None) -> None:
+def wait_for_server(base_url: str, timeout: int = None, api_key: str = "None") -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
@@ -458,7 +458,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         try:
             response = requests.get(
                 f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
+                headers={"Authorization": f"Bearer {api_key}"},
             )
             if response.status_code == 200:
                 time.sleep(5)
