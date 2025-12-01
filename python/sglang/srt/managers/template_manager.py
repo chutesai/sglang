@@ -120,6 +120,34 @@ class TemplateManager:
 
             # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
+                # Special-case DeepSeek-V3.2 (no HF template, DSML format)
+                if re.search(
+                    r"deepseek[-_]?ai/DeepSeek-V3\.2", model_path, re.IGNORECASE
+                ):
+                    template_path = os.path.join(
+                        os.path.dirname(__file__),
+                        "..",
+                        "..",
+                        "..",
+                        "..",
+                        "examples",
+                        "chat_template",
+                        "tool_chat_template_deepseekv32_dsml.jinja",
+                    )
+                    logger.info(
+                        f"Loading built-in DeepSeek-V3.2 DSML chat template: {template_path}"
+                    )
+                    self._load_jinja_template(tokenizer_manager, template_path)
+                    # Default tool-call parser to deepseekv32 for DSML outputs
+                    if hasattr(tokenizer_manager, "server_args") and hasattr(
+                        tokenizer_manager.server_args, "tool_call_parser"
+                    ):
+                        tokenizer_manager.server_args.tool_call_parser = (
+                            tokenizer_manager.server_args.tool_call_parser
+                            or "deepseekv32"
+                        )
+                    return
+
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
                 if hf_template:
