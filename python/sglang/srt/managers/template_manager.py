@@ -138,6 +138,14 @@ class TemplateManager:
                         f"Loading built-in DeepSeek-V3.2 DSML chat template: {template_path}"
                     )
                     self._load_jinja_template(tokenizer_manager, template_path)
+                    # Default tool-call parser to deepseekv32 for DSML outputs
+                    if hasattr(tokenizer_manager, "server_args") and hasattr(
+                        tokenizer_manager.server_args, "tool_call_parser"
+                    ):
+                        tokenizer_manager.server_args.tool_call_parser = (
+                            tokenizer_manager.server_args.tool_call_parser
+                            or "deepseekv32"
+                        )
                     return
 
                 # Try HuggingFace template first

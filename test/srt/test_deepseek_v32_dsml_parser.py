@@ -38,7 +38,7 @@ def test_dsml_parser_one_shot():
 def test_dsml_parser_streaming_collects_until_end():
     detector = DeepSeekV32Detector()
     tools = _make_tools()
-    part1 = "<｜DSML｜function_calls><｜DSML｜invoke name=\"foo\">"
+    part1 = '<｜DSML｜function_calls><｜DSML｜invoke name="foo">'
     part2 = (
         '<｜DSML｜parameter name="x" string="true">hi</｜DSML｜parameter>'
         "</｜DSML｜invoke></｜DSML｜function_calls>"
