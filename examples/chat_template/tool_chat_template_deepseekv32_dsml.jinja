@@ -1,5 +1,5 @@
 {# DeepSeek-V3.2 DSML chat template (compatible with encoding_dsv32.py) #}
-{%- if thinking_mode is not defined %}{% set thinking_mode = "thinking" %}{% endif -%}
+{%- if thinking is not defined %}{% set thinking = false %}{% endif -%}
 {%- if drop_thinking is not defined %}{% set drop_thinking = true %}{% endif -%}
 {%- set dsml_token = "｜DSML｜" -%}
 {%- set thinking_start_token = "<think>" -%}
@@ -100,18 +100,18 @@ Here are the functions available in JSONSchema format:
       {%- set dev_content = dev_content + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
     {%- endif -%}
     {%- set dev_content = dev_content + "\n\n# The user's message is: " + content -%}
-    {{ "<｜User｜>" + dev_content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking_mode == "thinking" else thinking_end_token }}
+    {{ "<｜User｜>" + dev_content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking else thinking_end_token }}
 
   {%- elif role == "user" -%}
-    {{ "<｜User｜>" + content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking_mode == "thinking" else thinking_end_token }}
+    {{ "<｜User｜>" + content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking else thinking_end_token }}
 
   {%- elif role == "assistant" -%}
     {%- if message.get("tool_calls") -%}
       {%- set first = true -%}
-      {%- if idx > ns.last_user and thinking_mode == "thinking" and (message.get("reasoning_content") or message.get("tool_calls")) -%}
-        {{ (message.get("reasoning_content","") if not (thinking_mode == "thinking" and drop_thinking and idx <= ns.last_user) else "") + thinking_end_token }}
+      {%- if idx > ns.last_user and thinking and (message.get("reasoning_content") or message.get("tool_calls")) -%}
+        {{ (message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "") + thinking_end_token }}
       {%- else -%}
-        {{ message.get("reasoning_content","") if not (thinking_mode == "thinking" and drop_thinking and idx <= ns.last_user) else "" }}
+        {{ message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "" }}
       {%- endif -%}
       {%- set tc = namespace(first=true) -%}
       {%- for tool in message["tool_calls"] -%}
@@ -155,7 +155,7 @@ Here are the functions available in JSONSchema format:
       {%- endfor -%}
       {{ "\n</" + dsml_token + "function_calls>" + eos_token }}
     {%- else -%}
-      {%- if idx > ns.last_user and thinking_mode == "thinking" and not (drop_thinking and idx <= ns.last_user) and message.get("reasoning_content") -%}
+      {%- if idx > ns.last_user and thinking and not (drop_thinking and idx <= ns.last_user) and message.get("reasoning_content") -%}
         {{ message["reasoning_content"] + thinking_end_token }}
       {%- endif -%}
       {{ content + eos_token }}
@@ -168,7 +168,7 @@ Here are the functions available in JSONSchema format:
     {{- "\n<result>" + content + "</result>" -}}
     {%- if is_last_tool -%}
       {{- "\n</function_results>" -}}
-      {{- ("\n\n" + thinking_start_token) if idx >= ns.last_user and thinking_mode == "thinking" else ("\n\n" + thinking_end_token) -}}
+      {{- ("\n\n" + thinking_start_token) if idx >= ns.last_user and thinking else ("\n\n" + thinking_end_token) -}}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
