@@ -29,10 +29,14 @@
 
 {# Tools block if provided globally #}
 {%- if tools is defined and tools is not none -%}
-  {%- set tool_schemas = [] -%}
+  {%- set tool_ns = namespace(text="") -%}
   {%- for tool in tools -%}
-    {%- set tool_ns = tool["function"] if tool.get("function") else tool -%}
-    {%- set _ = tool_schemas.append(tool_ns | tojson) -%}
+    {%- set t = tool["function"] if tool.get("function") else tool -%}
+    {%- if loop.first -%}
+      {%- set tool_ns.text = tool_ns.text + (t | tojson) -%}
+    {%- else -%}
+      {%- set tool_ns.text = tool_ns.text + "\n" + (t | tojson) -%}
+    {%- endif -%}
   {%- endfor -%}
   {%- set tools_block -%}
 ## Tools
@@ -65,7 +69,7 @@ If the thinking_mode is enabled, then after function results you should strongly
 
 Here are the functions available in JSONSchema format:
 <functions>
-{{ tool_schemas | join("\n") }}
+{{ tool_ns.text }}
 </functions>
   {%- endset -%}
   {%- if sp.text -%}
@@ -116,7 +120,7 @@ Here are the functions available in JSONSchema format:
         {%- set func = tool["function"] -%}
         {%- set tool_name = func["name"] -%}
         {%- set raw_args = func["arguments"] -%}
-        {%- set params = [] -%}
+        {%- set param_ns = namespace(text="", first=true) -%}
         {%- if raw_args is mapping -%}
           {%- set parsed = raw_args -%}
         {%- elif raw_args is string -%}
@@ -131,9 +135,15 @@ Here are the functions available in JSONSchema format:
           {%- else -%}
             {%- set val = v | tojson -%}
           {%- endif -%}
-          {%- set _ = params.append("<" + dsml_token + "parameter name=\"" + k + "\" string=\"" + is_str + "\">" + val + "</" + dsml_token + "parameter>") -%}
+          {%- set piece = "<" + dsml_token + "parameter name=\"" + k + "\" string=\"" + is_str + "\">" + val + "</" + dsml_token + "parameter>" -%}
+          {%- if param_ns.first -%}
+            {%- set param_ns.text = piece -%}
+            {%- set param_ns.first = false -%}
+          {%- else -%}
+            {%- set param_ns.text = param_ns.text + "\n" + piece -%}
+          {%- endif -%}
         {%- endfor -%}
-        {%- set param_block = params | join("\n") -%}
+        {%- set param_block = param_ns.text -%}
         {%- if tc.first -%}
           {%- if content -%}
             {{ content + "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
