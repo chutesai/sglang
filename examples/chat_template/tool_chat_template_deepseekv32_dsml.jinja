@@ -111,12 +111,19 @@ Here are the functions available in JSONSchema format:
       {%- else -%}
         {{ message.get("reasoning_content","") if not (thinking_mode == "thinking" and drop_thinking and idx <= ns.last_user) else "" }}
       {%- endif -%}
+      {%- set tc = namespace(first=true) -%}
       {%- for tool in message["tool_calls"] -%}
         {%- set func = tool["function"] -%}
         {%- set tool_name = func["name"] -%}
         {%- set raw_args = func["arguments"] -%}
         {%- set params = [] -%}
-        {%- set parsed = raw_args if raw_args is mapping else {} -%}
+        {%- if raw_args is mapping -%}
+          {%- set parsed = raw_args -%}
+        {%- elif raw_args is string -%}
+          {%- set parsed = raw_args | from_json -%}
+        {%- else -%}
+          {%- set parsed = {} -%}
+        {%- endif -%}
         {%- for k,v in parsed.items() -%}
           {%- set is_str = "true" if v is string else "false" -%}
           {%- if v is string -%}
@@ -127,13 +134,13 @@ Here are the functions available in JSONSchema format:
           {%- set _ = params.append("<" + dsml_token + "parameter name=\"" + k + "\" string=\"" + is_str + "\">" + val + "</" + dsml_token + "parameter>") -%}
         {%- endfor -%}
         {%- set param_block = params | join("\n") -%}
-        {%- if first -%}
+        {%- if tc.first -%}
           {%- if content -%}
             {{ content + "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
           {%- else -%}
             {{ "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
           {%- endif -%}
-          {%- set first = false -%}
+          {%- set tc.first = false -%}
         {%- else -%}
           {{ "\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
         {%- endif -%}
