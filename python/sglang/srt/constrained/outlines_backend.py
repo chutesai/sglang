@@ -49,29 +49,9 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
-        self._accepted_tokens: List[int] = []
 
     def accept_token(self, token: int):
-        self._accepted_tokens.append(token)
         self.state = self.guide.get_next_state(self.state, token)
-        self.current_token = token
-
-    def rollback(self, k: int):
-        if k <= 0 or not self._accepted_tokens:
-            return
-        if k > len(self._accepted_tokens):
-            k = len(self._accepted_tokens)
-        del self._accepted_tokens[-k:]
-        self._replay_state()
-
-    def _replay_state(self) -> None:
-        state = 0
-        for token in self._accepted_tokens:
-            state = self.guide.get_next_state(state, token)
-        self.state = state
-        self.current_token = (
-            self._accepted_tokens[-1] if self._accepted_tokens else None
-        )
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
@@ -95,13 +75,7 @@ class OutlinesGrammar(BaseGrammarObject):
         logits.masked_fill_(vocab_mask, float("-inf"))
 
     def copy(self):
-        copied = OutlinesGrammar(self.guide, self.jump_forward_map)
-        if self._accepted_tokens:
-            copied._accepted_tokens = list(self._accepted_tokens)
-            copied._replay_state()
-        copied.state = self.state
-        copied.current_token = self.current_token
-        return copied
+        return OutlinesGrammar(self.guide, self.jump_forward_map)
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple]:
         if not self.jump_forward_map:
@@ -134,8 +108,7 @@ class OutlinesGrammar(BaseGrammarObject):
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
-        self._accepted_tokens = list(new_output_ids)
-        self._replay_state()
+        self.state = next_state
 
 
 class OutlinesGrammarBackend(BaseGrammarBackend):
