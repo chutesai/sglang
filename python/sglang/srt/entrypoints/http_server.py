@@ -17,7 +17,6 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements HTTP APIs for the inference engine via fastapi.
 """
 
-import setproctitle
 import asyncio
 import dataclasses
 import logging
@@ -28,6 +27,8 @@ import threading
 import time
 from http import HTTPStatus
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
+
+import setproctitle
 
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
@@ -1387,7 +1388,9 @@ def launch_server(
     os.environ["SGL_REVISION"] = server_args.revision
     if server_args.api_key:
         current_proctitle = setproctitle.getproctitle()
-        clean_proctitle = current_proctitle.replace(server_args.api_key, "*" * len(server_args.api_key))
+        clean_proctitle = current_proctitle.replace(
+            server_args.api_key, "*" * len(server_args.api_key)
+        )
         setproctitle.setproctitle(clean_proctitle)
 
     tokenizer_manager, template_manager, scheduler_info, port_args = (

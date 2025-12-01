@@ -1,0 +1,161 @@
+{# DeepSeek-V3.2 DSML chat template (compatible with encoding_dsv32.py) #}
+{%- if add_default_bos_token is not defined %}{% set add_default_bos_token = true %}{% endif -%}
+{%- if thinking_mode is not defined %}{% set thinking_mode = "thinking" %}{% endif -%}
+{%- if drop_thinking is not defined %}{% set drop_thinking = true %}{% endif -%}
+{%- set dsml_token = "｜DSML｜" -%}
+{%- set thinking_start_token = "<think>" -%}
+{%- set thinking_end_token = "</think>" -%}
+{%- set eos_token = "<｜end▁of▁sentence｜>" -%}
+
+{# Identify last user/developer index #}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+  {%- if message["role"] in ["user", "developer"] -%}
+    {%- set ns.last_user = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{# Build system prompt (concatenate all system messages) #}
+{%- set sp = namespace(text="") -%}
+{%- for message in messages -%}
+  {%- if message["role"] == "system" -%}
+    {%- if sp.text -%}
+      {%- set sp.text = sp.text + "\n\n" + (message["content"] or "") -%}
+    {%- else -%}
+      {%- set sp.text = (message["content"] or "") -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{# Tools block if provided globally #}
+{%- if tools is defined and tools is not none -%}
+  {%- set tool_schemas = [] -%}
+  {%- for tool in tools -%}
+    {%- set tool_ns = tool["function"] if tool.get("function") else tool -%}
+    {%- set _ = tool_schemas.append(tool_ns | tojson) -%}
+  {%- endfor -%}
+  {%- set tools_block -%}
+## Tools
+
+You have access to a set of tools you can use to answer the user's question.
+You can invoke functions by writing a "<{{ dsml_token }}function_calls>" block like the following as part of your reply to the user:
+<{{ dsml_token }}function_calls>
+<{{ dsml_token }}invoke name="$FUNCTION_NAME">
+<{{ dsml_token }}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{{ dsml_token }}parameter>
+...
+</{{ dsml_token }}invoke>
+<{{ dsml_token }}invoke name="$FUNCTION_NAME2">
+...
+</{{ dsml_token }}invoke>
+</{{ dsml_token }}function_calls>
+
+String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The "string" attribute should be set to "true" for string type parameters and "false" for other types (numbers, booleans, arrays, objects).
+
+If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
+
+<{{ dsml_token }}function_calls>
+...
+</{{ dsml_token }}function_calls>
+
+<function_results>
+...
+</function_results>
+
+{{ thinking_start_token }}...thinking about results{{ thinking_end_token }}
+
+Here are the functions available in JSONSchema format:
+<functions>
+{{ tool_schemas | join("\n") }}
+</functions>
+  {%- endset -%}
+  {%- if sp.text -%}
+    {%- set sp.text = sp.text + "\n\n" + tools_block -%}
+  {%- else -%}
+    {%- set sp.text = "\n\n" + tools_block -%}
+  {%- endif -%}
+{%- endif -%}
+
+{# Response format on system messages #}
+{%- for message in messages -%}
+  {%- if message["role"] == "system" and message.get("response_format") -%}
+    {%- set sp.text = sp.text + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{# Emit BOS and system prompt #}
+{%- if add_default_bos_token -%}{{ bos_token }}{%- endif -%}
+{{- sp.text -}}
+
+{# Render messages #}
+{%- for message in messages -%}
+  {%- set idx = loop.index0 -%}
+  {%- set role = message["role"] -%}
+  {%- set content = message.get("content", "") if message.get("content") is not none else "" -%}
+
+  {%- if role == "developer" -%}
+    {%- set dev_content = "" -%}
+    {%- if message.get("response_format") -%}
+      {%- set dev_content = dev_content + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
+    {%- endif -%}
+    {%- set dev_content = dev_content + "\n\n# The user's message is: " + content -%}
+    {{ "<｜User｜>" + dev_content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking_mode == "thinking" else thinking_end_token }}
+
+  {%- elif role == "user" -%}
+    {{ "<｜User｜>" + content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking_mode == "thinking" else thinking_end_token }}
+
+  {%- elif role == "assistant" -%}
+    {%- if message.get("tool_calls") -%}
+      {%- set first = true -%}
+      {%- if idx > ns.last_user and thinking_mode == "thinking" and (message.get("reasoning_content") or message.get("tool_calls")) -%}
+        {{ (message.get("reasoning_content","") if not (thinking_mode == "thinking" and drop_thinking and idx <= ns.last_user) else "") + thinking_end_token }}
+      {%- else -%}
+        {{ message.get("reasoning_content","") if not (thinking_mode == "thinking" and drop_thinking and idx <= ns.last_user) else "" }}
+      {%- endif -%}
+      {%- for tool in message["tool_calls"] -%}
+        {%- set func = tool["function"] -%}
+        {%- set tool_name = func["name"] -%}
+        {%- set raw_args = func["arguments"] -%}
+        {%- set params = [] -%}
+        {%- set parsed = raw_args if raw_args is mapping else {} -%}
+        {%- for k,v in parsed.items() -%}
+          {%- set is_str = "true" if v is string else "false" -%}
+          {%- if v is string -%}
+            {%- set val = v -%}
+          {%- else -%}
+            {%- set val = v | tojson -%}
+          {%- endif -%}
+          {%- set _ = params.append("<" + dsml_token + "parameter name=\"" + k + "\" string=\"" + is_str + "\">" + val + "</" + dsml_token + "parameter>") -%}
+        {%- endfor -%}
+        {%- set param_block = params | join("\n") -%}
+        {%- if first -%}
+          {%- if content -%}
+            {{ content + "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+          {%- else -%}
+            {{ "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+          {%- endif -%}
+          {%- set first = false -%}
+        {%- else -%}
+          {{ "\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ "\n</" + dsml_token + "function_calls>" + eos_token }}
+    {%- else -%}
+      {%- if idx > ns.last_user and thinking_mode == "thinking" and not (drop_thinking and idx <= ns.last_user) and message.get("reasoning_content") -%}
+        {{ message["reasoning_content"] + thinking_end_token }}
+      {%- endif -%}
+      {{ content + eos_token }}
+    {%- endif -%}
+
+  {%- elif role == "tool" -%}
+    {%- set is_first_tool = loop.index0 == 0 or messages[loop.index0 - 1]["role"] != "tool" -%}
+    {%- set is_last_tool = loop.last or messages[loop.index0 + 1]["role"] != "tool" -%}
+    {%- if is_first_tool -%}{{- "\n\n<function_results>" -}}{%- endif -%}
+    {{- "\n<result>" + content + "</result>" -}}
+    {%- if is_last_tool -%}
+      {{- "\n</function_results>" -}}
+      {{- ("\n\n" + thinking_start_token) if idx >= ns.last_user and thinking_mode == "thinking" else ("\n\n" + thinking_end_token) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{# No extra generation prompt needed; assistant prefix is handled inline #}

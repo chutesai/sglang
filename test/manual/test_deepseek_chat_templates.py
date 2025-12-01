@@ -27,6 +27,7 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
             "v3": "tool_chat_template_deepseekv3.jinja",
             "v3.1": "tool_chat_template_deepseekv31.jinja",
             "v3.2": "tool_chat_template_deepseekv32.jinja",
+            "v3.2-dsml": "tool_chat_template_deepseekv32_dsml.jinja",
         }
 
         for version, filename in template_files.items():
@@ -312,6 +313,36 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                 self.assertNotIn(
                     '\\"city\\"', output, f"{version}: Should not double-escape"
                 )
+
+    def test_deepseek_v32_dsml_minimal(self):
+        """DeepSeek-V3.2 DSML template should match encoding_dsv32 example."""
+        version = "v3.2-dsml"
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "Hello! I am DeepSeek.",
+                "reasoning_content": "thinking...",
+            },
+            {"role": "user", "content": "1+1=?"},
+        ]
+
+        output = self._render_template(
+            version,
+            messages,
+            tools=None,
+            add_generation_prompt=True,
+            thinking_mode="thinking",
+            drop_thinking=True,
+            add_default_bos_token=True,
+        )
+
+        expected = (
+            "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+            "Hello! I am DeepSeek.<｜end▁of▁sentence｜><｜User｜>1+1=?"
+            "<｜Assistant｜><think>"
+        )
+        self.assertEqual(output.strip(), expected)
 
 
 if __name__ == "__main__":
