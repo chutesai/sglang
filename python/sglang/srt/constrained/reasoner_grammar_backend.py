@@ -59,6 +59,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         for _ in range(k):
             self.rollback_state()
 
+    def set_initial_reasoning_state(self, in_reasoning: bool) -> None:
+        """
+        Configure whether constrained decoding should wait for the reasoning
+        block to finish (`</think>`), or start immediately.
+        """
+        if in_reasoning:
+            self.tokens_after_think_end = -1
+        else:
+            self.tokens_after_think_end = 0
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:

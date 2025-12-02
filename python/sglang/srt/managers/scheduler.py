@@ -1534,8 +1534,10 @@ class Scheduler(
 
     def _apply_reasoning_initial_state(self, req: Req) -> None:
         custom_params = getattr(req.sampling_params, "custom_params", None)
-        initial_flag = None
-        if isinstance(custom_params, dict):
+        initial_flag = getattr(self.tokenizer, "reasoning_initial_in_reasoning", False)
+        if isinstance(custom_params, dict) and (
+            "reasoning_initial_in_reasoning" in custom_params
+        ):
             initial_flag = custom_params.get("reasoning_initial_in_reasoning")
         grammar = getattr(req, "grammar", None)
         if grammar is None or grammar is INVALID_GRAMMAR_OBJ:
@@ -1543,7 +1545,7 @@ class Scheduler(
         setter = getattr(grammar, "set_initial_reasoning_state", None)
         if setter is not None:
             try:
-                setter(initial_flag)
+                setter(bool(initial_flag))
             except Exception:
                 logger.exception("Failed to set reasoning initial state for grammar.")
 
