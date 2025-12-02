@@ -31,20 +31,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        # Allow optional trailing "｜" before ">"
-        self.bot_token = "<｜DSML｜function_calls"
-        self.eot_token = "</｜DSML｜function_calls"
+        prefix = r"(?:｜\s*DSML\s*｜)?"
+        tail = r"(?:｜)?>"
+        end_tail = r"(?:｜)?>"
+
+        self.bot_pattern = re.compile(rf"<{prefix}function_calls{tail}")
+        self.eot_pattern = re.compile(rf"</{prefix}function_calls{end_tail}")
+
         self.invoke_pattern = re.compile(
-            r'<｜DSML｜invoke name="(?P<name>[^"]+)"(?:｜)?>\s*(?P<body>.*?)\s*</｜DSML｜invoke(?:｜)?>',
+            rf"<{prefix}invoke name=\"(?P<name>[^\"]+)\"{tail}\s*(?P<body>.*?)\s*</{prefix}invoke{end_tail}",
             re.DOTALL,
         )
         self.param_pattern = re.compile(
-            r'<｜DSML｜parameter name="(?P<key>[^"]+)" string="(?P<string>true|false)"(?:｜)?>\s*(?P<val>.*?)\s*</｜DSML｜parameter(?:｜)?>',
+            rf"<{prefix}parameter name=\"(?P<key>[^\"]+)\" string=\"(?P<string>true|false)\"{tail}\s*(?P<val>.*?)\s*</{prefix}parameter{end_tail}",
             re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
-        return self.bot_token in text
+        return bool(self.bot_pattern.search(text))
 
     def _parse_arguments(self, body: str) -> Dict:
         args: Dict[str, object] = {}
@@ -72,16 +76,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return calls
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        start_match = re.search(r"<｜DSML｜function_calls(?:｜)?>", text)
-        idx = start_match.start() if start_match else -1
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if start_match is None:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        end_match = re.search(r"</｜DSML｜function_calls(?:｜)?>", text)
-        if end_match is None:
+        start_match = self.bot_pattern.search(text)
+        if not start_match:
             return StreamingParseResult(normal_text=text)
 
+        end_match = self.eot_pattern.search(text, start_match.end())
+        if not end_match:
+            return StreamingParseResult(normal_text=text)
+
+        normal_text = text[: start_match.start()].strip()
         block = text[start_match.end() : end_match.start()]
         calls = self._decode_block(block, tools)
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -94,12 +97,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
         then parse the complete block.
         """
         self._buffer += new_text
-        if "<｜DSML｜function_calls" not in self._buffer:
+        has_start = bool(self.bot_pattern.search(self._buffer))
+        if not has_start:
             normal_text = self._buffer
             self._buffer = ""
             return StreamingParseResult(normal_text=normal_text)
 
-        if "</｜DSML｜function_calls" not in self._buffer:
+        if not self.eot_pattern.search(self._buffer):
             return StreamingParseResult()
 
         result = self.detect_and_parse(self._buffer, tools)
