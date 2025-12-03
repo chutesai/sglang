@@ -32,19 +32,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         prefix = r"(?:｜\s*DSML\s*｜)?"
-        tail = r"(?:｜)?>"
-        end_tail = r"(?:｜)?>"
+        tail = r"(?:｜)?\s*>"
+        end_tail = r"(?:｜)?\s*>"
 
-        self.bot_pattern = re.compile(rf"<{prefix}function_calls{tail}")
-        self.eot_pattern = re.compile(rf"</{prefix}function_calls{end_tail}")
+        flags = re.IGNORECASE
+
+        self.bot_pattern = re.compile(rf"<\s*{prefix}function_calls{tail}", flags)
+        self.eot_pattern = re.compile(rf"</\s*{prefix}function_calls{end_tail}", flags)
+        self._start_tokens = [
+            "<function_calls",
+            "<｜dsml｜function_calls",
+        ]
 
         self.invoke_pattern = re.compile(
-            rf"<{prefix}invoke name=\"(?P<name>[^\"]+)\"{tail}\s*(?P<body>.*?)\s*</{prefix}invoke{end_tail}",
-            re.DOTALL,
+            rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
+            re.DOTALL | flags,
         )
         self.param_pattern = re.compile(
-            rf"<{prefix}parameter name=\"(?P<key>[^\"]+)\" string=\"(?P<string>true|false)\"{tail}\s*(?P<val>.*?)\s*</{prefix}parameter{end_tail}",
-            re.DOTALL,
+            rf"<\s*{prefix}parameter\s+name\s*=\s*[\"'](?P<key>[^\"'>]+)[\"'](?:\s+string\s*=\s*[\"'](?P<string>true|false)[\"'])?\s*{tail}\s*(?P<val>.*?)\s*</\s*{prefix}parameter{end_tail}",
+            re.DOTALL | flags,
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -54,7 +60,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         args: Dict[str, object] = {}
         for match in self.param_pattern.finditer(body):
             key = match.group("key")
-            is_str = match.group("string") == "true"
+            string_flag = (match.group("string") or "true").lower()
+            is_str = string_flag == "true"
             raw_val = match.group("val")
             if is_str:
                 args[key] = raw_val
@@ -81,12 +88,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
         end_match = self.eot_pattern.search(text, start_match.end())
-        if not end_match:
-            return StreamingParseResult(normal_text=text)
+        block_end = end_match.start() if end_match else len(text)
 
         normal_text = text[: start_match.start()].strip()
-        block = text[start_match.end() : end_match.start()]
+        block = text[start_match.end() : block_end]
         calls = self._decode_block(block, tools)
+
+        # If we couldn't find an end tag and also didn't decode anything, treat as normal text.
+        if not end_match and not calls:
+            return StreamingParseResult(normal_text=text)
+
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
@@ -97,18 +108,42 @@ class DeepSeekV32Detector(BaseFormatDetector):
         then parse the complete block.
         """
         self._buffer += new_text
-        has_start = bool(self.bot_pattern.search(self._buffer))
-        if not has_start:
+
+        # No start token yet; keep buffering if current buffer could be a partial prefix
+        # of the start token (e.g. "<function" across chunks).
+        if not self.bot_pattern.search(self._buffer):
+            buffer_low = self._buffer.lower()
+            for token in self._start_tokens:
+                token_low = token.lower()
+                # Treat both strict prefixes and the full token (without the closing '>') as partial
+                if buffer_low.endswith(token_low) or self._ends_with_partial_token(
+                    buffer_low, token_low
+                ):
+                    return StreamingParseResult()
+
             normal_text = self._buffer
             self._buffer = ""
             return StreamingParseResult(normal_text=normal_text)
 
-        if not self.eot_pattern.search(self._buffer):
-            return StreamingParseResult()
+        if self.eot_pattern.search(self._buffer):
+            result = self.detect_and_parse(self._buffer, tools)
+            self._buffer = ""
+            return result
 
-        result = self.detect_and_parse(self._buffer, tools)
-        self._buffer = ""
-        return result
+        # Fallback: if we have a complete invoke block that reaches the current end
+        # of the buffer but the model never emitted </function_calls>, parse what we
+        # have so far.
+        last_invoke_end = None
+        for match in self.invoke_pattern.finditer(self._buffer):
+            last_invoke_end = match.end()
+
+        trimmed_len = len(self._buffer.rstrip())
+        if last_invoke_end is not None and last_invoke_end == trimmed_len:
+            result = self.detect_and_parse(self._buffer, tools)
+            self._buffer = ""
+            return result
+
+        return StreamingParseResult()
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
