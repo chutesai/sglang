@@ -43,6 +43,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             "<function_calls",
             "<｜dsml｜function_calls",
         ]
+        # Track whether we're waiting for the closing function_calls tag after early parsing
+        self._waiting_for_end_tag = False
 
         self.invoke_pattern = re.compile(
             rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
@@ -77,9 +79,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
         for match in self.invoke_pattern.finditer(block):
             name = match.group("name")
             args = self._parse_arguments(match.group("body"))
-            calls.extend(
-                self.parse_base_json({"name": name, "parameters": args}, tools)
+            parsed_calls = self.parse_base_json(
+                {"name": name, "parameters": args}, tools
             )
+            # Update tool_index to be the sequential position in the response
+            for call in parsed_calls:
+                call.tool_index = len(calls)
+                calls.append(call)
         return calls
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -109,6 +115,39 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._buffer += new_text
 
+        # If we're waiting for the closing tag after early parsing, consume it
+        if self._waiting_for_end_tag:
+            end_match = self.eot_pattern.search(self._buffer)
+            if end_match:
+                # Consume everything up to and including the closing tag
+                self._buffer = self._buffer[end_match.end() :]
+                self._waiting_for_end_tag = False
+                # Return any remaining text after the closing tag
+                if self._buffer:
+                    remaining = self._buffer
+                    self._buffer = ""
+                    return StreamingParseResult(normal_text=remaining)
+                return StreamingParseResult()
+            # Check if we might have a partial closing tag by checking against end patterns
+            # Possible closing tags: "</function_calls>" or "</｜DSML｜function_calls>"
+            closing_patterns = ["</function_calls>", "</｜dsml｜function_calls>"]
+            buffer_low = self._buffer.lower()
+            is_partial = False
+            for pattern in closing_patterns:
+                if self._ends_with_partial_token(buffer_low, pattern):
+                    is_partial = True
+                    break
+
+            if is_partial:
+                # Keep buffering, might be partial closing tag
+                return StreamingParseResult()
+            else:
+                # Not a closing tag, return as normal text
+                normal_text = self._buffer
+                self._buffer = ""
+                self._waiting_for_end_tag = False
+                return StreamingParseResult(normal_text=normal_text)
+
         # No start token yet; keep buffering if current buffer could be a partial prefix
         # of the start token (e.g. "<function" across chunks).
         if not self.bot_pattern.search(self._buffer):
@@ -128,6 +167,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.eot_pattern.search(self._buffer):
             result = self.detect_and_parse(self._buffer, tools)
             self._buffer = ""
+            self._waiting_for_end_tag = False
             return result
 
         # Fallback: if we have a complete invoke block that reaches the current end
@@ -141,6 +181,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if last_invoke_end is not None and last_invoke_end == trimmed_len:
             result = self.detect_and_parse(self._buffer, tools)
             self._buffer = ""
+            # Mark that we're waiting for the closing tag
+            self._waiting_for_end_tag = True
             return result
 
         return StreamingParseResult()
