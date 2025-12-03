@@ -46,12 +46,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Track whether we've emitted tool calls and should consume remaining tags
         self._tool_calls_emitted = False
 
+        # Match invoke blocks - make closing quote optional to handle malformed output
+        # Handles both: name="foo" and name="foo> (missing closing quote)
         self.invoke_pattern = re.compile(
-            rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
+            rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']?{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
             re.DOTALL | flags,
         )
+        # Match parameter blocks - make closing quote optional for both name and string attributes
         self.param_pattern = re.compile(
-            rf"<\s*{prefix}parameter\s+name\s*=\s*[\"'](?P<key>[^\"'>]+)[\"'](?:\s+string\s*=\s*[\"'](?P<string>true|false)[\"'])?\s*{tail}\s*(?P<val>.*?)\s*</\s*{prefix}parameter{end_tail}",
+            rf"<\s*{prefix}parameter\s+name\s*=\s*[\"'](?P<key>[^\"'>]+)[\"']?(?:\s+string\s*=\s*[\"'](?P<string>true|false)[\"']?)?\s*{tail}\s*(?P<val>.*?)\s*</\s*{prefix}parameter{end_tail}",
             re.DOTALL | flags,
         )
 
@@ -61,10 +64,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def _parse_arguments(self, body: str) -> Dict:
         args: Dict[str, object] = {}
         for match in self.param_pattern.finditer(body):
-            key = match.group("key")
-            string_flag = (match.group("string") or "true").lower()
+            key = match.group("key").strip()  # Strip whitespace from parameter name
+            string_flag = (match.group("string") or "true").lower().strip()
             is_str = string_flag == "true"
-            raw_val = match.group("val")
+            raw_val = match.group("val").strip()  # Strip whitespace from value
             if is_str:
                 args[key] = raw_val
             else:
@@ -77,7 +80,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def _decode_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
         calls = []
         for match in self.invoke_pattern.finditer(block):
-            name = match.group("name")
+            name = match.group("name").strip()  # Strip whitespace from function name
             args = self._parse_arguments(match.group("body"))
             parsed_calls = self.parse_base_json(
                 {"name": name, "parameters": args}, tools
@@ -194,6 +197,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         if not self._buffer:
             return StreamingParseResult()
+
+        logger.debug(f"Flushing buffer: {repr(self._buffer[:200])}")
 
         # Try to parse what we have, even without the closing tag
         result = self.detect_and_parse(self._buffer, tools)

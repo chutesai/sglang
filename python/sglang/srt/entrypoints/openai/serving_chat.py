@@ -604,8 +604,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             flush_result = parser.detector.flush_buffered_content(
                                 request.tools
                             )
+
+                            # Emit tool calls if any were parsed
                             if flush_result.calls:
-                                # Emit the buffered tool calls
                                 history_tool_calls_cnt = (
                                     self._get_history_tool_calls_cnt(request)
                                 )
@@ -635,6 +636,28 @@ class OpenAIServingChat(OpenAIServingBase):
                                     yield f"data: {chunk.model_dump_json()}\n\n"
                                     # Mark that this choice has tool calls
                                     has_tool_calls[index] = True
+
+                            # Also emit normal_text if there's unparsable buffered content
+                            # (e.g., incomplete XML that couldn't be parsed as tool calls)
+                            elif flush_result.normal_text:
+                                logger.warning(
+                                    f"Flushed unparsable buffered content: "
+                                    f"{repr(flush_result.normal_text[:100])}"
+                                )
+                                choice_data = ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        content=flush_result.normal_text
+                                    ),
+                                    finish_reason=None,
+                                )
+                                chunk = ChatCompletionStreamResponse(
+                                    id=content["meta_info"]["id"],
+                                    created=int(time.time()),
+                                    choices=[choice_data],
+                                    model=request.model,
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # Then check for any remaining argument diffs
                         remaining_chunk = self._check_for_unstreamed_tool_args(
