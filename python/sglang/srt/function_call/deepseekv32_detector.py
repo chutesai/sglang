@@ -37,6 +37,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         self.bot_pattern = re.compile(rf"<{prefix}function_calls{tail}")
         self.eot_pattern = re.compile(rf"</{prefix}function_calls{end_tail}")
+        self._start_tokens = [
+            "<function_calls",
+            "<｜DSML｜function_calls",
+        ]
 
         self.invoke_pattern = re.compile(
             rf"<{prefix}invoke name=\"(?P<name>[^\"]+)\"{tail}\s*(?P<body>.*?)\s*</{prefix}invoke{end_tail}",
@@ -97,6 +101,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
         then parse the complete block.
         """
         self._buffer += new_text
+
+        # No start token yet; keep buffering if current buffer could be a partial prefix
+        # of the start token (e.g. "<function" across chunks).
+        if not self.bot_pattern.search(self._buffer):
+            for token in self._start_tokens:
+                if self._ends_with_partial_token(self._buffer, token):
+                    return StreamingParseResult()
+
+            normal_text = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=normal_text)
+
         has_start = bool(self.bot_pattern.search(self._buffer))
         if not has_start:
             normal_text = self._buffer

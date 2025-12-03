@@ -51,3 +51,24 @@ def test_dsml_parser_streaming_collects_until_end():
     assert len(second.calls) == 1
     parsed_args = json.loads(second.calls[0].parameters)
     assert parsed_args["x"] == "hi"
+
+
+def test_dsml_streaming_partial_start_token():
+    detector = DeepSeekV32Detector()
+    tools = _make_tools()
+    part1 = "Lead <｜DS"
+    part2 = (
+        'ML｜function_calls><｜DSML｜invoke name="foo">'
+        '<｜DSML｜parameter name="x" string="false">2</｜DSML｜parameter>'
+        "</｜DSML｜invoke></｜DSML｜function_calls>"
+    )
+
+    first = detector.parse_streaming_increment(part1, tools)
+    assert not first.calls
+    assert first.normal_text == ""
+
+    result = detector.parse_streaming_increment(part2, tools)
+    assert result.calls
+    parsed_args = json.loads(result.calls[0].parameters)
+    assert parsed_args["x"] == 2
+    assert result.normal_text == "Lead"
