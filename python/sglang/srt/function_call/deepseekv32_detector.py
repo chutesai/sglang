@@ -100,9 +100,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
         block = text[start_match.end() : block_end]
         calls = self._decode_block(block, tools)
 
-        # If we couldn't find an end tag and also didn't decode anything, treat as normal text.
+        # If we couldn't find an end tag and also didn't decode anything,
+        # check if we at least found complete invoke blocks
         if not end_match and not calls:
-            return StreamingParseResult(normal_text=text)
+            # Check if there are complete invoke blocks (even if undefined/invalid)
+            has_complete_invoke = bool(self.invoke_pattern.search(block))
+            if has_complete_invoke:
+                # We found invoke blocks but they were undefined/invalid
+                # Consume the markup instead of leaking it as normal text
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+            else:
+                # No complete invoke blocks, treat as normal text
+                return StreamingParseResult(normal_text=text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -154,28 +163,46 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.eot_pattern.search(self._buffer):
             result = self.detect_and_parse(self._buffer, tools)
             self._buffer = ""
-            # Mark that we've emitted tool calls if we found any
-            if result.calls:
-                self._tool_calls_emitted = True
+            # No need to set _tool_calls_emitted here since we already have the closing tag
             return result
 
         # Fallback: if we have a complete invoke block that reaches the current end
         # of the buffer but the model never emitted </function_calls>, parse what we
         # have so far.
-        last_invoke_end = None
-        for match in self.invoke_pattern.finditer(self._buffer):
-            last_invoke_end = match.end()
+        # Search in the trimmed buffer to avoid issues with trailing whitespace
+        trimmed_buffer = self._buffer.rstrip()
+        if trimmed_buffer:
+            last_invoke_end = None
+            for match in self.invoke_pattern.finditer(trimmed_buffer):
+                last_invoke_end = match.end()
 
-        trimmed_len = len(self._buffer.rstrip())
-        if last_invoke_end is not None and last_invoke_end == trimmed_len:
-            result = self.detect_and_parse(self._buffer, tools)
-            self._buffer = ""
-            # Mark that we've emitted tool calls - consume any remaining tags
-            if result.calls:
+            if last_invoke_end is not None and last_invoke_end == len(trimmed_buffer):
+                result = self.detect_and_parse(self._buffer, tools)
+                self._buffer = ""
+                # Mark that we've processed tool call markup - consume any remaining tags
+                # Set flag even if calls are empty (undefined/invalid tools) since we found invoke blocks
                 self._tool_calls_emitted = True
-            return result
+                return result
 
         return StreamingParseResult()
+
+    def flush_buffered_content(self, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Force-parse any buffered content when generation finishes.
+        This handles the case where the model generates a complete tool call
+        but doesn't emit the closing </｜DSML｜function_calls> tag before stopping.
+        """
+        if not self._buffer:
+            return StreamingParseResult()
+
+        # Try to parse what we have, even without the closing tag
+        result = self.detect_and_parse(self._buffer, tools)
+        self._buffer = ""
+
+        # Reset state
+        self._tool_calls_emitted = False
+
+        return result
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

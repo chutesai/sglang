@@ -597,6 +597,46 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Send any remaining tool call arguments when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
+
+                        # First, check if there's buffered content that needs to be flushed
+                        # (e.g., for DeepSeek V3.2 when model stops before emitting closing tag)
+                        if hasattr(parser.detector, "flush_buffered_content"):
+                            flush_result = parser.detector.flush_buffered_content(
+                                request.tools
+                            )
+                            if flush_result.calls:
+                                # Emit the buffered tool calls
+                                history_tool_calls_cnt = (
+                                    self._get_history_tool_calls_cnt(request)
+                                )
+                                for call_item in flush_result.calls:
+                                    tool_call_id = self._process_tool_call_id(
+                                        call_item, history_tool_calls_cnt
+                                    )
+                                    tool_call = ToolCall(
+                                        id=tool_call_id,
+                                        index=call_item.tool_index,
+                                        function=FunctionResponse(
+                                            name=call_item.name,
+                                            arguments=call_item.parameters,
+                                        ),
+                                    )
+                                    choice_data = ChatCompletionResponseStreamChoice(
+                                        index=index,
+                                        delta=DeltaMessage(tool_calls=[tool_call]),
+                                        finish_reason=None,
+                                    )
+                                    chunk = ChatCompletionStreamResponse(
+                                        id=content["meta_info"]["id"],
+                                        created=int(time.time()),
+                                        choices=[choice_data],
+                                        model=request.model,
+                                    )
+                                    yield f"data: {chunk.model_dump_json()}\n\n"
+                                    # Mark that this choice has tool calls
+                                    has_tool_calls[index] = True
+
+                        # Then check for any remaining argument diffs
                         remaining_chunk = self._check_for_unstreamed_tool_args(
                             parser, content, request, index
                         )

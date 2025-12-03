@@ -50,11 +50,11 @@ def test_streaming_closing_tag_after_invoke(tools):
 
     # Chunk 2: Opening tag and complete invoke block (no closing tag yet)
     tool_call_chunk = (
-        '<｜DSML｜function_calls>\n'
+        "<｜DSML｜function_calls>\n"
         '<｜DSML｜invoke name="get_capital_info">\n'
         '<｜DSML｜parameter name="name" string="true">Paris</｜DSML｜parameter>\n'
         '<｜DSML｜parameter name="population" string="false">2100000</｜DSML｜parameter>\n'
-        '</｜DSML｜invoke>'
+        "</｜DSML｜invoke>"
     )
     result2 = detector.parse_streaming_increment(tool_call_chunk, tools)
 
@@ -78,11 +78,11 @@ def test_streaming_closing_tag_split_across_chunks(tools):
 
     # Chunk 1: Complete invoke block
     tool_call_chunk = (
-        '<｜DSML｜function_calls>\n'
+        "<｜DSML｜function_calls>\n"
         '<｜DSML｜invoke name="get_capital_info">\n'
         '<｜DSML｜parameter name="name" string="true">Paris</｜DSML｜parameter>\n'
         '<｜DSML｜parameter name="population" string="false">2100000</｜DSML｜parameter>\n'
-        '</｜DSML｜invoke>'
+        "</｜DSML｜invoke>"
     )
     result1 = detector.parse_streaming_increment(tool_call_chunk, tools)
     assert len(result1.calls) == 1
@@ -106,12 +106,12 @@ def test_streaming_normal_flow_with_closing_tag(tools):
     # Chunk 1: Complete tool call with closing tag
     complete_call = (
         "I'll use the tool.\n\n"
-        '<｜DSML｜function_calls>\n'
+        "<｜DSML｜function_calls>\n"
         '<｜DSML｜invoke name="get_capital_info">\n'
         '<｜DSML｜parameter name="name" string="true">Paris</｜DSML｜parameter>\n'
         '<｜DSML｜parameter name="population" string="false">2100000</｜DSML｜parameter>\n'
-        '</｜DSML｜invoke>\n'
-        '</｜DSML｜function_calls>'
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜function_calls>"
     )
     result = detector.parse_streaming_increment(complete_call, tools)
 
@@ -143,15 +143,15 @@ def test_multiple_tool_calls_sequential_indices(tools):
     )
 
     complete_call = (
-        '<｜DSML｜function_calls>\n'
+        "<｜DSML｜function_calls>\n"
         '<｜DSML｜invoke name="get_capital_info">\n'
         '<｜DSML｜parameter name="name" string="true">Paris</｜DSML｜parameter>\n'
         '<｜DSML｜parameter name="population" string="false">2100000</｜DSML｜parameter>\n'
-        '</｜DSML｜invoke>\n'
+        "</｜DSML｜invoke>\n"
         '<｜DSML｜invoke name="get_weather">\n'
         '<｜DSML｜parameter name="city" string="true">London</｜DSML｜parameter>\n'
-        '</｜DSML｜invoke>\n'
-        '</｜DSML｜function_calls>'
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜function_calls>"
     )
     result = detector.parse_streaming_increment(complete_call, tools)
 
@@ -169,11 +169,11 @@ def test_plain_format_closing_tag(tools):
 
     # Chunk 1: Plain format invoke block
     tool_call_chunk = (
-        '<function_calls>\n'
+        "<function_calls>\n"
         '<invoke name="get_capital_info">\n'
         '<parameter name="name" string="true">Paris</parameter>\n'
         '<parameter name="population" string="false">2100000</parameter>\n'
-        '</invoke>'
+        "</invoke>"
     )
     result1 = detector.parse_streaming_increment(tool_call_chunk, tools)
     assert len(result1.calls) == 1
