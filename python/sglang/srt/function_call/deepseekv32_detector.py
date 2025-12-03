@@ -43,8 +43,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             "<function_calls",
             "<｜dsml｜function_calls",
         ]
-        # Track whether we're waiting for the closing function_calls tag after early parsing
-        self._waiting_for_end_tag = False
+        # Track whether we've emitted tool calls and should consume remaining tags
+        self._tool_calls_emitted = False
 
         self.invoke_pattern = re.compile(
             rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
@@ -111,42 +111,29 @@ class DeepSeekV32Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         """
         Simplified streaming: buffer until the closing </｜DSML｜function_calls> is seen,
-        then parse the complete block.
+        then parse the complete block. After emitting tool calls, consume any remaining
+        tool-related tags.
         """
         self._buffer += new_text
 
-        # If we're waiting for the closing tag after early parsing, consume it
-        if self._waiting_for_end_tag:
+        # If we've already emitted tool calls, consume any remaining tool-related tags
+        if self._tool_calls_emitted:
+            # Check if we've hit the closing tag
             end_match = self.eot_pattern.search(self._buffer)
             if end_match:
-                # Consume everything up to and including the closing tag
+                # Found closing tag, consume it and reset
                 self._buffer = self._buffer[end_match.end() :]
-                self._waiting_for_end_tag = False
+                self._tool_calls_emitted = False
                 # Return any remaining text after the closing tag
                 if self._buffer:
                     remaining = self._buffer
                     self._buffer = ""
                     return StreamingParseResult(normal_text=remaining)
                 return StreamingParseResult()
-            # Check if we might have a partial closing tag by checking against end patterns
-            # Possible closing tags: "</function_calls>" or "</｜DSML｜function_calls>"
-            closing_patterns = ["</function_calls>", "</｜dsml｜function_calls>"]
-            buffer_low = self._buffer.lower()
-            is_partial = False
-            for pattern in closing_patterns:
-                if self._ends_with_partial_token(buffer_low, pattern):
-                    is_partial = True
-                    break
 
-            if is_partial:
-                # Keep buffering, might be partial closing tag
-                return StreamingParseResult()
-            else:
-                # Not a closing tag, return as normal text
-                normal_text = self._buffer
-                self._buffer = ""
-                self._waiting_for_end_tag = False
-                return StreamingParseResult(normal_text=normal_text)
+            # Keep consuming until we see the complete closing tag
+            # Just buffer everything and return empty - the closing tag will eventually arrive
+            return StreamingParseResult()
 
         # No start token yet; keep buffering if current buffer could be a partial prefix
         # of the start token (e.g. "<function" across chunks).
@@ -167,7 +154,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.eot_pattern.search(self._buffer):
             result = self.detect_and_parse(self._buffer, tools)
             self._buffer = ""
-            self._waiting_for_end_tag = False
+            # Mark that we've emitted tool calls if we found any
+            if result.calls:
+                self._tool_calls_emitted = True
             return result
 
         # Fallback: if we have a complete invoke block that reaches the current end
@@ -181,8 +170,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if last_invoke_end is not None and last_invoke_end == trimmed_len:
             result = self.detect_and_parse(self._buffer, tools)
             self._buffer = ""
-            # Mark that we're waiting for the closing tag
-            self._waiting_for_end_tag = True
+            # Mark that we've emitted tool calls - consume any remaining tags
+            if result.calls:
+                self._tool_calls_emitted = True
             return result
 
         return StreamingParseResult()
