@@ -42,6 +42,15 @@ class JsonArrayParser(BaseFormatDetector):
         """
         return super().parse_streaming_increment(new_text, tools)
 
+    def flush_buffered_content(self, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Flush any buffered content when generation finishes.
+        For JSON array parser, we don't need to do anything special as JSON
+        parsing is complete when the model stops generating.
+        """
+        # No buffered content to flush for JSON array parsing
+        return StreamingParseResult()
+
     def structure_info(self) -> callable:
         """
         Return a function that creates StructureInfo for constrained generation.

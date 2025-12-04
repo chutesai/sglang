@@ -600,10 +600,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         # First, check if there's buffered content that needs to be flushed
                         # (e.g., for DeepSeek V3.2 when model stops before emitting closing tag)
-                        if hasattr(parser.detector, "flush_buffered_content"):
-                            flush_result = parser.detector.flush_buffered_content(
-                                request.tools
-                            )
+                        # Check parser.detector (FunctionCallParser) or parser itself (JsonArrayParser)
+                        flush_method = None
+                        if hasattr(parser, "detector") and hasattr(
+                            parser.detector, "flush_buffered_content"
+                        ):
+                            flush_method = parser.detector.flush_buffered_content
+                        elif hasattr(parser, "flush_buffered_content"):
+                            flush_method = parser.flush_buffered_content
+
+                        if flush_method:
+                            flush_result = flush_method(request.tools)
 
                             # Emit tool calls if any were parsed
                             if flush_result.calls:
@@ -698,6 +705,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
+            logger.debug(f"Exited async for loop. About to send finish_reason chunks.")
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
@@ -706,6 +714,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 final_finish_reason = finish_reason_type
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
+                    logger.debug(
+                        f"Changed finish_reason from 'stop' to 'tool_calls' for index {idx}"
+                    )
 
                 finish_reason_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"][
