@@ -113,6 +113,7 @@ def _validate_sharded_model(
         return False, index_error, []
 
     # Pattern for sharded files: model-00001-of-00009.safetensors
+    # or zero-indexed like: model-00000-of-00009.safetensors
     shard_pattern = re.compile(r"(.*?)-(\d+)-of-(\d+)\.(safetensors|bin)")
 
     # Group files by shard pattern (prefix-*-of-N)
@@ -122,6 +123,7 @@ def _validate_sharded_model(
         match = shard_pattern.match(base_name)
         if match:
             prefix = match.group(1)
+            shard_id_str = match.group(2)
             total_shards_str = match.group(3)
             suffix = match.group(4)
 
@@ -135,7 +137,7 @@ def _validate_sharded_model(
                     "files": [],
                 }
 
-            shard_id = int(match.group(2))
+            shard_id = int(shard_id_str)
             shard_groups[group_key]["found_shards"].append(shard_id)
             shard_groups[group_key]["files"].append(f)
 
@@ -146,7 +148,26 @@ def _validate_sharded_model(
     for group_key, group_info in shard_groups.items():
         total_shards = group_info["total"]
         found_shards = set(group_info["found_shards"])
-        expected_shards = set(range(1, total_shards + 1))
+
+        if not found_shards:
+            # No shards found at all for this group
+            return (
+                False,
+                f"No shards found for {group_key}",
+                [],
+            )
+
+        max_shard = max(found_shards)
+
+        # Detect 0-based vs 1-based indexing:
+        # - If max_shard == total_shards - 1, we assume 0-based (0..total_shards-1)
+        # - Otherwise, we assume 1-based (1..total_shards)
+        if max_shard == total_shards - 1:
+            # 0-based indexing: 0..total_shards-1
+            expected_shards = set(range(0, total_shards))
+        else:
+            # 1-based indexing: 1..total_shards
+            expected_shards = set(range(1, total_shards + 1))
 
         # Check for missing shards
         missing_shards = expected_shards - found_shards
