@@ -168,6 +168,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -396,6 +398,7 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+    speculative_moe_a2a_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -459,7 +462,7 @@ class ServerArgs:
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
-    dllm_block_size: Optional[int] = None
+    dllm_algorithm_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -540,6 +543,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -1280,6 +1284,21 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
+                if (
+                    not self.disable_radix_cache
+                    and self.attention_backend == "trtllm_mha"
+                ):
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
         elif model_arch in [
             "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
@@ -3019,6 +3038,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
+        parser.add_argument(
+            "--speculative-moe-a2a-backend",
+            type=str,
+            choices=MOE_A2A_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_a2a_backend,
+            help="Choose the backend for MoE A2A in speculative decoding",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3077,7 +3103,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
+            choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -3335,13 +3361,13 @@ class ServerArgs:
             "--dllm-algorithm",
             type=str,
             default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm.",
+            help="The diffusion LLM algorithm, such as LowConfidence.",
         )
         parser.add_argument(
-            "--dllm-block-size",
-            type=int,
-            default=ServerArgs.dllm_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+            "--dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.dllm_algorithm_config,
+            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
         )
 
         # Double Sparsity
@@ -3720,6 +3746,11 @@ class ServerArgs:
             "--enable-nsa-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
+        )
+        parser.add_argument(
+            "--enable-fused-qk-norm-rope",
+            action="store_true",
+            help="Enable fused qk normalization and rope rotary embedding.",
         )
 
         # Dynamic batch tokenizer
