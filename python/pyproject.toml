@@ -31,7 +31,7 @@ dependencies = [
   "flashinfer_cubin==0.5.3",
   "gguf",
   "hf_transfer",
-  "huggingface_hub<1.0",
+  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",

@@ -19,11 +19,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek-V3.2 DSML function call format.
 
-    Format:
+    Supports two parameter encodings inside each invoke block:
+    1) XML parameter tags (original DeepSeek V3.2 format):
     <｜DSML｜function_calls>
     <｜DSML｜invoke name="tool">
     <｜DSML｜parameter name="key" string="true|false">value</｜DSML｜parameter>
     ...
+    </｜DSML｜invoke>
+    ...
+    </｜DSML｜function_calls>
+
+    2) Direct JSON object
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="tool">
+    {"key": "value"}
     </｜DSML｜invoke>
     ...
     </｜DSML｜function_calls>
@@ -62,6 +71,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return bool(self.bot_pattern.search(text))
 
     def _parse_arguments(self, body: str) -> Dict:
+        # First, try the direct JSON format for the entire invoke body
+        stripped_body = body.strip()
+        if stripped_body.startswith("{") and stripped_body.endswith("}"):
+            try:
+                parsed = json.loads(stripped_body)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                # Fall back to DSML parameter parsing on JSON errors
+                logger.debug(
+                    "DeepSeekV32Detector: JSON parameter parse failed", exc_info=True
+                )
+
         args: Dict[str, object] = {}
         for match in self.param_pattern.finditer(body):
             key = match.group("key").strip()  # Strip whitespace from parameter name
