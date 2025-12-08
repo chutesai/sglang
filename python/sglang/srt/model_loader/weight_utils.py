@@ -310,6 +310,11 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
+    # If we have a local snapshot and are in offline mode, we need to skip
+    # attempts to re-download; i.e. skip validation.
+    if found_local_snapshot_dir and huggingface_hub.constants.HF_HUB_OFFLINE:
+        return found_local_snapshot_dir
+
     # if local snapshot exists, validate it contains at least one weight file
     # matching allow_patterns before skipping download.
     if found_local_snapshot_dir is None:
