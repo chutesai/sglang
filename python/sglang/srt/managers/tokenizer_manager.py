@@ -1669,6 +1669,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "reasoning_tokens": recv_obj.reasoning_tokens[i],
                     }
                 )
 

@@ -752,6 +752,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        reasoning_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
@@ -860,6 +861,13 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                # Compute reasoning_tokens from grammar state if available
+                grammar = getattr(req, "grammar", None)
+                tokens_after = getattr(grammar, "tokens_after_think_end", None)
+                if tokens_after is not None and tokens_after >= 0:
+                    reasoning_tokens.append(len(output_ids_) - tokens_after)
+                else:
+                    reasoning_tokens.append(0)
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -980,6 +988,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
