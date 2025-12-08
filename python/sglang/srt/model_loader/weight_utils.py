@@ -331,24 +331,6 @@ def find_local_hf_snapshot_dir(
         )
         blobs_dir = os.path.join(repo_folder, "blobs")
 
-        # Check for incomplete download markers
-        incomplete_files = []
-        if os.path.isdir(blobs_dir):
-            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
-
-        if incomplete_files:
-            log_info_on_rank0(
-                logger,
-                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
-                f"{model_name_or_path}. Will clean up and re-download.",
-            )
-            _cleanup_corrupted_model_cache(
-                model_name_or_path,
-                found_local_snapshot_dir,
-                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
-            )
-            return None
-
         local_weight_files: List[str] = []
         try:
             for pattern in allow_patterns:
