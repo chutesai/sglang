@@ -22,6 +22,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 
+import huggingface_hub.constants
 import torch
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -97,9 +98,21 @@ for name, cls in _CONFIG_REGISTRY.items():
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: str = None,
 ):
     if os.path.exists(model_path):
         return model_path
+
+    if huggingface_hub.constants.HF_HUB_OFFLINE:
+        from sglang.srt.configs.model_config import local_or_cached_path
+
+        config_file = local_or_cached_path("config.json", model_path, revision=revision)
+        if config_file:
+            return os.path.dirname(config_file)
+        else:
+            raise RuntimeError(
+                f"Did not find local download of {model_path} {revision=} and HF_HUB_OFFLINE is set!"
+            )
 
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
@@ -160,7 +173,7 @@ def _load_deepseek_v32_model(
     **kwargs,
 ):
     # first get the local path
-    local_path = download_from_hf(model_path)
+    local_path = download_from_hf(model_path, revision=revision)
     # then load the config file in json
     config_file = os.path.join(local_path, "config.json")
     if not os.path.exists(config_file):
@@ -192,7 +205,7 @@ def _load_mistral_large_3_for_causal_LM(
     **kwargs,
 ):
     # first get the local path
-    local_path = download_from_hf(model_path)
+    local_path = download_from_hf(model_path, revision=revision)
     # then load the config file in json
     parser = mistral_utils.MistralConfigParser()
     config_dict, _ = parser.parse(local_path)
@@ -339,11 +352,12 @@ def get_generation_config(
 def get_sparse_attention_config(
     model: str,
     sparse_attention_config_filename: str = "sparse_attention_config.json",
+    revision: str = None,
 ) -> Dict[str, Any]:
     is_local = os.path.isdir(model)
     if not is_local:
         # Download the config files.
-        model = download_from_hf(model, allow_patterns=["*.json"])
+        model = download_from_hf(model, allow_patterns=["*.json"], revision=revision)
 
     config_file = os.path.join(model, sparse_attention_config_filename)
     if not os.path.exists(config_file):

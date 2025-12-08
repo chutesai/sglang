@@ -772,7 +772,9 @@ class ModelConfig:
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
             # Try loading the sparse attention config
-            sparse_attn_config = get_sparse_attention_config(self.model_path)
+            sparse_attn_config = get_sparse_attention_config(
+                self.model_path, revision=self.revision
+            )
             if not sparse_attn_config:
                 return
             self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (

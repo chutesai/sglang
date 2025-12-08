@@ -868,12 +868,16 @@ class SchedulerOutputProcessorMixin:
                 if tokens_after is not None and tokens_after >= 0:
                     reasoning_token_count = len(output_ids_) - tokens_after
                 elif hasattr(self, "tokenizer"):
-                    think_end_ids = getattr(self.tokenizer, "reasoning_think_end_ids", None)
+                    think_end_ids = getattr(
+                        self.tokenizer, "reasoning_think_end_ids", None
+                    )
                     if think_end_ids:
                         # Scan output_ids for think_end_ids sequence
                         end_len = len(think_end_ids)
                         for idx in range(len(output_ids_) - end_len + 1):
-                            if list(output_ids_[idx:idx + end_len]) == list(think_end_ids):
+                            if list(output_ids_[idx : idx + end_len]) == list(
+                                think_end_ids
+                            ):
                                 reasoning_token_count = idx + end_len
                                 break
                         else:
