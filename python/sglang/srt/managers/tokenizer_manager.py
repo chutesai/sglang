@@ -1669,7 +1669,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
-                        "reasoning_tokens": recv_obj.reasoning_tokens[i],
+                        "reasoning_tokens": getattr(
+                            recv_obj, "reasoning_tokens", [0] * len(recv_obj.rids)
+                        )[i],
                     }
                 )
 
