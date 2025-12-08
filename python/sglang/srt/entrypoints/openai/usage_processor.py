@@ -86,10 +86,16 @@ class UsageProcessor:
         reasoning_tokens: int = 0,
     ) -> UsageInfo:
         """Calculate token usage information"""
+        # Build prompt_tokens_details with both cached_tokens and reasoning_tokens
+        details = {}
+        if cached_tokens:
+            details.update(cached_tokens)
+        if reasoning_tokens > 0:
+            details["reasoning_tokens"] = reasoning_tokens
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=cached_tokens,
+            prompt_tokens_details=details if details else None,
             reasoning_tokens=reasoning_tokens,
         )
