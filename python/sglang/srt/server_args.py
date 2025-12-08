@@ -131,7 +131,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
+LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
@@ -2051,10 +2051,16 @@ class ServerArgs:
         if self.dllm_algorithm is None:
             return
         if not self.disable_cuda_graph:
-            logger.warning(
-                "Cuda graph is disabled because of using diffusion LLM inference"
-            )
-            self.disable_cuda_graph = True
+            if self.cuda_graph_bs != [1]:
+                logger.warning(
+                    "Cuda graph bs is set to [1] because of using diffusion LLM inference"
+                )
+                self.cuda_graph_bs = [1]
+            if self.attention_backend != "flashinfer":
+                logger.warning(
+                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                )
+                self.attention_backend = "flashinfer"
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"

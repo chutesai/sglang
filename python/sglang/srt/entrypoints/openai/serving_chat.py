@@ -175,7 +175,7 @@ class OpenAIServingChat(OpenAIServingBase):
             should_force_reasoning = False
             if self.template_manager.force_reasoning:
                 should_force_reasoning = True
-            elif self._get_enable_thinking_from_request(request):
+            elif self._get_reasoning_from_request(request):
                 should_force_reasoning = True
             if should_force_reasoning:
                 custom_params = sampling_params.get("custom_params")
@@ -233,6 +233,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
+            reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -463,7 +464,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_enable_thinking_from_request(request):
+            if self._get_reasoning_from_request(
+                request
+            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
+                # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -892,7 +896,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
+                    or self._get_reasoning_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
@@ -1162,7 +1166,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_enable_thinking_from_request(request)
+                or self._get_reasoning_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
@@ -1192,17 +1196,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
-    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
-
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
-
-        Args:
-            request_obj: The request object (or an item from a list of requests).
-        Returns:
-            The boolean value of 'enable_thinking' if found, otherwise False.
-        """
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Judge whether the request needs reasoning"""
         chat_template_kwargs = (
             request.chat_template_kwargs
             if hasattr(request, "chat_template_kwargs")
