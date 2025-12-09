@@ -732,7 +732,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
         """Clamp max_new_tokens in the raw request dict before validation."""
-        limit = self.server_args.max_completion_tokens
+        is_stream = getattr(obj, "stream", False)
+        if is_stream:
+            limit = self.server_args.max_stream_completion_tokens
+        else:
+            limit = self.server_args.max_completion_tokens
+
         if limit is None:
             return
 
@@ -876,7 +881,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = SamplingParams(**sampling_kwargs)
-        self._enforce_sampling_max_completion_limit(sampling_params)
+        is_stream = getattr(obj, "stream", False)
+        self._enforce_sampling_max_completion_limit(sampling_params, is_stream)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
@@ -927,11 +933,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         return tokenized_obj
 
     def _enforce_sampling_max_completion_limit(
-        self, sampling_params: SamplingParams
+        self, sampling_params: SamplingParams, is_stream: bool = False
     ) -> None:
-        """Apply the global --max-completion-tokens cap to finalized sampling params."""
+        """Apply the global --max-completion-tokens or --max-stream-completion-tokens cap to finalized sampling params."""
 
-        limit = self.server_args.max_completion_tokens
+        if is_stream:
+            limit = self.server_args.max_stream_completion_tokens
+            arg_name = "--max-stream-completion-tokens"
+        else:
+            limit = self.server_args.max_completion_tokens
+            arg_name = "--max-completion-tokens"
+
         if limit is None:
             return
 
@@ -939,9 +951,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if current is None or current > limit:
             if current is not None and current > limit:
                 logger.debug(
-                    "Capping max_new_tokens from %s to %s due to --max-completion-tokens",
+                    "Capping max_new_tokens from %s to %s due to %s",
                     current,
                     limit,
+                    arg_name,
                 )
             sampling_params.max_new_tokens = limit
 
@@ -950,9 +963,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             and sampling_params.min_new_tokens > sampling_params.max_new_tokens
         ):
             raise ValueError(
-                "min_new_tokens ({}) exceeds the configured --max-completion-tokens ({}). "
-                "Lower min_new_tokens or increase --max-completion-tokens.".format(
-                    sampling_params.min_new_tokens, limit
+                "min_new_tokens ({}) exceeds the configured {} ({}). "
+                "Lower min_new_tokens or increase {}.".format(
+                    sampling_params.min_new_tokens, arg_name, limit, arg_name
                 )
             )
 

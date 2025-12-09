@@ -272,6 +272,7 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
+    max_stream_completion_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
@@ -705,6 +706,18 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        # If only one of max_completion_tokens or max_stream_completion_tokens is set,
+        # use that value for both.
+        if (
+            self.max_completion_tokens is not None
+            and self.max_stream_completion_tokens is None
+        ):
+            self.max_stream_completion_tokens = self.max_completion_tokens
+        elif (
+            self.max_stream_completion_tokens is not None
+            and self.max_completion_tokens is None
+        ):
+            self.max_completion_tokens = self.max_stream_completion_tokens
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -2358,8 +2371,17 @@ class ServerArgs:
             "--max-completion-tokens",
             type=int,
             default=ServerArgs.max_completion_tokens,
-            help="Hard upper bound for the number of new tokens each request is allowed to generate."
-            " Requests asking for more tokens will be capped at this value.",
+            help="Hard upper bound for the number of new tokens each non-streaming request is allowed to generate."
+            " Requests asking for more tokens will be capped at this value."
+            " If --max-stream-completion-tokens is not set, this value is also used for streaming requests.",
+        )
+        parser.add_argument(
+            "--max-stream-completion-tokens",
+            type=int,
+            default=ServerArgs.max_stream_completion_tokens,
+            help="Hard upper bound for the number of new tokens each streaming request is allowed to generate."
+            " Requests asking for more tokens will be capped at this value."
+            " If --max-completion-tokens is not set, this value is also used for non-streaming requests.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
