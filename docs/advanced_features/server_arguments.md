@@ -124,7 +124,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--max-running-requests` | The maximum number of running requests. | `None` | Type: int |
 | `--max-queued-requests` | The maximum number of queued requests. This option is ignored when using disaggregation-mode. | `None` | Type: int |
 | `--max-total-tokens` | The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes. | `None` | Type: int |
-| `--max-completion-tokens` | Hard upper bound on the number of new tokens any single request may generate. Larger per-request values will be capped to this limit. | `None` | Type: int |
+| `--max-completion-tokens` | Hard upper bound on the number of new tokens any single request may generate in non-streaming mode. Larger per-request values will be capped to this limit. | `None` | Type: int |
+| `--max-stream-completion-tokens` | Hard upper bound on the number of new tokens any single request may generate in streaming mode. Larger per-request values will be capped to this limit. | `None` | Type: int |
 | `--chunked-prefill-size` | The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill. | `None` | Type: int |
 | `--max-prefill-tokens` | The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length. | `16384` | Type: int |
 | `--schedule-policy` | The scheduling policy of the requests. | `fcfs` | `lpm`, `random`, `fcfs`, `dfs-weight`, `lof`, `priority` |
