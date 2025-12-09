@@ -142,15 +142,22 @@ class OpenAIServingChat(OpenAIServingBase):
         # Check against --max-completion-tokens / --max-stream-completion-tokens caps
         if request.stream:
             server_cap = self.tokenizer_manager.server_args.max_stream_completion_tokens
-            cap_name = "max_stream_completion_tokens"
+            other_cap = self.tokenizer_manager.server_args.max_completion_tokens
+            mode_name = "streaming"
+            other_mode = "non-streaming"
         else:
             server_cap = self.tokenizer_manager.server_args.max_completion_tokens
-            cap_name = "max_completion_tokens"
+            other_cap = self.tokenizer_manager.server_args.max_stream_completion_tokens
+            mode_name = "non-streaming"
+            other_mode = "streaming"
         if max_output_tokens and server_cap and max_output_tokens > server_cap:
-            return (
+            msg = (
                 f"max_completion_tokens is too large: {max_output_tokens}. "
-                f"This server is configured with --{cap_name.replace('_', '-')}={server_cap}."
+                f"This server allows up to {server_cap} completion tokens for {mode_name} requests."
             )
+            if other_cap and other_cap > server_cap:
+                msg += f" ({other_mode} mode allows up to {other_cap})"
+            return msg
 
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
