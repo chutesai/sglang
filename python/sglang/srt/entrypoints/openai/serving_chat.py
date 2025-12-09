@@ -139,6 +139,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
+        # Check against --max-completion-tokens / --max-stream-completion-tokens caps
+        if request.stream:
+            server_cap = self.tokenizer_manager.server_args.max_stream_completion_tokens
+            cap_name = "max_stream_completion_tokens"
+        else:
+            server_cap = self.tokenizer_manager.server_args.max_completion_tokens
+            cap_name = "max_completion_tokens"
+        if max_output_tokens and server_cap and max_output_tokens > server_cap:
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}. "
+                f"This server is configured with --{cap_name.replace('_', '-')}={server_cap}."
+            )
+
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
