@@ -72,22 +72,38 @@ class MistralDetector(BaseFormatDetector):
         """Check if the text contains a Mistral format tool call."""
         return self.bot_token in text
 
-    def _is_devstral_format(self, text: str) -> bool:
+    def _is_devstral_format(self, text: str) -> Optional[bool]:
         """
         Check if the text uses Devstral format ([TOOL_CALLS]name[ARGS]{...})
         vs legacy format ([TOOL_CALLS] [{...}]).
+
+        Returns:
+            True if Devstral format
+            False if legacy format
+            None if we can't determine yet (need more text)
         """
         idx = text.find(self.bot_token)
         if idx == -1:
-            return False
+            return None
 
         # Check what comes after [TOOL_CALLS]
-        after_token = text[idx + len(self.bot_token) :].lstrip()
-        # Legacy format starts with '[', Devstral format starts with function name or newline then name
-        if after_token.startswith("["):
+        after_token = text[idx + len(self.bot_token) :]
+        after_stripped = after_token.lstrip()
+
+        if not after_stripped:
+            # Not enough text to determine
+            return None
+
+        # Legacy format starts with '[', Devstral format starts with function name
+        if after_stripped.startswith("["):
             return False
-        # Devstral format: function name follows (possibly after newline)
-        return "[ARGS]" in text
+
+        # If first char is a letter or underscore, it's Devstral format
+        if after_stripped[0].isalpha() or after_stripped[0] == "_":
+            return True
+
+        # Unknown - shouldn't happen
+        return None
 
     def _parse_devstral_format(
         self, text: str, tools: List[Tool]
@@ -313,35 +329,35 @@ class MistralDetector(BaseFormatDetector):
         """
         Streaming incremental parsing for both Mistral formats.
 
-        For Devstral format ([TOOL_CALLS]name[ARGS]{...}), we buffer until
-        we have a complete tool call, then parse it.
+        For Devstral format ([TOOL_CALLS]name[ARGS]{...}), we do incremental
+        streaming of the arguments.
 
         For legacy format ([TOOL_CALLS] [{...}]), we delegate to the base class.
         """
         self._buffer += new_text
 
-        # Determine which format we're dealing with (only once per stream)
-        if self._devstral_mode is None and self.bot_token in self._buffer:
-            self._devstral_mode = self._is_devstral_format(self._buffer)
+        # Check if we have [TOOL_CALLS] yet
+        if self.bot_token not in self._buffer:
+            # Check if buffer might be a partial bot_token
+            if self._ends_with_partial_token(self._buffer, self.bot_token):
+                return StreamingParseResult()
+            # No tool call starting, return as normal text
+            normal_text = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=normal_text)
 
-        # If we haven't determined the mode yet, check for partial bot_token
+        # We have [TOOL_CALLS] - determine which format (only once per stream)
         if self._devstral_mode is None:
-            if not self.has_tool_call(self._buffer):
-                # Check if buffer might be a partial bot_token
-                if self._ends_with_partial_token(self._buffer, self.bot_token):
-                    return StreamingParseResult()
-                # No tool call starting, return as normal text
-                normal_text = self._buffer
-                self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text)
-            return StreamingParseResult()
+            format_result = self._is_devstral_format(self._buffer)
+            if format_result is None:
+                # Can't determine yet, need more text - keep buffering
+                return StreamingParseResult()
+            self._devstral_mode = format_result
 
         # Use legacy parsing for legacy format
-        if not self._devstral_mode:
-            # Reset buffer and call base class with accumulated text
+        if self._devstral_mode is False:
+            # For legacy format, use the base class streaming
             text_to_parse = self._buffer
-            self._buffer = ""
-            # Re-add to buffer for base class
             self._buffer = ""
             return super().parse_streaming_increment(text_to_parse, tools)
 
