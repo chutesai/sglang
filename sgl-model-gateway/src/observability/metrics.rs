@@ -263,6 +263,11 @@ pub fn init_metrics() {
         "sgl_tokenizer_factory_load_duration_seconds",
         "Time to load and initialize tokenizer"
     );
+
+    describe_counter!(
+        "sgl_router_http_responses_total",
+        "Total number of HTTP responses by status code"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -531,6 +536,15 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    // TODO delete the metrics (instead of setting them to zero)
+    pub fn remove_worker_metrics(worker_url: &str) {
+        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_worker_load","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
+    }
+
     pub fn set_job_queue_depth(depth: usize) {
         gauge!("sgl_router_job_queue_depth").set(depth as f64);
     }
@@ -562,6 +576,13 @@ impl RouterMetrics {
 
     pub fn record_job_shutdown_rejected() {
         counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+    }
+
+    pub fn record_http_status_code(status_code: u16) {
+        counter!("sgl_router_http_responses_total",
+            "status_code" => status_code.to_string()
+        )
+        .increment(1);
     }
 }
 
