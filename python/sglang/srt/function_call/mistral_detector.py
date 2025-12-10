@@ -59,6 +59,15 @@ class MistralDetector(BaseFormatDetector):
             re.DOTALL,
         )
 
+        # Streaming state for Devstral format
+        self._devstral_mode: Optional[bool] = (
+            None  # None = unknown, True = devstral, False = legacy
+        )
+        self._devstral_tool_calls_emitted = False
+        self._devstral_current_tool_name: Optional[str] = None
+        self._devstral_args_buffer = ""
+        self._devstral_streamed_args = ""
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Mistral format tool call."""
         return self.bot_token in text
@@ -297,6 +306,253 @@ class MistralDetector(BaseFormatDetector):
                 pass
 
         return None
+
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        """
+        Streaming incremental parsing for both Mistral formats.
+
+        For Devstral format ([TOOL_CALLS]name[ARGS]{...}), we buffer until
+        we have a complete tool call, then parse it.
+
+        For legacy format ([TOOL_CALLS] [{...}]), we delegate to the base class.
+        """
+        self._buffer += new_text
+
+        # Determine which format we're dealing with (only once per stream)
+        if self._devstral_mode is None and self.bot_token in self._buffer:
+            self._devstral_mode = self._is_devstral_format(self._buffer)
+
+        # If we haven't determined the mode yet, check for partial bot_token
+        if self._devstral_mode is None:
+            if not self.has_tool_call(self._buffer):
+                # Check if buffer might be a partial bot_token
+                if self._ends_with_partial_token(self._buffer, self.bot_token):
+                    return StreamingParseResult()
+                # No tool call starting, return as normal text
+                normal_text = self._buffer
+                self._buffer = ""
+                return StreamingParseResult(normal_text=normal_text)
+            return StreamingParseResult()
+
+        # Use legacy parsing for legacy format
+        if not self._devstral_mode:
+            # Reset buffer and call base class with accumulated text
+            text_to_parse = self._buffer
+            self._buffer = ""
+            # Re-add to buffer for base class
+            self._buffer = ""
+            return super().parse_streaming_increment(text_to_parse, tools)
+
+        # Devstral format streaming parsing
+        return self._parse_devstral_streaming(tools)
+
+    def _parse_devstral_streaming(self, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Handle streaming for Devstral format: [TOOL_CALLS]function_name[ARGS]{json}
+        """
+        # If we've already emitted tool calls, just consume remaining content
+        if self._devstral_tool_calls_emitted:
+            self._buffer = ""
+            return StreamingParseResult()
+
+        # Check if we have [TOOL_CALLS] token
+        if self.bot_token not in self._buffer:
+            # Could be partial, keep buffering
+            if self._ends_with_partial_token(self._buffer, self.bot_token):
+                return StreamingParseResult()
+            # Return normal text
+            normal_text = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Extract normal text before [TOOL_CALLS]
+        idx = self._buffer.find(self.bot_token)
+        normal_text = ""
+        if idx > 0:
+            normal_text = self._buffer[:idx].strip()
+            self._buffer = self._buffer[idx:]
+
+        # Check if we have [ARGS] yet
+        if "[ARGS]" not in self._buffer:
+            # Still waiting for function name and [ARGS]
+            # Check if we might have a partial [ARGS]
+            for i in range(1, len("[ARGS]")):
+                if self._buffer.endswith("[ARGS]"[:i]):
+                    return (
+                        StreamingParseResult(normal_text=normal_text)
+                        if normal_text
+                        else StreamingParseResult()
+                    )
+            # Keep buffering
+            return (
+                StreamingParseResult(normal_text=normal_text)
+                if normal_text
+                else StreamingParseResult()
+            )
+
+        # We have [TOOL_CALLS]...[ARGS], extract function name
+        match = self.devstral_pattern_lenient.search(self._buffer)
+        if not match:
+            return (
+                StreamingParseResult(normal_text=normal_text)
+                if normal_text
+                else StreamingParseResult()
+            )
+
+        function_name = match.group(1)
+        args_text = match.group(2).strip()
+
+        tool_indices = self._get_tool_indices(tools)
+
+        # Send tool name if we haven't yet
+        if not self.current_tool_name_sent:
+            if function_name and function_name in tool_indices:
+                self.current_tool_id = 0
+                self.current_tool_name_sent = True
+                self._devstral_current_tool_name = function_name
+                self._devstral_args_buffer = args_text
+                self._devstral_streamed_args = ""
+                self.streamed_args_for_tool = [""]
+
+                result = StreamingParseResult(
+                    normal_text=normal_text,
+                    calls=[
+                        ToolCallItem(
+                            tool_index=0,
+                            name=function_name,
+                            parameters="",
+                        )
+                    ],
+                )
+                return result
+            elif function_name and function_name not in tool_indices:
+                # Unknown function, consume and ignore
+                logger.warning(
+                    f"Model attempted to call undefined function: {function_name}"
+                )
+                self._buffer = ""
+                self._devstral_tool_calls_emitted = True
+                return (
+                    StreamingParseResult(normal_text=normal_text)
+                    if normal_text
+                    else StreamingParseResult()
+                )
+            else:
+                return (
+                    StreamingParseResult(normal_text=normal_text)
+                    if normal_text
+                    else StreamingParseResult()
+                )
+
+        # We've sent the tool name, now stream arguments
+        self._devstral_args_buffer = args_text
+
+        # Check if JSON is complete (balanced braces)
+        if args_text.startswith("{"):
+            brace_count = 0
+            in_string = False
+            escape_next = False
+            json_complete = False
+
+            for i, char in enumerate(args_text):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == "\\":
+                    escape_next = True
+                    continue
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if char == "{":
+                        brace_count += 1
+                    elif char == "}":
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_complete = True
+                            break
+
+            if json_complete:
+                # Parse the complete JSON and send final arguments
+                arguments = self._extract_json_object(args_text)
+                args_json = json.dumps(arguments, ensure_ascii=False)
+
+                # Calculate what we haven't sent yet
+                remaining_args = args_json[len(self._devstral_streamed_args) :]
+
+                self._devstral_tool_calls_emitted = True
+                self._buffer = ""
+                self.current_tool_name_sent = False
+                self.current_tool_id = -1
+
+                if remaining_args:
+                    self.streamed_args_for_tool[0] = args_json
+                    return StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=0,
+                                parameters=remaining_args,
+                            )
+                        ]
+                    )
+                return StreamingParseResult()
+
+            # JSON not complete yet, try to stream partial arguments
+            # Only stream if we have meaningful content
+            if len(args_text) > 1:  # More than just "{"
+                try:
+                    # Try to parse partial JSON to get streamable content
+                    partial_args = self._extract_json_object(args_text)
+                    if partial_args:
+                        args_json = json.dumps(partial_args, ensure_ascii=False)
+                        if len(args_json) > len(self._devstral_streamed_args):
+                            # Find safe prefix to stream
+                            new_content = args_json[len(self._devstral_streamed_args) :]
+                            # Don't stream trailing incomplete parts
+                            if new_content and not args_json.endswith("}"):
+                                # Remove potentially incomplete trailing content
+                                new_content = ""
+                            if new_content:
+                                self._devstral_streamed_args = args_json
+                                self.streamed_args_for_tool[0] = args_json
+                                return StreamingParseResult(
+                                    calls=[
+                                        ToolCallItem(
+                                            tool_index=0,
+                                            parameters=new_content,
+                                        )
+                                    ]
+                                )
+                except Exception:
+                    pass
+
+        return StreamingParseResult()
+
+    def flush_buffered_content(self, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Force-parse any buffered content when generation finishes.
+        Handles incomplete tool calls at end of stream.
+        """
+        if not self._buffer:
+            return StreamingParseResult()
+
+        logger.debug(f"Flushing buffer: {repr(self._buffer[:200])}")
+
+        # Try to parse what we have
+        result = self.detect_and_parse(self._buffer, tools)
+        self._buffer = ""
+
+        # Reset streaming state
+        self._devstral_mode = None
+        self._devstral_tool_calls_emitted = False
+        self._devstral_current_tool_name = None
+        self._devstral_args_buffer = ""
+        self._devstral_streamed_args = ""
+
+        return result
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
