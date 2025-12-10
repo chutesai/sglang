@@ -457,6 +457,173 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["content"], "The answer is 42")
 
 
+class TestMistralDetectorDevstralFormat(unittest.TestCase):
+    """Test the Devstral format variant of the Mistral detector.
+
+    Devstral format: [TOOL_CALLS]function_name[ARGS]{json_args}
+    """
+
+    def setUp(self):
+        """Set up test tools and detector for Devstral format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get current weather for a city",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "City name, e.g. Berlin, Germany",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                                "description": "Temperature unit",
+                            },
+                        },
+                        "required": ["location", "unit"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = MistralDetector()
+
+    def test_devstral_simple_tool_call(self):
+        """Test parsing a simple Devstral format tool call."""
+        test_text = (
+            '[TOOL_CALLS]get_weather[ARGS]{"location": "Berlin", "unit": "celsius"}'
+        )
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1, "Should detect exactly one tool call")
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Berlin")
+        self.assertEqual(params["unit"], "celsius")
+
+    def test_devstral_with_newline_after_tool_calls(self):
+        """Test parsing Devstral format with newline after [TOOL_CALLS]."""
+        test_text = (
+            '[TOOL_CALLS]\nget_weather[ARGS]{"location": "Tokyo", "unit": "fahrenheit"}'
+        )
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_devstral_incomplete_json_missing_closing_brace(self):
+        """Test parsing Devstral format with incomplete JSON (missing closing brace)."""
+        test_text = (
+            '[TOOL_CALLS]get_weather[ARGS]{"location": "Paris", "unit": "celsius"'
+        )
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1, "Should still parse incomplete JSON")
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Paris")
+        self.assertEqual(params["unit"], "celsius")
+
+    def test_devstral_with_text_before_tool_call(self):
+        """Test parsing Devstral format with text before the tool call."""
+        test_text = 'Let me check the weather for you. [TOOL_CALLS]get_weather[ARGS]{"location": "London", "unit": "celsius"}'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.normal_text, "Let me check the weather for you.")
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+    def test_devstral_no_tool_calls(self):
+        """Test parsing text without any Devstral tool calls."""
+        test_text = "This is just normal text without any tool calls."
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, test_text)
+
+    def test_devstral_undefined_function(self):
+        """Test parsing Devstral format with undefined function name."""
+        test_text = '[TOOL_CALLS]undefined_function[ARGS]{"param": "value"}'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        # Should not include undefined function calls
+        self.assertEqual(len(result.calls), 0)
+
+    def test_devstral_empty_arguments(self):
+        """Test parsing Devstral format with empty arguments."""
+        test_text = "[TOOL_CALLS]get_weather[ARGS]{}"
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {})
+
+    def test_is_devstral_format_detection(self):
+        """Test that the detector correctly distinguishes between formats."""
+        # Devstral format
+        devstral_text = '[TOOL_CALLS]get_weather[ARGS]{"location": "Berlin"}'
+        self.assertTrue(self.detector._is_devstral_format(devstral_text))
+
+        # Legacy format
+        legacy_text = '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"location": "Berlin"}}]'
+        self.assertFalse(self.detector._is_devstral_format(legacy_text))
+
+    def test_legacy_format_still_works(self):
+        """Ensure legacy Mistral format still works after adding Devstral support."""
+        test_text = '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"location":"Berlin", "unit":"celsius"}}]'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Berlin")
+        self.assertEqual(params["unit"], "celsius")
+
+
 class TestBaseFormatDetector(unittest.TestCase):
     """Test buffer management and sequential tool index assignment in BaseFormatDetector."""
 
