@@ -604,6 +604,9 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    # Filter stray <|begin_of_box|>/<|end_of_box|> tokens from GLM vision models
+    # None = auto-detect (enabled for GLM vision models), True = always enable, False = disable
+    enable_glm_bbox_filter: Optional[bool] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -722,6 +725,9 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        # Convert enable_glm_bbox_filter from string to bool if needed
+        if isinstance(self.enable_glm_bbox_filter, str):
+            self.enable_glm_bbox_filter = self.enable_glm_bbox_filter.lower() == "true"
         # If only one of max_completion_tokens or max_stream_completion_tokens is set,
         # use that value for both.
         if (
@@ -4009,6 +4015,15 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_broadcast_mm_inputs_process,
             help="Enable broadcast mm-inputs process in scheduler.",
+        )
+        parser.add_argument(
+            "--enable-glm-bbox-filter",
+            type=nullable_str,
+            default=None,
+            help="Filter stray <|begin_of_box|>/<|end_of_box|> tokens from GLM vision models. "
+            "None (default) = auto-detect based on model architecture, "
+            "'true' = always enable, 'false' = disable. "
+            "When enabled, invalid bounding box sequences are filtered from output.",
         )
 
         # For checkpoint decryption
