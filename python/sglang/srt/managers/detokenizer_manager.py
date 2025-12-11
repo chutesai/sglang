@@ -547,42 +547,39 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        output_strs = self._decode_batch_token_id_output(recv_obj)
-
-        # Apply GLM bounding box filter if enabled
-        output_ids = recv_obj.output_ids
-        output_token_logprobs_val = recv_obj.output_token_logprobs_val
-        output_token_logprobs_idx = recv_obj.output_token_logprobs_idx
-        output_top_logprobs_val = recv_obj.output_top_logprobs_val
-        output_top_logprobs_idx = recv_obj.output_top_logprobs_idx
-
-        if self.glm_bbox_filter is not None and output_ids is not None:
+        # Apply GLM bounding box filter if enabled - MUST happen before decoding
+        if self.glm_bbox_filter is not None and recv_obj.decode_ids is not None:
+            filtered_decode_ids = []
             filtered_output_ids = []
-            filtered_logprobs_val = [] if output_token_logprobs_val else None
-            filtered_logprobs_idx = [] if output_token_logprobs_idx else None
-            filtered_top_logprobs_val = [] if output_top_logprobs_val else None
-            filtered_top_logprobs_idx = [] if output_top_logprobs_idx else None
+            filtered_logprobs_val = [] if recv_obj.output_token_logprobs_val else None
+            filtered_logprobs_idx = [] if recv_obj.output_token_logprobs_idx else None
+            filtered_top_logprobs_val = [] if recv_obj.output_top_logprobs_val else None
+            filtered_top_logprobs_idx = [] if recv_obj.output_top_logprobs_idx else None
 
             for i, rid in enumerate(recv_obj.rids):
                 is_finished = recv_obj.finished_reasons[i] is not None
-                token_ids = (
-                    output_ids[i]
-                    if isinstance(output_ids[i], list)
-                    else [output_ids[i]]
-                )
+                token_ids = recv_obj.decode_ids[i]
 
                 # Get logprobs for this request if available
                 lp_val = (
-                    output_token_logprobs_val[i] if output_token_logprobs_val else None
+                    recv_obj.output_token_logprobs_val[i]
+                    if recv_obj.output_token_logprobs_val
+                    else None
                 )
                 lp_idx = (
-                    output_token_logprobs_idx[i] if output_token_logprobs_idx else None
+                    recv_obj.output_token_logprobs_idx[i]
+                    if recv_obj.output_token_logprobs_idx
+                    else None
                 )
                 top_lp_val = (
-                    output_top_logprobs_val[i] if output_top_logprobs_val else None
+                    recv_obj.output_top_logprobs_val[i]
+                    if recv_obj.output_top_logprobs_val
+                    else None
                 )
                 top_lp_idx = (
-                    output_top_logprobs_idx[i] if output_top_logprobs_idx else None
+                    recv_obj.output_top_logprobs_idx[i]
+                    if recv_obj.output_top_logprobs_idx
+                    else None
                 )
 
                 # Apply filter
@@ -602,7 +599,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     is_finished=is_finished,
                 )
 
-                filtered_output_ids.append(filtered_ids)
+                filtered_decode_ids.append(filtered_ids)
+                # Also filter output_ids if present
+                if recv_obj.output_ids is not None:
+                    output_ids_for_req = (
+                        recv_obj.output_ids[i]
+                        if isinstance(recv_obj.output_ids[i], list)
+                        else [recv_obj.output_ids[i]]
+                    )
+                    # Filter output_ids to match filtered decode_ids
+                    # For now, just use the filtered_ids since they should be the same
+                    filtered_output_ids.append(
+                        filtered_ids[-len(output_ids_for_req) :]
+                        if len(filtered_ids) >= len(output_ids_for_req)
+                        else filtered_ids
+                    )
+
                 if filtered_logprobs_val is not None:
                     filtered_logprobs_val.append(
                         filtered_lp_val if filtered_lp_val is not None else []
@@ -620,11 +632,23 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                         filtered_top_lp_idx if filtered_top_lp_idx is not None else []
                     )
 
-            output_ids = filtered_output_ids
-            output_token_logprobs_val = filtered_logprobs_val
-            output_token_logprobs_idx = filtered_logprobs_idx
-            output_top_logprobs_val = filtered_top_logprobs_val
-            output_top_logprobs_idx = filtered_top_logprobs_idx
+            # Replace the decode_ids in recv_obj with filtered ones
+            recv_obj.decode_ids = filtered_decode_ids
+            if recv_obj.output_ids is not None:
+                recv_obj.output_ids = filtered_output_ids
+            recv_obj.output_token_logprobs_val = filtered_logprobs_val
+            recv_obj.output_token_logprobs_idx = filtered_logprobs_idx
+            recv_obj.output_top_logprobs_val = filtered_top_logprobs_val
+            recv_obj.output_top_logprobs_idx = filtered_top_logprobs_idx
+
+        # Now decode with the filtered token IDs
+        output_strs = self._decode_batch_token_id_output(recv_obj)
+
+        output_ids = recv_obj.output_ids
+        output_token_logprobs_val = recv_obj.output_token_logprobs_val
+        output_token_logprobs_idx = recv_obj.output_token_logprobs_idx
+        output_top_logprobs_val = recv_obj.output_top_logprobs_val
+        output_top_logprobs_idx = recv_obj.output_top_logprobs_idx
 
         return BatchStrOutput(
             rids=recv_obj.rids,
