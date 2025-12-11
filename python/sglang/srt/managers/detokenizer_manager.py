@@ -190,6 +190,21 @@ class GlmBoundingBoxFilter:
                 top_logprobs_idx,
             )
 
+        # Check if logprobs lengths match token_ids to avoid creating None values
+        # If they don't match, disable that specific logprobs array
+        has_valid_logprobs_val = logprobs_val is not None and len(logprobs_val) == len(
+            token_ids
+        )
+        has_valid_logprobs_idx = logprobs_idx is not None and len(logprobs_idx) == len(
+            token_ids
+        )
+        has_valid_top_logprobs_val = top_logprobs_val is not None and len(
+            top_logprobs_val
+        ) == len(token_ids)
+        has_valid_top_logprobs_idx = top_logprobs_idx is not None and len(
+            top_logprobs_idx
+        ) == len(token_ids)
+
         # Initialize or get buffer state for this request
         if rid not in self.buffer_state:
             self.buffer_state[rid] = {
@@ -199,61 +214,80 @@ class GlmBoundingBoxFilter:
                 "buffered_top_logprobs_val": [],
                 "buffered_top_logprobs_idx": [],
                 "in_bbox": False,
+                "has_valid_lp_val": True,
+                "has_valid_lp_idx": True,
+                "has_valid_top_lp_val": True,
+                "has_valid_top_lp_idx": True,
             }
 
         state = self.buffer_state[rid]
+
+        # Update validity flags based on current chunk - if any chunk has invalid logprobs,
+        # disable logprobs for the entire request to maintain consistency
+        state["has_valid_lp_val"] = state["has_valid_lp_val"] and has_valid_logprobs_val
+        state["has_valid_lp_idx"] = state["has_valid_lp_idx"] and has_valid_logprobs_idx
+        state["has_valid_top_lp_val"] = (
+            state["has_valid_top_lp_val"] and has_valid_top_logprobs_val
+        )
+        state["has_valid_top_lp_idx"] = (
+            state["has_valid_top_lp_idx"] and has_valid_top_logprobs_idx
+        )
+
+        # Initialize result arrays - only create logprobs arrays if valid for entire request
         result_ids = []
-        result_logprobs_val = [] if logprobs_val is not None else None
-        result_logprobs_idx = [] if logprobs_idx is not None else None
-        result_top_logprobs_val = [] if top_logprobs_val is not None else None
-        result_top_logprobs_idx = [] if top_logprobs_idx is not None else None
+        result_logprobs_val = (
+            [] if (state["has_valid_lp_val"] and has_valid_logprobs_val) else None
+        )
+        result_logprobs_idx = (
+            [] if (state["has_valid_lp_idx"] and has_valid_logprobs_idx) else None
+        )
+        result_top_logprobs_val = (
+            []
+            if (state["has_valid_top_lp_val"] and has_valid_top_logprobs_val)
+            else None
+        )
+        result_top_logprobs_idx = (
+            []
+            if (state["has_valid_top_lp_idx"] and has_valid_top_logprobs_idx)
+            else None
+        )
 
         for i, token_id in enumerate(token_ids):
-            # Safely extract logprobs with bounds checking
-            lp_val = (
-                logprobs_val[i]
-                if (logprobs_val is not None and i < len(logprobs_val))
-                else None
-            )
-            lp_idx = (
-                logprobs_idx[i]
-                if (logprobs_idx is not None and i < len(logprobs_idx))
-                else None
-            )
-            top_lp_val = (
-                top_logprobs_val[i]
-                if (top_logprobs_val is not None and i < len(top_logprobs_val))
-                else None
-            )
-            top_lp_idx = (
-                top_logprobs_idx[i]
-                if (top_logprobs_idx is not None and i < len(top_logprobs_idx))
-                else None
-            )
+            # Extract logprobs only if valid for this chunk
+            lp_val = logprobs_val[i] if has_valid_logprobs_val else None
+            lp_idx = logprobs_idx[i] if has_valid_logprobs_idx else None
+            top_lp_val = top_logprobs_val[i] if has_valid_top_logprobs_val else None
+            top_lp_idx = top_logprobs_idx[i] if has_valid_top_logprobs_idx else None
 
             if token_id == self.begin_box_token_id:
                 # Start buffering
                 state["in_bbox"] = True
                 state["buffered_ids"] = [token_id]
-                state["buffered_logprobs_val"] = [lp_val] if lp_val is not None else []
-                state["buffered_logprobs_idx"] = [lp_idx] if lp_idx is not None else []
+                # Only maintain logprob buffers if they're valid
+                state["buffered_logprobs_val"] = (
+                    [lp_val] if state["has_valid_lp_val"] else []
+                )
+                state["buffered_logprobs_idx"] = (
+                    [lp_idx] if state["has_valid_lp_idx"] else []
+                )
                 state["buffered_top_logprobs_val"] = (
-                    [top_lp_val] if top_lp_val is not None else []
+                    [top_lp_val] if state["has_valid_top_lp_val"] else []
                 )
                 state["buffered_top_logprobs_idx"] = (
-                    [top_lp_idx] if top_lp_idx is not None else []
+                    [top_lp_idx] if state["has_valid_top_lp_idx"] else []
                 )
 
             elif state["in_bbox"]:
                 # We're buffering content inside a bbox
                 state["buffered_ids"].append(token_id)
-                if lp_val is not None:
+                # Only append logprobs if they're valid for this request
+                if state["has_valid_lp_val"]:
                     state["buffered_logprobs_val"].append(lp_val)
-                if lp_idx is not None:
+                if state["has_valid_lp_idx"]:
                     state["buffered_logprobs_idx"].append(lp_idx)
-                if top_lp_val is not None:
+                if state["has_valid_top_lp_val"]:
                     state["buffered_top_logprobs_val"].append(top_lp_val)
-                if top_lp_idx is not None:
+                if state["has_valid_top_lp_idx"]:
                     state["buffered_top_logprobs_idx"].append(top_lp_idx)
 
                 if token_id == self.end_box_token_id:
