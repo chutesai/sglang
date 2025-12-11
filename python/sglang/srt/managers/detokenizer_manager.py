@@ -209,10 +209,27 @@ class GlmBoundingBoxFilter:
         result_top_logprobs_idx = [] if top_logprobs_idx is not None else None
 
         for i, token_id in enumerate(token_ids):
-            lp_val = logprobs_val[i] if logprobs_val is not None else None
-            lp_idx = logprobs_idx[i] if logprobs_idx is not None else None
-            top_lp_val = top_logprobs_val[i] if top_logprobs_val is not None else None
-            top_lp_idx = top_logprobs_idx[i] if top_logprobs_idx is not None else None
+            # Safely extract logprobs with bounds checking
+            lp_val = (
+                logprobs_val[i]
+                if (logprobs_val is not None and i < len(logprobs_val))
+                else None
+            )
+            lp_idx = (
+                logprobs_idx[i]
+                if (logprobs_idx is not None and i < len(logprobs_idx))
+                else None
+            )
+            top_lp_val = (
+                top_logprobs_val[i]
+                if (top_logprobs_val is not None and i < len(top_logprobs_val))
+                else None
+            )
+            top_lp_idx = (
+                top_logprobs_idx[i]
+                if (top_logprobs_idx is not None and i < len(top_logprobs_idx))
+                else None
+            )
 
             if token_id == self.begin_box_token_id:
                 # Start buffering
@@ -258,7 +275,7 @@ class GlmBoundingBoxFilter:
                         is_valid = False
 
                     if is_valid:
-                        # Valid bbox - emit all buffered tokens
+                        # Valid bbox - emit all buffered tokens (including begin/end tags)
                         result_ids.extend(state["buffered_ids"])
                         if result_logprobs_val is not None:
                             result_logprobs_val.extend(state["buffered_logprobs_val"])
@@ -272,7 +289,37 @@ class GlmBoundingBoxFilter:
                             result_top_logprobs_idx.extend(
                                 state["buffered_top_logprobs_idx"]
                             )
-                    # else: Invalid bbox - discard all buffered tokens (don't emit)
+                    else:
+                        # Invalid bbox - emit only the content (skip begin/end tags)
+                        result_ids.extend(content_ids)
+                        if (
+                            result_logprobs_val is not None
+                            and len(state["buffered_logprobs_val"]) > 2
+                        ):
+                            result_logprobs_val.extend(
+                                state["buffered_logprobs_val"][1:-1]
+                            )
+                        if (
+                            result_logprobs_idx is not None
+                            and len(state["buffered_logprobs_idx"]) > 2
+                        ):
+                            result_logprobs_idx.extend(
+                                state["buffered_logprobs_idx"][1:-1]
+                            )
+                        if (
+                            result_top_logprobs_val is not None
+                            and len(state["buffered_top_logprobs_val"]) > 2
+                        ):
+                            result_top_logprobs_val.extend(
+                                state["buffered_top_logprobs_val"][1:-1]
+                            )
+                        if (
+                            result_top_logprobs_idx is not None
+                            and len(state["buffered_top_logprobs_idx"]) > 2
+                        ):
+                            result_top_logprobs_idx.extend(
+                                state["buffered_top_logprobs_idx"][1:-1]
+                            )
 
                     # Clear buffer
                     state["buffered_ids"] = []
@@ -293,9 +340,37 @@ class GlmBoundingBoxFilter:
                 if result_top_logprobs_idx is not None:
                     result_top_logprobs_idx.append(top_lp_idx)
 
-        # If request is finished and we still have buffered content, discard it
+        # If request is finished and we still have buffered content, emit it without the begin tag
         # (it's an incomplete/invalid bbox)
         if is_finished:
+            if state["in_bbox"] and state["buffered_ids"]:
+                # Emit content without the begin tag
+                content_ids = state["buffered_ids"][1:]  # Skip the begin token
+                result_ids.extend(content_ids)
+                if (
+                    result_logprobs_val is not None
+                    and len(state["buffered_logprobs_val"]) > 1
+                ):
+                    result_logprobs_val.extend(state["buffered_logprobs_val"][1:])
+                if (
+                    result_logprobs_idx is not None
+                    and len(state["buffered_logprobs_idx"]) > 1
+                ):
+                    result_logprobs_idx.extend(state["buffered_logprobs_idx"][1:])
+                if (
+                    result_top_logprobs_val is not None
+                    and len(state["buffered_top_logprobs_val"]) > 1
+                ):
+                    result_top_logprobs_val.extend(
+                        state["buffered_top_logprobs_val"][1:]
+                    )
+                if (
+                    result_top_logprobs_idx is not None
+                    and len(state["buffered_top_logprobs_idx"]) > 1
+                ):
+                    result_top_logprobs_idx.extend(
+                        state["buffered_top_logprobs_idx"][1:]
+                    )
             if rid in self.buffer_state:
                 del self.buffer_state[rid]
 
