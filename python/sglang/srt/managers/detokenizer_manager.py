@@ -190,8 +190,35 @@ class GlmBoundingBoxFilter:
                 top_logprobs_idx,
             )
 
-        # Check if logprobs lengths match token_ids to avoid creating None values
-        # If they don't match, disable that specific logprobs array
+        # Initialize or get buffer state for this request
+        if rid not in self.buffer_state:
+            self.buffer_state[rid] = {
+                "buffered_ids": [],
+                "buffered_logprobs_val": [],
+                "buffered_logprobs_idx": [],
+                "buffered_top_logprobs_val": [],
+                "buffered_top_logprobs_idx": [],
+                "in_bbox": False,
+            }
+
+        state = self.buffer_state[rid]
+
+        # Check if we're filtering anything (bbox tokens present or already buffering)
+        has_bbox_tokens = (
+            self.begin_box_token_id in token_ids or self.end_box_token_id in token_ids
+        )
+
+        # If not filtering, pass through unchanged
+        if not state["in_bbox"] and not has_bbox_tokens:
+            return (
+                token_ids,
+                logprobs_val,
+                logprobs_idx,
+                top_logprobs_val,
+                top_logprobs_idx,
+            )
+
+        # We're filtering - check if logprobs match for proper filtering
         has_valid_logprobs_val = logprobs_val is not None and len(logprobs_val) == len(
             token_ids
         )
@@ -205,52 +232,12 @@ class GlmBoundingBoxFilter:
             top_logprobs_idx
         ) == len(token_ids)
 
-        # Initialize or get buffer state for this request
-        if rid not in self.buffer_state:
-            self.buffer_state[rid] = {
-                "buffered_ids": [],
-                "buffered_logprobs_val": [],
-                "buffered_logprobs_idx": [],
-                "buffered_top_logprobs_val": [],
-                "buffered_top_logprobs_idx": [],
-                "in_bbox": False,
-                "has_valid_lp_val": True,
-                "has_valid_lp_idx": True,
-                "has_valid_top_lp_val": True,
-                "has_valid_top_lp_idx": True,
-            }
-
-        state = self.buffer_state[rid]
-
-        # Update validity flags based on current chunk - if any chunk has invalid logprobs,
-        # disable logprobs for the entire request to maintain consistency
-        state["has_valid_lp_val"] = state["has_valid_lp_val"] and has_valid_logprobs_val
-        state["has_valid_lp_idx"] = state["has_valid_lp_idx"] and has_valid_logprobs_idx
-        state["has_valid_top_lp_val"] = (
-            state["has_valid_top_lp_val"] and has_valid_top_logprobs_val
-        )
-        state["has_valid_top_lp_idx"] = (
-            state["has_valid_top_lp_idx"] and has_valid_top_logprobs_idx
-        )
-
-        # Initialize result arrays - only create logprobs arrays if valid for entire request
+        # Initialize result arrays
         result_ids = []
-        result_logprobs_val = (
-            [] if (state["has_valid_lp_val"] and has_valid_logprobs_val) else None
-        )
-        result_logprobs_idx = (
-            [] if (state["has_valid_lp_idx"] and has_valid_logprobs_idx) else None
-        )
-        result_top_logprobs_val = (
-            []
-            if (state["has_valid_top_lp_val"] and has_valid_top_logprobs_val)
-            else None
-        )
-        result_top_logprobs_idx = (
-            []
-            if (state["has_valid_top_lp_idx"] and has_valid_top_logprobs_idx)
-            else None
-        )
+        result_logprobs_val = [] if has_valid_logprobs_val else None
+        result_logprobs_idx = [] if has_valid_logprobs_idx else None
+        result_top_logprobs_val = [] if has_valid_top_logprobs_val else None
+        result_top_logprobs_idx = [] if has_valid_top_logprobs_idx else None
 
         for i, token_id in enumerate(token_ids):
             # Extract logprobs only if valid for this chunk
@@ -265,29 +252,29 @@ class GlmBoundingBoxFilter:
                 state["buffered_ids"] = [token_id]
                 # Only maintain logprob buffers if they're valid
                 state["buffered_logprobs_val"] = (
-                    [lp_val] if state["has_valid_lp_val"] else []
+                    [lp_val] if has_valid_logprobs_val else []
                 )
                 state["buffered_logprobs_idx"] = (
-                    [lp_idx] if state["has_valid_lp_idx"] else []
+                    [lp_idx] if has_valid_logprobs_idx else []
                 )
                 state["buffered_top_logprobs_val"] = (
-                    [top_lp_val] if state["has_valid_top_lp_val"] else []
+                    [top_lp_val] if has_valid_top_logprobs_val else []
                 )
                 state["buffered_top_logprobs_idx"] = (
-                    [top_lp_idx] if state["has_valid_top_lp_idx"] else []
+                    [top_lp_idx] if has_valid_top_logprobs_idx else []
                 )
 
             elif state["in_bbox"]:
                 # We're buffering content inside a bbox
                 state["buffered_ids"].append(token_id)
-                # Only append logprobs if they're valid for this request
-                if state["has_valid_lp_val"]:
+                # Only append logprobs if they're valid
+                if has_valid_logprobs_val:
                     state["buffered_logprobs_val"].append(lp_val)
-                if state["has_valid_lp_idx"]:
+                if has_valid_logprobs_idx:
                     state["buffered_logprobs_idx"].append(lp_idx)
-                if state["has_valid_top_lp_val"]:
+                if has_valid_top_logprobs_val:
                     state["buffered_top_logprobs_val"].append(top_lp_val)
-                if state["has_valid_top_lp_idx"]:
+                if has_valid_top_logprobs_idx:
                     state["buffered_top_logprobs_idx"].append(top_lp_idx)
 
                 if token_id == self.end_box_token_id:
