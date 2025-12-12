@@ -19,7 +19,7 @@ import os
 import re
 import signal
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Union
 
 import psutil
 import setproctitle
@@ -77,336 +77,60 @@ GLM_VISION_ARCHITECTURES = [
 
 class GlmBoundingBoxFilter:
     """
-    Filter stray bounding box tokens from GLM vision model outputs.
+    Filter stray bounding box tags from GLM vision model text outputs.
 
-    GLM-4.5V/4.6V models emit <|begin_of_box|> and <|end_of_box|> tokens for
-    bounding box outputs. However, they sometimes emit these tokens spuriously
-    even when there's no valid bounding box (e.g., in response to "Hi, how are you?").
+    GLM-4.5V/4.6V models emit <|begin_of_box|> and <|end_of_box|> tags for
+    bounding box outputs. However, they sometimes emit these spuriously.
 
-    This filter buffers tokens after seeing <|begin_of_box|> and only keeps them
-    if a valid bounding box pattern is detected (4 numbers enclosed in brackets).
-    Invalid bounding box sequences are filtered out.
-
-    Valid bounding box format: <|begin_of_box|>[x1, y1, x2, y2]<|end_of_box|>
-    where x1, y1, x2, y2 are numbers.
+    This filter works at the STRING level (not token level) to:
+    - Remove invalid bbox tags while keeping the content
+    - Preserve valid bboxes with coordinates
+    - Leave all token IDs and logprobs completely untouched
     """
 
-    # Regex pattern to match valid bounding box content
+    # Regex patterns
+    BEGIN_TAG = "<|begin_of_box|>"
+    END_TAG = "<|end_of_box|>"
     BBOX_PATTERN = re.compile(
-        r"^[\[\(<\{\s]*"  # Opening brackets
-        r"\s*[\d\.]+\s*,\s*[\d+\.]+\s*,\s*[\d+\.]+\s*,\s*[\d+\.]+\s*"  # 4 numbers
-        r"[\]\)>\}]*$"  # Closing brackets
+        r"<\|begin_of_box\|>([\[\(<\{\s]*\s*[\d\.]+\s*,\s*[\d\.]+\s*,\s*[\d\.]+\s*,\s*[\d\.]+\s*[\]\)>\}]*)<\|end_of_box\|>"
     )
 
-    def __init__(self, tokenizer):
-        """
-        Initialize the filter.
-
-        Args:
-            tokenizer: The HuggingFace tokenizer to use for encoding special tokens.
-        """
-        self.tokenizer = tokenizer
-        # Get token IDs for the special bounding box tokens
-        self.begin_box_token_id = self._get_token_id("<|begin_of_box|>")
-        self.end_box_token_id = self._get_token_id("<|end_of_box|>")
-
-        # Per-request state tracking
-        # Maps rid -> (buffered_ids, buffered_logprobs_val, buffered_logprobs_idx)
+    def __init__(self):
+        """Initialize the filter."""
+        # Per-request buffer for streaming
         self.buffer_state: Dict[str, dict] = {}
 
-    def _get_token_id(self, token_str: str) -> Optional[int]:
-        """Get the token ID for a special token string."""
-        try:
-            # Try to encode the token
-            encoded = self.tokenizer.encode(token_str, add_special_tokens=False)
-            if len(encoded) == 1:
-                return encoded[0]
-            # Try to get from vocab directly
-            vocab = self.tokenizer.get_vocab()
-            if token_str in vocab:
-                return vocab[token_str]
-        except Exception:
-            pass
-        return None
-
-    def _is_valid_bbox(self, content: str) -> bool:
+    def filter_text(self, text: str) -> str:
         """
-        Check if the content between box tokens is a valid bounding box.
+        Filter bbox tags from text. Works on complete (non-streaming) text.
 
-        Args:
-            content: The decoded text content between <|begin_of_box|> and <|end_of_box|>
-
-        Returns:
-            True if it's a valid bounding box pattern, False otherwise.
+        - Valid bboxes (with coordinates): Keep everything
+        - Invalid bboxes (with text): Remove tags, keep content
         """
-        content = content.strip()
-        if not content:
-            return False
-        return bool(self.BBOX_PATTERN.match(content))
+        if not text:
+            return text
 
-    def filter_tokens(
-        self,
-        rid: str,
-        token_ids: List[int],
-        logprobs_val: Optional[List[float]] = None,
-        logprobs_idx: Optional[List[int]] = None,
-        top_logprobs_val: Optional[List] = None,
-        top_logprobs_idx: Optional[List] = None,
-        is_finished: bool = False,
-    ) -> Tuple[
-        List[int],
-        Optional[List[float]],
-        Optional[List[int]],
-        Optional[List],
-        Optional[List],
-    ]:
-        """
-        Filter stray bounding box tokens from the output.
-
-        This method buffers tokens when it sees <|begin_of_box|> and waits to see
-        if the content forms a valid bounding box. If valid, it passes through.
-        If invalid (or request finishes without <|end_of_box|>), the tokens are filtered.
-
-        Args:
-            rid: Request ID for tracking state across calls.
-            token_ids: List of token IDs to filter.
-            logprobs_val: List of logprob values (same length as token_ids), or None.
-            logprobs_idx: List of logprob token indices (same length as token_ids), or None.
-            top_logprobs_val: List of top logprobs values, or None.
-            top_logprobs_idx: List of top logprobs indices, or None.
-            is_finished: Whether this is the final output for the request.
-
-        Returns:
-            Tuple of (filtered_token_ids, filtered_logprobs_val, filtered_logprobs_idx,
-                     filtered_top_logprobs_val, filtered_top_logprobs_idx).
-        """
-        if self.begin_box_token_id is None or self.end_box_token_id is None:
-            # Can't filter if we don't have the token IDs
-            return (
-                token_ids,
-                logprobs_val,
-                logprobs_idx,
-                top_logprobs_val,
-                top_logprobs_idx,
-            )
-
-        # Initialize or get buffer state for this request
-        if rid not in self.buffer_state:
-            self.buffer_state[rid] = {
-                "buffered_ids": [],
-                "buffered_logprobs_val": [],
-                "buffered_logprobs_idx": [],
-                "buffered_top_logprobs_val": [],
-                "buffered_top_logprobs_idx": [],
-                "in_bbox": False,
-            }
-
-        state = self.buffer_state[rid]
-
-        # Check if we're filtering anything (bbox tokens present or already buffering)
-        has_bbox_tokens = (
-            self.begin_box_token_id in token_ids or self.end_box_token_id in token_ids
-        )
-
-        # If not filtering, pass through unchanged
-        if not state["in_bbox"] and not has_bbox_tokens:
-            return (
-                token_ids,
-                logprobs_val,
-                logprobs_idx,
-                top_logprobs_val,
-                top_logprobs_idx,
-            )
-
-        # We're filtering - check if logprobs match for proper filtering
-        has_valid_logprobs_val = logprobs_val is not None and len(logprobs_val) == len(
-            token_ids
-        )
-        has_valid_logprobs_idx = logprobs_idx is not None and len(logprobs_idx) == len(
-            token_ids
-        )
-        has_valid_top_logprobs_val = top_logprobs_val is not None and len(
-            top_logprobs_val
-        ) == len(token_ids)
-        has_valid_top_logprobs_idx = top_logprobs_idx is not None and len(
-            top_logprobs_idx
-        ) == len(token_ids)
-
-        # Initialize result arrays
-        result_ids = []
-        result_logprobs_val = [] if has_valid_logprobs_val else None
-        result_logprobs_idx = [] if has_valid_logprobs_idx else None
-        result_top_logprobs_val = [] if has_valid_top_logprobs_val else None
-        result_top_logprobs_idx = [] if has_valid_top_logprobs_idx else None
-
-        for i, token_id in enumerate(token_ids):
-            # Extract logprobs only if valid for this chunk
-            lp_val = logprobs_val[i] if has_valid_logprobs_val else None
-            lp_idx = logprobs_idx[i] if has_valid_logprobs_idx else None
-            top_lp_val = top_logprobs_val[i] if has_valid_top_logprobs_val else None
-            top_lp_idx = top_logprobs_idx[i] if has_valid_top_logprobs_idx else None
-
-            if token_id == self.begin_box_token_id:
-                # Start buffering
-                state["in_bbox"] = True
-                state["buffered_ids"] = [token_id]
-                # Only maintain logprob buffers if they're valid
-                state["buffered_logprobs_val"] = (
-                    [lp_val] if has_valid_logprobs_val else []
-                )
-                state["buffered_logprobs_idx"] = (
-                    [lp_idx] if has_valid_logprobs_idx else []
-                )
-                state["buffered_top_logprobs_val"] = (
-                    [top_lp_val] if has_valid_top_logprobs_val else []
-                )
-                state["buffered_top_logprobs_idx"] = (
-                    [top_lp_idx] if has_valid_top_logprobs_idx else []
-                )
-
-            elif state["in_bbox"]:
-                # We're buffering content inside a bbox
-                state["buffered_ids"].append(token_id)
-                # Only append logprobs if they're valid
-                if has_valid_logprobs_val:
-                    state["buffered_logprobs_val"].append(lp_val)
-                if has_valid_logprobs_idx:
-                    state["buffered_logprobs_idx"].append(lp_idx)
-                if has_valid_top_logprobs_val:
-                    state["buffered_top_logprobs_val"].append(top_lp_val)
-                if has_valid_top_logprobs_idx:
-                    state["buffered_top_logprobs_idx"].append(top_lp_idx)
-
-                if token_id == self.end_box_token_id:
-                    # End of bbox - check if valid
-                    state["in_bbox"] = False
-                    # Decode the content between begin and end (excluding them)
-                    content_ids = state["buffered_ids"][
-                        1:-1
-                    ]  # Exclude begin and end tokens
-                    if content_ids:
-                        try:
-                            content_text = self.tokenizer.decode(
-                                content_ids, skip_special_tokens=False
-                            )
-                            is_valid = self._is_valid_bbox(content_text)
-                        except Exception:
-                            is_valid = False
-                    else:
-                        is_valid = False
-
-                    if is_valid:
-                        # Valid bbox - emit all buffered tokens (including begin/end tags)
-                        result_ids.extend(state["buffered_ids"])
-                        if result_logprobs_val is not None:
-                            result_logprobs_val.extend(state["buffered_logprobs_val"])
-                        if result_logprobs_idx is not None:
-                            result_logprobs_idx.extend(state["buffered_logprobs_idx"])
-                        if result_top_logprobs_val is not None:
-                            result_top_logprobs_val.extend(
-                                state["buffered_top_logprobs_val"]
-                            )
-                        if result_top_logprobs_idx is not None:
-                            result_top_logprobs_idx.extend(
-                                state["buffered_top_logprobs_idx"]
-                            )
-                    else:
-                        # Invalid bbox - emit only the content (skip begin/end tags)
-                        result_ids.extend(content_ids)
-                        if (
-                            result_logprobs_val is not None
-                            and len(state["buffered_logprobs_val"]) > 2
-                        ):
-                            result_logprobs_val.extend(
-                                state["buffered_logprobs_val"][1:-1]
-                            )
-                        if (
-                            result_logprobs_idx is not None
-                            and len(state["buffered_logprobs_idx"]) > 2
-                        ):
-                            result_logprobs_idx.extend(
-                                state["buffered_logprobs_idx"][1:-1]
-                            )
-                        if (
-                            result_top_logprobs_val is not None
-                            and len(state["buffered_top_logprobs_val"]) > 2
-                        ):
-                            result_top_logprobs_val.extend(
-                                state["buffered_top_logprobs_val"][1:-1]
-                            )
-                        if (
-                            result_top_logprobs_idx is not None
-                            and len(state["buffered_top_logprobs_idx"]) > 2
-                        ):
-                            result_top_logprobs_idx.extend(
-                                state["buffered_top_logprobs_idx"][1:-1]
-                            )
-
-                    # Clear buffer
-                    state["buffered_ids"] = []
-                    state["buffered_logprobs_val"] = []
-                    state["buffered_logprobs_idx"] = []
-                    state["buffered_top_logprobs_val"] = []
-                    state["buffered_top_logprobs_idx"] = []
-
+        # Find all complete bbox sequences
+        def replace_bbox(match):
+            content = match.group(1)
+            # Check if content looks like coordinates (numbers)
+            if re.match(
+                r"^[\[\(<\{\s]*\s*[\d\.]+\s*,\s*[\d\.]+\s*,\s*[\d\.]+\s*,\s*[\d\.]+\s*[\]\)>\}]*$",
+                content,
+            ):
+                # Valid bbox - keep everything
+                return match.group(0)
             else:
-                # Normal token outside of bbox
-                result_ids.append(token_id)
-                if result_logprobs_val is not None:
-                    result_logprobs_val.append(lp_val)
-                if result_logprobs_idx is not None:
-                    result_logprobs_idx.append(lp_idx)
-                if result_top_logprobs_val is not None:
-                    result_top_logprobs_val.append(top_lp_val)
-                if result_top_logprobs_idx is not None:
-                    result_top_logprobs_idx.append(top_lp_idx)
+                # Invalid bbox - return only content (strip tags)
+                return content
 
-        # If request is finished and we still have buffered content, emit it without the begin tag
-        # (it's an incomplete/invalid bbox)
-        if is_finished:
-            if state["in_bbox"] and state["buffered_ids"]:
-                # Emit content without the begin tag
-                content_ids = state["buffered_ids"][1:]  # Skip the begin token
-                result_ids.extend(content_ids)
-                if (
-                    result_logprobs_val is not None
-                    and len(state["buffered_logprobs_val"]) > 1
-                ):
-                    result_logprobs_val.extend(state["buffered_logprobs_val"][1:])
-                if (
-                    result_logprobs_idx is not None
-                    and len(state["buffered_logprobs_idx"]) > 1
-                ):
-                    result_logprobs_idx.extend(state["buffered_logprobs_idx"][1:])
-                if (
-                    result_top_logprobs_val is not None
-                    and len(state["buffered_top_logprobs_val"]) > 1
-                ):
-                    result_top_logprobs_val.extend(
-                        state["buffered_top_logprobs_val"][1:]
-                    )
-                if (
-                    result_top_logprobs_idx is not None
-                    and len(state["buffered_top_logprobs_idx"]) > 1
-                ):
-                    result_top_logprobs_idx.extend(
-                        state["buffered_top_logprobs_idx"][1:]
-                    )
-            if rid in self.buffer_state:
-                del self.buffer_state[rid]
+        result = self.BBOX_PATTERN.sub(replace_bbox, text)
 
-        return (
-            result_ids,
-            result_logprobs_val,
-            result_logprobs_idx,
-            result_top_logprobs_val,
-            result_top_logprobs_idx,
-        )
+        # Also handle incomplete sequences (begin without end) - just remove the tag
+        result = result.replace(self.BEGIN_TAG, "")
+        result = result.replace(self.END_TAG, "")
 
-    def cleanup_request(self, rid: str):
-        """Clean up state for a finished request."""
-        if rid in self.buffer_state:
-            del self.buffer_state[rid]
+        return result
 
 
 def is_glm_vision_model(model_path: str, trust_remote_code: bool = False) -> bool:
@@ -474,7 +198,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             if enable_filter:
-                self.glm_bbox_filter = GlmBoundingBoxFilter(self.tokenizer)
+                self.glm_bbox_filter = GlmBoundingBoxFilter()
                 logger.info(
                     "GLM bounding box filter enabled for filtering stray "
                     "<|begin_of_box|>/<|end_of_box|> tokens"
@@ -643,115 +367,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        # Apply GLM bounding box filter if enabled - MUST happen before decoding
-        if self.glm_bbox_filter is not None and recv_obj.decode_ids is not None:
-            filtered_decode_ids = []
-            filtered_output_ids = []
-            filtered_logprobs_val = [] if recv_obj.output_token_logprobs_val else None
-            filtered_logprobs_idx = [] if recv_obj.output_token_logprobs_idx else None
-            filtered_top_logprobs_val = [] if recv_obj.output_top_logprobs_val else None
-            filtered_top_logprobs_idx = [] if recv_obj.output_top_logprobs_idx else None
-
-            for i, rid in enumerate(recv_obj.rids):
-                is_finished = recv_obj.finished_reasons[i] is not None
-                token_ids = recv_obj.decode_ids[i]
-
-                # Get logprobs for this request if available
-                lp_val = (
-                    recv_obj.output_token_logprobs_val[i]
-                    if recv_obj.output_token_logprobs_val
-                    else None
-                )
-                lp_idx = (
-                    recv_obj.output_token_logprobs_idx[i]
-                    if recv_obj.output_token_logprobs_idx
-                    else None
-                )
-                top_lp_val = (
-                    recv_obj.output_top_logprobs_val[i]
-                    if recv_obj.output_top_logprobs_val
-                    else None
-                )
-                top_lp_idx = (
-                    recv_obj.output_top_logprobs_idx[i]
-                    if recv_obj.output_top_logprobs_idx
-                    else None
-                )
-
-                # Apply filter
-                (
-                    filtered_ids,
-                    filtered_lp_val,
-                    filtered_lp_idx,
-                    filtered_top_lp_val,
-                    filtered_top_lp_idx,
-                ) = self.glm_bbox_filter.filter_tokens(
-                    rid=rid,
-                    token_ids=token_ids,
-                    logprobs_val=lp_val,
-                    logprobs_idx=lp_idx,
-                    top_logprobs_val=top_lp_val,
-                    top_logprobs_idx=top_lp_idx,
-                    is_finished=is_finished,
-                )
-
-                filtered_decode_ids.append(filtered_ids)
-                # Also filter output_ids if present
-                if recv_obj.output_ids is not None:
-                    output_ids_for_req = (
-                        recv_obj.output_ids[i]
-                        if isinstance(recv_obj.output_ids[i], list)
-                        else [recv_obj.output_ids[i]]
-                    )
-                    # Filter output_ids to match filtered decode_ids
-                    # For now, just use the filtered_ids since they should be the same
-                    filtered_output_ids.append(
-                        filtered_ids[-len(output_ids_for_req) :]
-                        if len(filtered_ids) >= len(output_ids_for_req)
-                        else filtered_ids
-                    )
-
-                if filtered_logprobs_val is not None:
-                    filtered_logprobs_val.append(
-                        filtered_lp_val if filtered_lp_val is not None else []
-                    )
-                if filtered_logprobs_idx is not None:
-                    filtered_logprobs_idx.append(
-                        filtered_lp_idx if filtered_lp_idx is not None else []
-                    )
-                if filtered_top_logprobs_val is not None:
-                    filtered_top_logprobs_val.append(
-                        filtered_top_lp_val if filtered_top_lp_val is not None else []
-                    )
-                if filtered_top_logprobs_idx is not None:
-                    filtered_top_logprobs_idx.append(
-                        filtered_top_lp_idx if filtered_top_lp_idx is not None else []
-                    )
-
-            # Replace the decode_ids in recv_obj with filtered ones
-            recv_obj.decode_ids = filtered_decode_ids
-            if recv_obj.output_ids is not None:
-                recv_obj.output_ids = filtered_output_ids
-            recv_obj.output_token_logprobs_val = filtered_logprobs_val
-            recv_obj.output_token_logprobs_idx = filtered_logprobs_idx
-            recv_obj.output_top_logprobs_val = filtered_top_logprobs_val
-            recv_obj.output_top_logprobs_idx = filtered_top_logprobs_idx
-
-        # Now decode with the filtered token IDs
+        # Decode tokens to strings first (no filtering yet)
         output_strs = self._decode_batch_token_id_output(recv_obj)
 
-        output_ids = recv_obj.output_ids
-        output_token_logprobs_val = recv_obj.output_token_logprobs_val
-        output_token_logprobs_idx = recv_obj.output_token_logprobs_idx
-        output_top_logprobs_val = recv_obj.output_top_logprobs_val
-        output_top_logprobs_idx = recv_obj.output_top_logprobs_idx
+        # Apply GLM bounding box filter to the DECODED STRINGS only
+        # All token IDs and logprobs pass through completely untouched
+        if self.glm_bbox_filter is not None:
+            output_strs = [self.glm_bbox_filter.filter_text(s) for s in output_strs]
 
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=output_ids,
+            output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -760,12 +389,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             spec_accepted_tokens=recv_obj.spec_accepted_tokens,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
-            output_token_logprobs_val=output_token_logprobs_val,
-            output_token_logprobs_idx=output_token_logprobs_idx,
+            output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+            output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
             input_top_logprobs_val=recv_obj.input_top_logprobs_val,
             input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
-            output_top_logprobs_val=output_top_logprobs_val,
-            output_top_logprobs_idx=output_top_logprobs_idx,
+            output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+            output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
             input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
