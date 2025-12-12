@@ -401,6 +401,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
@@ -409,7 +410,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
             v_lower = v.lower()
             if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', 'tool', 'function', or 'developer' (case-insensitive)."
+                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
