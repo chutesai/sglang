@@ -16,9 +16,12 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    if arg_key not in tool.function.parameters["properties"]:
+    properties = (tool.function.parameters or {}).get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    if arg_key not in properties:
         return None
-    return tool.function.parameters["properties"][arg_key].get("type", None)
+    return properties[arg_key].get("type", None)
 
 
 def parse_arguments(json_value):
