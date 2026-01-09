@@ -2,16 +2,52 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
+from sglang.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
 
 
-def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
+class StreamState(str, Enum):
+    """State machine states for XML to JSON streaming conversion."""
+
+    INIT = "INIT"
+    BETWEEN = "BETWEEN"
+    IN_KEY = "IN_KEY"
+    WAITING_VALUE = "WAITING_VALUE"
+    IN_VALUE = "IN_VALUE"
+
+
+def get_argument_type(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> Optional[str]:
+    """Get the expected type of a function argument from tool definitions.
+
+    Supports complex JSON Schema definitions including:
+    - Direct type field (including type arrays)
+    - anyOf/oneOf: parameter can be any of multiple types
+    - enum: parameter must be one of enum values
+    - allOf: parameter must satisfy all type definitions
+    - properties: inferred as object type
+    - items: inferred as array type
+
+    Args:
+        func_name: Name of the function/tool
+        arg_key: Name of the argument
+        defined_tools: List of available tools
+
+    Returns:
+        The type string (e.g., 'string', 'number', 'object') or None if not found
+    """
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
         return None
@@ -21,35 +57,95 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
         properties = {}
     if arg_key not in properties:
         return None
-    return properties[arg_key].get("type", None)
+
+    # Use new type inference function for complex JSON Schema support
+    return infer_type_from_json_schema(properties[arg_key])
 
 
-def parse_arguments(json_value):
+def _convert_to_number(value: str) -> Any:
+    """Convert string to appropriate number type (int or float).
+
+    Args:
+        value: String value to convert
+
+    Returns:
+        Converted number or original string if conversion fails
+    """
+    try:
+        if "." in value or "e" in value.lower():
+            return float(value)
+        else:
+            return int(value)
+    except (ValueError, AttributeError):
+        return value
+
+
+def parse_arguments(
+    json_value: str, arg_type: Optional[str] = None
+) -> Tuple[Any, bool]:
+    """Parse argument value with multiple fallback strategies.
+
+    Args:
+        json_value: Raw string value to parse
+        arg_type: Expected type hint ('string', 'number', 'object', etc.)
+
+    Returns:
+        Tuple of (parsed_value, is_valid_json)
+    """
+    # Strategy 1: Direct JSON parsing
     try:
         parsed_value = json.loads(json_value)
+
+        # Type coercion for number type
+        if arg_type == "number" and isinstance(parsed_value, str):
+            parsed_value = _convert_to_number(parsed_value)
+
         return parsed_value, True
-    except:
-        # If that fails, try wrapping it to unescape JSON characters
-        try:
-            # Wrap the value as a JSON string field
-            wrapped = json.loads('{"tmp": "' + json_value + '"}')
-            # parse the unescaped value
-            parsed_value = json.loads(wrapped["tmp"])
-            return parsed_value, True
-        except:
-            # Final fallback to ast.literal_eval
-            try:
-                parsed_value = ast.literal_eval(json_value)
-                return parsed_value, True
-            except:
-                return json_value, False
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: Unescape and parse
+    try:
+        wrapped = json.loads('{"tmp": "' + json_value + '"}')
+        parsed_value = json.loads(wrapped["tmp"])
+
+        if arg_type == "number" and isinstance(parsed_value, str):
+            parsed_value = _convert_to_number(parsed_value)
+
+        return parsed_value, True
+    except (json.JSONDecodeError, ValueError, KeyError):
+        pass
+
+    # Strategy 3: ast.literal_eval
+    try:
+        parsed_value = ast.literal_eval(json_value)
+        return parsed_value, True
+    except (ValueError, SyntaxError):
+        pass
+
+    # Strategy 4: Treat as string
+    try:
+        quoted_value = json.dumps(str(json_value))
+        return json.loads(quoted_value), True
+    except (json.JSONDecodeError, ValueError):
+        return json_value, False
 
 
 class Glm4MoeDetector(BaseFormatDetector):
     """
     Detector for GLM-4.5 and GLM-4.6 models.
-    Assumes function call format:
-      <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>上海</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>
+    Assumes function call format (with actual newlines):
+      <tool_call>get_weather
+      <arg_key>city</arg_key>
+      <arg_value>北京</arg_value>
+      <arg_key>date</arg_key>
+      <arg_value>2024-06-27</arg_value>
+      </tool_call>
+
+    Or with literal \n characters (escaped as \\n in the output):
+      <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n</tool_call>
+
+    Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
     def __init__(self):
@@ -63,6 +159,23 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
+        )
+        self._last_arguments = ""
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self._streamed_raw_length = 0
+        self._reset_streaming_state()
+
+    def _reset_streaming_state(self) -> None:
+        """Reset the streaming state machine for a new tool call."""
+        self._stream_state = StreamState.INIT
+        self._current_key = ""
+        self._current_value = ""
+        self._xml_tag_buffer = ""
+        self._is_first_param = True
+        self._value_started = False
+        self._cached_value_type: Optional[str] = (
+            None  # Cache the value type for consistency
         )
 
     def has_tool_call(self, text: str) -> bool:
@@ -92,22 +205,218 @@ class Glm4MoeDetector(BaseFormatDetector):
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 pairs = self.func_arg_regex.findall(func_args)
-                arguments = {}
-                for arg_key, arg_value in pairs:
-                    arg_key = arg_key.strip()
-                    arg_value = arg_value.strip()
-                    arg_type = get_argument_type(func_name, arg_key, tools)
-                    if arg_type != "string":
-                        arg_value, is_good_json = parse_arguments(arg_value)
-                    arguments[arg_key] = arg_value
+
+                # Parse arguments using shared method
+                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
                 calls.extend(self.parse_base_json(match_result, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
+            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
+
+    def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
+        """Get parameter type from tool definition, with fallback to auto-detection.
+
+        Args:
+            func_name: Name of the function
+            key: Parameter name
+            tools: List of available tools
+
+        Returns:
+            Type string: 'string', 'number', 'object', 'array', or 'boolean'
+        """
+        arg_type = get_argument_type(func_name, key, tools)
+        if arg_type:
+            return arg_type
+
+        # Improved auto-detection type from value (best effort)
+        value_content = self._current_value.strip() if self._current_value else ""
+
+        if not value_content:
+            return "string"
+
+        # Try to parse as valid JSON first
+        try:
+            parsed = json.loads(value_content)
+            if isinstance(parsed, dict):
+                return "object"
+            elif isinstance(parsed, list):
+                return "array"
+            elif isinstance(parsed, bool):
+                return "boolean"
+            elif isinstance(parsed, (int, float)):
+                return "number"
+            # For string values, check if they look like numbers
+            elif isinstance(parsed, str):
+                if parsed.isdigit() or (
+                    parsed.startswith("-") and parsed[1:].isdigit()
+                ):
+                    return "number"
+                return "string"
+        except json.JSONDecodeError:
+            # Not valid JSON, try heuristic detection
+            first_char = value_content[0] if value_content else ""
+
+            if first_char.isdigit() or first_char in ["-", "."]:
+                return "number"
+            elif first_char in ["{", "["]:
+                return "object"
+            elif first_char in ['"', "'"]:
+                return "string"
+
+        # Default to string (safest fallback)
+        return "string"
+
+    def _format_value_complete(self, value: str, value_type: str) -> str:
+        """Format complete value based on type.
+
+        Args:
+            value: Raw value string
+            value_type: Expected type ('string', 'number', 'object')
+
+        Returns:
+            Properly formatted JSON value string
+        """
+        if value_type == "string":
+            # Ensure proper JSON string formatting with quotes
+            return json.dumps(value, ensure_ascii=False)
+        elif value_type == "number":
+            try:
+                num = _convert_to_number(value.strip())
+                return str(num)
+            except (ValueError, AttributeError):
+                # Fallback to string if not a valid number
+                logger.warning(
+                    f"Failed to parse '{value}' as number, treating as string"
+                )
+                return json.dumps(str(value), ensure_ascii=False)
+        else:
+            # For object/array types, return as-is (should already be valid JSON)
+            return value
+
+    def _process_xml_to_json_streaming(
+        self, raw_increment: str, func_name: str, tools: List[Tool]
+    ) -> str:
+        """Convert XML increment to JSON streaming output using state machine.
+
+        This method processes XML fragments character by character and converts them
+        to JSON format incrementally. It maintains state across calls to handle
+        partial XML tags and values.
+
+        Args:
+            raw_increment: New XML content to process
+            func_name: Name of the function being called
+            tools: List of available tools for type inference
+
+        Returns:
+            JSON string increment to append to the output
+        """
+        json_output = ""
+
+        for char in raw_increment:
+            self._xml_tag_buffer += char
+
+            if self._stream_state in [StreamState.INIT, StreamState.BETWEEN]:
+                if self._xml_tag_buffer.endswith("<arg_key>"):
+                    self._stream_state = StreamState.IN_KEY
+                    self._current_key = ""
+                    self._xml_tag_buffer = ""
+                    json_output += "{" if self._is_first_param else ", "
+                    self._is_first_param = False
+
+            elif self._stream_state == StreamState.IN_KEY:
+                if self._xml_tag_buffer.endswith("</arg_key>"):
+                    self._current_key = self._xml_tag_buffer[:-10].strip()
+                    self._xml_tag_buffer = ""
+                    self._stream_state = StreamState.WAITING_VALUE
+                    json_output += (
+                        json.dumps(self._current_key, ensure_ascii=False) + ": "
+                    )
+
+            elif self._stream_state == StreamState.WAITING_VALUE:
+                if self._xml_tag_buffer.endswith("<arg_value>"):
+                    self._stream_state = StreamState.IN_VALUE
+                    self._current_value = ""
+                    self._xml_tag_buffer = ""
+                    self._value_started = False
+                    # Determine and cache the value type at the start
+                    self._cached_value_type = self._get_value_type(
+                        func_name, self._current_key, tools
+                    )
+
+            elif self._stream_state == StreamState.IN_VALUE:
+                if self._xml_tag_buffer.endswith("</arg_value>"):
+                    final_value = self._xml_tag_buffer[:-12]
+                    self._current_value += final_value
+
+                    # Use cached value type for consistency
+                    value_type = self._cached_value_type or "string"
+
+                    if self._value_started:
+                        # Output any remaining content
+                        if final_value:
+                            if value_type == "string":
+                                json_output += json.dumps(
+                                    final_value, ensure_ascii=False
+                                )[1:-1]
+                            else:
+                                json_output += final_value
+                        # Always output closing quote for string type when value was started
+                        if value_type == "string":
+                            json_output += '"'
+                    else:
+                        # Value was never started (empty or complete in one chunk)
+                        json_output += self._format_value_complete(
+                            self._current_value, value_type
+                        )
+
+                    self._xml_tag_buffer = ""
+                    self._stream_state = StreamState.BETWEEN
+                    self._current_value = ""
+                    self._value_started = False
+                    self._cached_value_type = None  # Reset cached type
+                else:
+                    closing_tag = "</arg_value>"
+                    is_potential_closing = len(self._xml_tag_buffer) <= len(
+                        closing_tag
+                    ) and closing_tag.startswith(self._xml_tag_buffer)
+
+                    if not is_potential_closing:
+                        content = self._xml_tag_buffer
+                        # Use cached value type for consistency
+                        value_type = self._cached_value_type or "string"
+
+                        if value_type == "string":
+                            if not self._value_started:
+                                json_output += '"'
+                                self._value_started = True
+                            if content:
+                                json_output += json.dumps(content, ensure_ascii=False)[
+                                    1:-1
+                                ]
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                        elif value_type == "number":
+                            if content:
+                                if not self._value_started:
+                                    self._value_started = True
+                                json_output += content
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                        else:
+                            # For object/array types, output as-is
+                            if content:
+                                if not self._value_started:
+                                    self._value_started = True
+                                json_output += content
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+
+        return json_output
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
