@@ -710,6 +710,11 @@ class OpenAIServingChat(OpenAIServingBase):
                                         choices=[choice_data],
                                         model=request.model,
                                     )
+                                    chunk.chutes_verification = (
+                                        get_chutes_verification_value(
+                                            chunk.id, chunk.created, None
+                                        )
+                                    )
                                     yield f"data: {chunk.model_dump_json()}\n\n"
                                     # Mark that this choice has tool calls
                                     has_tool_calls[index] = True
@@ -733,6 +738,11 @@ class OpenAIServingChat(OpenAIServingBase):
                                     created=int(time.time()),
                                     choices=[choice_data],
                                     model=request.model,
+                                )
+                                chunk.chutes_verification = (
+                                    get_chutes_verification_value(
+                                        chunk.id, chunk.created, flush_result.normal_text
+                                    )
                                 )
                                 yield f"data: {chunk.model_dump_json()}\n\n"
 
