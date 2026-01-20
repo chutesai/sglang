@@ -49,17 +49,28 @@ def get_argument_type(
         The type string (e.g., 'string', 'number', 'object') or None if not found
     """
     name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
-        return None
-    tool = name2tool[func_name]
-    properties = (tool.function.parameters or {}).get("properties", {})
-    if not isinstance(properties, dict):
-        properties = {}
-    if arg_key not in properties:
+
+    # Check if function exists
+    tool = name2tool.get(func_name)
+    if not tool:
         return None
 
-    # Use new type inference function for complex JSON Schema support
-    return infer_type_from_json_schema(properties[arg_key])
+    # Get parameters safely using getattr
+    params = getattr(tool.function, "parameters", None)
+    if not isinstance(params, dict):
+        return None
+
+    # Navigate to the type using dict.get() for safe access
+    properties = params.get("properties")
+    if not isinstance(properties, dict):
+        return None
+
+    arg_spec = properties.get(arg_key)
+    if isinstance(arg_spec, dict):
+        # Use the new type inference function for complex JSON Schema support
+        return infer_type_from_json_schema(arg_spec)
+
+    return None
 
 
 def _convert_to_number(value: str) -> Any:
@@ -131,21 +142,11 @@ def parse_arguments(
         return json_value, False
 
 
-class Glm4MoeDetector(BaseFormatDetector):
+class Glm47MoeDetector(BaseFormatDetector):
     """
-    Detector for GLM-4.5 and GLM-4.6 models.
-    Assumes function call format (with actual newlines):
-      <tool_call>get_weather
-      <arg_key>city</arg_key>
-      <arg_value>北京</arg_value>
-      <arg_key>date</arg_key>
-      <arg_value>2024-06-27</arg_value>
-      </tool_call>
-
-    Or with literal \n characters (escaped as \\n in the output):
-      <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n</tool_call>
-
-    Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
+    Detector for GLM-4.7 and GLM-5 models.
+    Assumes function call format:
+      <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>
     """
 
     def __init__(self):
@@ -154,7 +155,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -164,6 +165,10 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._tool_call_completed = False  # Track if tool call has been completed
+        self._sent_empty_object = (
+            False  # Track if empty object has been sent for no-arg functions
+        )
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -177,6 +182,8 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._tool_call_completed = False  # Reset tool call completion status
+        self._sent_empty_object = False  # Reset empty object sent status
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -190,10 +197,28 @@ class Glm4MoeDetector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        # Extract all normal text (before, between, and after tool calls)
+        normal_text_parts = []
+        last_end = 0
+
+        # Find all tool call matches
+        for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+            # Add text before this tool call
+            if match.start() > last_end:
+                normal_text_parts.append(text[last_end : match.start()])
+            last_end = match.end()
+
+        # Add any remaining text after the last tool call
+        if last_end < len(text):
+            normal_text_parts.append(text[last_end:])
+
+        # Combine all normal text parts
+        normal_text = "".join(normal_text_parts).strip()
+
+        # Parse tool calls
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
         try:
@@ -204,10 +229,11 @@ class Glm4MoeDetector(BaseFormatDetector):
                     continue
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
-                pairs = self.func_arg_regex.findall(func_args)
-
-                # Parse arguments using shared method
-                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                arguments = {}
+                if func_args:
+                    pairs = self.func_arg_regex.findall(func_args)
+                    # Parse arguments using shared method
+                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
@@ -286,14 +312,14 @@ class Glm4MoeDetector(BaseFormatDetector):
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
             try:
-                num = _convert_to_number(value.strip())
+                num = _convert_to_number(value.strip() if value else "")
                 return str(num)
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
                     f"Failed to parse '{value}' as number, treating as string"
                 )
-                return json.dumps(str(value), ensure_ascii=False)
+                return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -418,6 +444,179 @@ class Glm4MoeDetector(BaseFormatDetector):
 
         return json_output
 
+    def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
+        """Extract function name, arguments and end marker from regex match.
+
+        Args:
+            match: Regex match object
+
+        Returns:
+            (func_name, func_args_raw, is_tool_end)
+        """
+        func_name = match.group(1).strip()
+        func_args_raw = match.group(2).strip() if match.group(2) else ""
+        is_tool_end = match.group(3) or ""
+        return func_name, func_args_raw, is_tool_end
+
+    def _send_tool_name_if_needed(
+        self, func_name: str, has_arg_key: bool, is_tool_end: str
+    ) -> Optional[ToolCallItem]:
+        """Send tool name if needed.
+
+        Args:
+            func_name: Function name
+            has_arg_key: Whether current text contains <arg_key
+            is_tool_end: Whether end marker is encountered
+
+        Returns:
+            Tool call item or None
+        """
+        if self.current_tool_name_sent:
+            return None
+
+        # Function name completeness check
+        is_func_name_complete = has_arg_key or is_tool_end == self.eot_token
+
+        if not is_func_name_complete:
+            return None
+
+        if not func_name:
+            logger.warning("Empty function name detected, skipping tool call")
+            return None
+
+        # Send tool name
+        self.current_tool_name_sent = True
+        self._streamed_raw_length = 0
+        self._reset_streaming_state()
+
+        # Record tool info
+        self.prev_tool_call_arr[self.current_tool_id] = {
+            "name": func_name,
+            "arguments": {},
+        }
+
+        return ToolCallItem(
+            tool_index=self.current_tool_id,
+            name=func_name,
+            parameters="",
+        )
+
+    def _process_arguments_streaming(
+        self, func_name: str, func_args_raw: str, tools: List[Tool]
+    ) -> Optional[ToolCallItem]:
+        """Process streaming arguments.
+
+        Args:
+            func_name: Function name
+            func_args_raw: Raw argument string
+            tools: List of available tools
+
+        Returns:
+            Tool call item with parameter updates or None
+        """
+        current_raw_length = len(func_args_raw)
+
+        if current_raw_length <= self._streamed_raw_length:
+            return None
+
+        # Get new raw XML content
+        raw_increment = func_args_raw[self._streamed_raw_length :]
+
+        # Convert XML to JSON using state machine
+        json_increment = self._process_xml_to_json_streaming(
+            raw_increment, func_name, tools
+        )
+
+        # CRITICAL: Update streamed length BEFORE early return
+        # Even if json_increment is empty, the input has been consumed by the state machine
+        self._streamed_raw_length = current_raw_length
+
+        if not json_increment:
+            return None
+
+        # Update state
+        self._last_arguments += json_increment
+        self.streamed_args_for_tool[self.current_tool_id] += json_increment
+
+        return ToolCallItem(
+            tool_index=self.current_tool_id,
+            name=None,
+            parameters=json_increment,
+        )
+
+    def _finalize_tool_call(
+        self,
+        func_name: str,
+        func_args_raw: str,
+        tools: List[Tool],
+        match_end_pos: int,
+        current_text: str,
+    ) -> List[ToolCallItem]:
+        """Complete tool call processing.
+
+        Args:
+            func_name: Function name
+            func_args_raw: Raw argument string
+            tools: List of available tools
+            match_end_pos: Match end position
+            current_text: Current text
+
+        Returns:
+            List of tool call items to add
+        """
+        calls = []
+
+        # Handle no-arg function or need to close braces
+        if self._is_first_param and not self._sent_empty_object:
+            # No-arg function
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters="{}",
+                )
+            )
+            self._last_arguments += "{}"
+            self.streamed_args_for_tool[self.current_tool_id] += "{}"
+            self._sent_empty_object = True
+        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
+            # Need to close brace
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters="}",
+                )
+            )
+            self._last_arguments += "}"
+            self.streamed_args_for_tool[self.current_tool_id] += "}"
+            self._sent_empty_object = True
+
+        # Parse final arguments
+        if func_args_raw:
+            try:
+                pairs = self.func_arg_regex.findall(func_args_raw)
+                if pairs:
+                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                    self.prev_tool_call_arr[self.current_tool_id][
+                        "arguments"
+                    ] = arguments
+            except Exception as e:
+                logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
+
+        # Clean buffer
+        self._buffer = current_text[match_end_pos:]
+
+        # Reset state for next tool call
+        self._tool_call_completed = True
+        self.current_tool_id += 1
+        self._last_arguments = ""
+        self.current_tool_name_sent = False
+        self._streamed_raw_length = 0
+        self._reset_streaming_state()
+
+        return calls
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -454,148 +653,95 @@ class Glm4MoeDetector(BaseFormatDetector):
                 # Could be start of tool call, keep buffering
                 return StreamingParseResult(normal_text="", calls=[])
 
+        # Extract any text before the first bot_token and return it as normal_text
+        normal_text = ""
+        first_bot_token_idx = current_text.find(self.bot_token)
+        if first_bot_token_idx > 0:
+            normal_text = current_text[:first_bot_token_idx]
+            current_text = current_text[first_bot_token_idx:]
+            # Update buffer to only include from the bot token onwards
+            self._buffer = current_text
+
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
+            # Use a single flexible regex pattern that handles all cases
             partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
-                string=current_text,
-                flags=re.DOTALL,
+                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
+                current_text,
+                re.DOTALL,
             )
-            if partial_match:
-                func_name_raw = partial_match.group(1)
-                func_args_raw = partial_match.group(2)
-                is_tool_end = partial_match.group(3)
 
-                # Only proceed if we have a non-empty function name
-                if func_name_raw is None or not func_name_raw.strip():
-                    # If we only have the start token without a function name,
-                    # continue buffering until we get more content
-                    return StreamingParseResult(normal_text="", calls=[])
+            if not partial_match:
+                return StreamingParseResult(normal_text=normal_text, calls=[])
 
-                func_name = func_name_raw.strip()
-                func_args_raw = func_args_raw.strip() if func_args_raw else ""
+            # Extract match groups using helper method
+            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
+                partial_match
+            )
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-                    self._streamed_raw_length = 0
-                    self.current_tool_name_sent = False
-                    self._reset_streaming_state()
+            # Initialize tool call state if needed (keeping existing logic)
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
+                self._streamed_raw_length = 0
+                self.current_tool_name_sent = False  # Reset for new tool call
+                self._reset_streaming_state()
+            # Check if this is a continuation of an existing tool call or a new one
+            elif not self.current_tool_name_sent:
+                # Only increment tool_id if we're truly starting a NEW tool call
+                # Don't increment if this is just the first time we're processing
+                # a tool call that was received in the buffer
+                # The key insight: only increment when we've COMPLETED a previous tool call
+                # and now see another bot_token in new_text
+                pass  # Remove the problematic auto-increment logic
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+            # Ensure tracking arrays are large enough (keeping existing logic)
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
 
-                # Send tool name first if not sent yet
-                if not self.current_tool_name_sent:
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
+            # Determine if function name is complete by checking for <arg_key> in the full text
+            # This is important for streaming scenarios where args come in later chunks
+            has_arg_key = "<arg_key" in current_text
+
+            # Send tool name if needed
+            tool_name_item = self._send_tool_name_if_needed(
+                func_name, has_arg_key, is_tool_end
+            )
+            if tool_name_item:
+                calls.append(tool_name_item)
+
+            # Process streaming arguments if tool name has been sent
+            if self.current_tool_name_sent:
+                arg_item = self._process_arguments_streaming(
+                    func_name, func_args_raw, tools
+                )
+                if arg_item:
+                    calls.append(arg_item)
+
+                # Finalize tool call if end token is encountered
+                if is_tool_end == self.eot_token and not self._tool_call_completed:
+                    finalize_calls = self._finalize_tool_call(
+                        func_name,
+                        func_args_raw,
+                        tools,
+                        partial_match.end(),
+                        current_text,
                     )
-                    self.current_tool_name_sent = True
-                    self._streamed_raw_length = 0
-                    self._reset_streaming_state()
-                    # Store the tool call info
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": {},
-                    }
-                else:
-                    # Process XML to JSON streaming
-                    current_raw_length = len(func_args_raw)
-
-                    if current_raw_length > self._streamed_raw_length:
-                        # Get the new raw XML content
-                        raw_increment = func_args_raw[self._streamed_raw_length :]
-
-                        # Convert XML increment to JSON increment using state machine
-                        json_increment = self._process_xml_to_json_streaming(
-                            raw_increment, func_name, tools
-                        )
-
-                        # CRITICAL: Update streamed length BEFORE checking json_increment
-                        # Even if json_increment is empty, the input has been consumed by the state machine
-                        self._streamed_raw_length = current_raw_length
-
-                        if json_increment:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=json_increment,
-                                )
-                            )
-                            self._last_arguments += json_increment
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += json_increment
-
-                    if is_tool_end == self.eot_token:
-                        if self._is_first_param:
-                            empty_object = "{}"
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=empty_object,
-                                )
-                            )
-                            self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
-                            closing_brace = "}"
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=closing_brace,
-                                )
-                            )
-                            self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += closing_brace
-
-                        try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
-                            if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
-                        except Exception as e:
-                            logger.debug(
-                                f"Failed to parse arguments: {e}", exc_info=True
-                            )
-
-                        # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._streamed_raw_length = 0
-                        self._reset_streaming_state()
-                        return result
-
-            return StreamingParseResult(normal_text="", calls=calls)
+                    calls.extend(finalize_calls)
+                    return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
             return StreamingParseResult(normal_text=current_text)
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
