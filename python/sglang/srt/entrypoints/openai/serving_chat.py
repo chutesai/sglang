@@ -29,6 +29,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    SglExt,
     ToolCall,
     ToolCallProcessingResult,
     ToolChoice,
@@ -38,6 +39,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -54,6 +56,32 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    img_vals = []
+    vid_vals = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # pydantic object or dict type
+            if getattr(part, "type", None) == "image_url":
+                iu = getattr(part, "image_url", None)
+                mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
+                if mdp is not None:
+                    img_vals.append(int(mdp))
+            elif getattr(part, "type", None) == "video_url":
+                vu = getattr(part, "video_url", None)
+                mdp = getattr(vu, "max_dynamic_patch", None) if vu else None
+                if mdp is not None:
+                    vid_vals.append(int(mdp))
+
+    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    img_max_dynamic_patch = min(img_vals) if img_vals else None
+    vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
+    return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -87,12 +115,68 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
+    def _handle_last_assistant_message(
+        self,
+        messages: List[Dict[str, Any]],
+        request: ChatCompletionRequest,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Handle continue_final_message feature: separate final assistant message.
+
+        If continue_final_message is enabled and the last message is from assistant,
+        extract its content and remove it from the message list.
+        If continue_final_message is False and the last message is from assistant,
+        convert it to a user message to ensure the last message is always from user.
+
+        Only processes text-based content (strings), ignoring multimodal content (lists).
+
+        Args:
+            messages: List of message dictionaries
+            request: ChatCompletionRequest with continue_final_message flag
+
+        Returns:
+            Tuple of (processed_messages, assistant_prefix)
+            - processed_messages: Messages with last assistant message handled appropriately
+            - assistant_prefix: Content of the last assistant message (string only), or None
+        """
+        assistant_prefix = None
+        if messages and messages[-1].get("role") == "assistant":
+            last_content = messages[-1].get("content")
+            # Only process string content, ignore multimodal content (lists)
+            if isinstance(last_content, str):
+                if request.continue_final_message:
+                    # Extract content and remove the assistant message
+                    assistant_prefix = last_content
+                    messages = messages[:-1]
+                else:
+                    # Convert the last assistant message to user message
+                    messages[-1] = {"role": "user", "content": last_content}
+        return messages, assistant_prefix
+
+    def _append_assistant_prefix_to_prompt_ids(
+        self, prompt_ids: List[int], assistant_prefix: str
+    ) -> List[int]:
+        """
+        Append assistant prefix to prompt_ids.
+
+        Args:
+            prompt_ids: Current prompt token IDs
+            assistant_prefix: Assistant message content to append
+
+        Returns:
+            Updated prompt_ids with assistant prefix appended
+        """
+        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+            encoded = encoded[1:]
+        return prompt_ids + encoded
+
     def _use_dpsk_v32_encoding(self) -> bool:
         has_chat_template = (
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
 
@@ -134,7 +218,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ):
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -235,6 +319,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if first_adapter:
                 self._validate_lora_enabled(first_adapter)
 
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -253,12 +340,17 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
         return adapted_request, request
@@ -333,12 +425,25 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
+            # Handle continue_final_message: separate final assistant message
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+
+            if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
         else:
             for message in request.messages:
                 if message.content is None:
@@ -375,15 +480,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 openai_compatible_messages.append(processed_msg)
 
-            # Handle assistant prefix for continue_final_message
-            assistant_prefix = None
-            if (
-                openai_compatible_messages
-                and openai_compatible_messages[-1]["role"] == "assistant"
-            ):
-                if request.continue_final_message:
-                    assistant_prefix = openai_compatible_messages[-1]["content"]
-                    openai_compatible_messages = openai_compatible_messages[:-1]
+            # Handle continue_final_message: separate final assistant message
+            openai_compatible_messages, assistant_prefix = (
+                self._handle_last_assistant_message(openai_compatible_messages, request)
+            )
 
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -397,6 +497,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if request.chat_template_kwargs
                         else {}
                     ),
+                    return_dict=False,
                 )
             except Exception as e:
                 # If the first attempt fails, try transforming the tools format
@@ -419,20 +520,18 @@ class OpenAIServingChat(OpenAIServingBase):
                             if request.chat_template_kwargs
                             else {}
                         ),
+                        return_dict=False,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
+            # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
-                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-                if (
-                    encoded
-                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
-                ):
-                    encoded = encoded[1:]
-                prompt_ids += encoded
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
 
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -556,6 +655,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         reasoning_tokens = {}
         hidden_states = {}
+        routed_experts = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -570,18 +670,25 @@ class OpenAIServingChat(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
+                finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
-                    choice_logprobs = self._process_streaming_logprobs(
-                        content, n_prev_tokens.get(index, 0)
-                    )
-                    n_prev_tokens[index] = len(
+                    n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
-
-                finish_reason = content["meta_info"]["finish_reason"]
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
+                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                        choice_logprobs = self._process_streaming_logprobs(
+                            content, n_prev_token
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
@@ -857,6 +964,27 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            if request.return_routed_experts and routed_experts:
+                for index, choice_routed_experts in routed_experts.items():
+                    if choice_routed_experts is not None:
+                        routed_experts_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        sgl_ext=SglExt(
+                                            routed_experts=choice_routed_experts
+                                        )
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield (f"data: {routed_experts_chunk.model_dump_json()}\n\n")
+
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -927,6 +1055,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
+            routed_experts = process_routed_experts_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
@@ -944,6 +1073,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model_type=reasoning_parser,
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
+                        request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1004,6 +1134,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 
@@ -1213,6 +1346,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
+                request,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1239,30 +1373,44 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""
+        if not self.reasoning_parser:
+            return False
+
         chat_template_kwargs = (
             request.chat_template_kwargs
             if hasattr(request, "chat_template_kwargs")
             else None
         )
-        default_enable_thinking = False
 
-        # GLM-4.5/4.6 templates emit thinking tags by default, so honor that unless
-        # the user explicitly disables it.
-        if self.reasoning_parser in {"glm45"}:
+        if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
+            return (
+                chat_template_kwargs is not None
+                and chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
+            return (
+                not chat_template_kwargs
+                or chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "nano_v3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not chat_template_kwargs
+                or chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["glm45"]:
+            # GLM-4.5/4.6 templates emit thinking tags by default, so honor that unless
+            # the user explicitly disables it via enable_thinking=False
             default_enable_thinking = True
-
-        if chat_template_kwargs:
-            # For Qwen3/GLM models, `enable_thinking` controls reasoning.
-            if self.reasoning_parser in ["qwen3", "glm45"]:
+            if chat_template_kwargs:
                 return chat_template_kwargs.get(
                     "enable_thinking", default_enable_thinking
                 )
-            # For DeepSeek-V3.1 models, `thinking` is supported.
-            if self.reasoning_parser in ["deepseek-v3"]:
-                return chat_template_kwargs.get("thinking", default_enable_thinking)
             return default_enable_thinking
 
-        return default_enable_thinking
+        return True  # default
 
     async def _process_tool_call_stream(
         self,

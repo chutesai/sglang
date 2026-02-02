@@ -214,5 +214,5 @@ class DeepSeekV31Detector(BaseFormatDetector):
         return lambda name: StructureInfo(
             begin="<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
             end="<｜tool▁call▁end｜>",
-            trigger="<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
+            trigger="<｜tool▁call▁begin｜>",
         )
