@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -114,6 +115,42 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+    def _compute_template_hashes(
+        self, request: ChatCompletionRequest
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Compute SHA256 hashes for chat template and templated prompt.
+
+        Args:
+            request: The chat completion request with _chat_template and _templated_prompt attrs
+
+        Returns:
+            Tuple of (template_sha256, prompt_sha256, templated_prompt or None)
+            - template_sha256 and prompt_sha256 are always returned if data is available
+            - templated_prompt is only returned if echo_prompt is True
+        """
+        template_sha256 = None
+        prompt_sha256 = None
+        templated_prompt = None
+
+        chat_template = getattr(request, "_chat_template", None)
+        templated_prompt_val = getattr(request, "_templated_prompt", None)
+
+        if chat_template:
+            template_sha256 = hashlib.sha256(
+                chat_template.encode("utf-8")
+            ).hexdigest()
+
+        if templated_prompt_val:
+            prompt_sha256 = hashlib.sha256(
+                templated_prompt_val.encode("utf-8")
+            ).hexdigest()
+
+        if request.echo_prompt and templated_prompt_val:
+            templated_prompt = templated_prompt_val
+
+        return template_sha256, prompt_sha256, templated_prompt
 
     def _handle_last_assistant_message(
         self,
@@ -353,6 +390,13 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
+        # Store template data for echo_prompt feature (as private attributes)
+        # These are computed during template application and used in responses
+        object.__setattr__(request, "_chat_template", processed_messages._chat_template)
+        object.__setattr__(
+            request, "_templated_prompt", processed_messages._templated_prompt
+        )
+
         return adapted_request, request
 
     def _process_messages(
@@ -541,6 +585,19 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_data = audio_data if audio_data else None
         video_data = video_data if video_data else None
         modalities = modalities if modalities else []
+
+        # Capture chat template and templated prompt for echo_prompt feature
+        chat_template = getattr(
+            self.tokenizer_manager.tokenizer, "chat_template", None
+        )
+        # Get the templated prompt string (decode if we have token IDs)
+        if prompt:
+            templated_prompt = prompt
+        elif isinstance(prompt_ids, list) and prompt_ids:
+            templated_prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+        else:
+            templated_prompt = str(prompt_ids) if prompt_ids else ""
+
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
@@ -549,6 +606,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            _chat_template=chat_template,
+            _templated_prompt=templated_prompt,
         )
 
     def _apply_conversation_template(
@@ -608,6 +667,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
+        # For conversation templates, capture the conversation template name and prompt
+        # Note: conversation templates don't have a raw template string like Jinja,
+        # so we use the template name as an identifier
+        chat_template = self.template_manager.chat_template_name
+        templated_prompt = prompt
+
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
@@ -616,6 +681,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            _chat_template=chat_template,
+            _templated_prompt=templated_prompt,
         )
 
     async def _handle_streaming_request(
@@ -705,11 +772,20 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason=None,
                         logprobs=None,
                     )
+
+                    # Compute template hashes for first chunk only (echo_prompt feature)
+                    template_sha256, prompt_sha256, templated_prompt = (
+                        self._compute_template_hashes(request)
+                    )
+
                     chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=int(time.time()),
                         choices=[choice_data],
                         model=request.model,
+                        template_sha256=template_sha256,
+                        prompt_sha256=prompt_sha256,
+                        templated_prompt=templated_prompt,
                     )
                     chunk.chutes_verification = get_chutes_verification_value(
                         chunk.id, chunk.created, None
@@ -1147,6 +1223,11 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        # Compute template hashes for echo_prompt feature
+        template_sha256, prompt_sha256, templated_prompt = self._compute_template_hashes(
+            request
+        )
+
         chunk = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
@@ -1154,6 +1235,9 @@ class OpenAIServingChat(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            template_sha256=template_sha256,
+            prompt_sha256=prompt_sha256,
+            templated_prompt=templated_prompt,
         )
         if choices:
             chunk.chutes_verification = get_chutes_verification_value(

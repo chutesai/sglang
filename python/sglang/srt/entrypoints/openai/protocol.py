@@ -555,6 +555,11 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    echo_prompt: bool = Field(
+        default=False,
+        description="If true, returns the templated prompt in the response. "
+        "Also includes template_sha256 and prompt_sha256 hashes.",
+    )
 
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -781,6 +786,20 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     chutes_verification: Optional[str] = None
+    template_sha256: Optional[str] = None
+    prompt_sha256: Optional[str] = None
+    templated_prompt: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.template_sha256 is None:
+            data.pop("template_sha256", None)
+        if self.prompt_sha256 is None:
+            data.pop("prompt_sha256", None)
+        if self.templated_prompt is None:
+            data.pop("templated_prompt", None)
+        return data
 
 
 class DeltaMessage(BaseModel):
@@ -821,6 +840,20 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     chutes_verification: Optional[str] = None
+    template_sha256: Optional[str] = None
+    prompt_sha256: Optional[str] = None
+    templated_prompt: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.template_sha256 is None:
+            data.pop("template_sha256", None)
+        if self.prompt_sha256 is None:
+            data.pop("prompt_sha256", None)
+        if self.templated_prompt is None:
+            data.pop("templated_prompt", None)
+        return data
 
 
 class MultimodalEmbeddingInput(BaseModel):
@@ -1307,6 +1340,8 @@ class MessageProcessingResult:
         modalities: List of modality types present in the messages
         stop: Combined stop strings from template and request
         tool_call_constraint: Optional constraint for structured tool calls
+        _chat_template: The chat template string used for rendering (internal)
+        _templated_prompt: The final templated prompt string (internal)
     """
 
     prompt: str
@@ -1317,6 +1352,8 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    _chat_template: Optional[str] = None
+    _templated_prompt: Optional[str] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
