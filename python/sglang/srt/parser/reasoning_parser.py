@@ -410,6 +410,7 @@ class ReasoningParser:
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
         "longcat": LongCatDetector,
+        "step3p5": DeepSeekR1Detector,
         "nano_v3": NanoV3Detector,
         "interns1": Qwen3Detector,
     }
