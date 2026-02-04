@@ -1067,7 +1067,7 @@ class SchedulerOutputProcessorMixin:
                                 break
                         else:
                             # No end token found - all tokens are reasoning if request has reasoning enabled
-                            if req.reasoning:
+                            if req.require_reasoning:
                                 reasoning_token_count = len(output_ids_)
                 reasoning_tokens.append(reasoning_token_count)
 
