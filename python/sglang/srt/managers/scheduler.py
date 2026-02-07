@@ -34,6 +34,7 @@ from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constrained.base_grammar_backend import INVALID_GRAMMAR_OBJ
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
