@@ -115,6 +115,10 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
 
+        # Auto-detect reasoning parser for GPT-OSS models
+        if self.is_gpt_oss and not self.reasoning_parser:
+            self.reasoning_parser = "gpt-oss"
+
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
     def _compute_template_hashes(
@@ -744,19 +748,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
-                    n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = len(
-                        content["meta_info"]["output_token_logprobs"]
+                    output_token_logprobs = content["meta_info"].get(
+                        "output_token_logprobs"
                     )
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
-                    # detokenizer (it holds back text at word boundaries). Return None
-                    # for logprobs since no new tokens were generated for this text.
-                    if n_prev_token < total_output_logprobs or finish_reason is None:
-                        choice_logprobs = self._process_streaming_logprobs(
-                            content, n_prev_token
-                        )
-                    n_prev_tokens[index] = total_output_logprobs
+                    if output_token_logprobs is not None:
+                        n_prev_token = n_prev_tokens.get(index, 0)
+                        total_output_logprobs = len(output_token_logprobs)
+                        # When finish_reason is set and all logprobs have been sent,
+                        # any remaining text is just buffered text being flushed by the
+                        # detokenizer (it holds back text at word boundaries). Return None
+                        # for logprobs since no new tokens were generated for this text.
+                        if (
+                            n_prev_token < total_output_logprobs
+                            or finish_reason is None
+                        ):
+                            choice_logprobs = self._process_streaming_logprobs(
+                                content, n_prev_token
+                            )
+                        n_prev_tokens[index] = total_output_logprobs
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
@@ -1299,10 +1308,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return token_logprobs
 
-    def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
+    def _process_response_logprobs(
+        self, ret_item: Dict[str, Any]
+    ) -> Optional[ChoiceLogprobs]:
         """Process logprobs for non-streaming response"""
+        output_token_logprobs = ret_item["meta_info"].get("output_token_logprobs")
+        if output_token_logprobs is None:
+            return None
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
+            output_token_logprobs=output_token_logprobs,
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 

@@ -1161,12 +1161,16 @@ class SchedulerOutputProcessorMixin:
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
-                        output_hidden_states = []
+                        output_hidden_states = [None] * (len(rids) - 1)
                     output_hidden_states.append(req.hidden_states)
+                elif output_hidden_states is not None:
+                    output_hidden_states.append(None)
                 if req.return_routed_experts:
                     if routed_experts is None:
-                        routed_experts = []
+                        routed_experts = [None] * (len(rids) - 1)
                     routed_experts.append(req.routed_experts)
+                elif routed_experts is not None:
+                    routed_experts.append(None)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():

@@ -1611,9 +1611,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                if i < len(recv_obj.output_hidden_states):
+                    meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                meta_info["routed_experts"] = recv_obj.routed_experts[i]
+                if i < len(recv_obj.routed_experts):
+                    meta_info["routed_experts"] = recv_obj.routed_experts[i]
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -1800,6 +1802,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj_index: int,
     ):
         if recv_obj.input_token_logprobs_val is None:
+            # The batch didn't compute logprobs (no logprob requests in this
+            # batch iteration), but the request still needs logprob fields in
+            # meta_info. Populate from previously accumulated state.
+            self.add_logprob_to_meta_info(
+                meta_info,
+                state,
+                top_logprobs_num,
+                token_ids_logprob,
+                return_text_in_logprobs,
+            )
             return
 
         if (
