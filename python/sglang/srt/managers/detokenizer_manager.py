@@ -123,6 +123,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_dummy = False
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        # Auto-enable for gpt-oss: batch_decode can corrupt structural tokens
+        # like <|end|> which breaks HarmonyParser reasoning/content separation.
+        if not self.disable_tokenizer_batch_decode and (
+            server_args.tool_call_parser == "gpt-oss"
+            or server_args.reasoning_parser == "gpt-oss"
+        ):
+            self.disable_tokenizer_batch_decode = True
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",

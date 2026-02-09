@@ -411,6 +411,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss:
             request.skip_special_tokens = False
+            # Avoid inserting spaces between structural tokens like <|end|>
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs.setdefault(
+                "spaces_between_special_tokens", False
+            )
 
         tool_call_constraint = None
 
