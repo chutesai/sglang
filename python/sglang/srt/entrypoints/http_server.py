@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -1820,6 +1821,44 @@ def _wait_weights_ready():
     )
 
 
+_SSL_PEM_ENV_VARS = {
+    "SGLANG_SSL_KEYFILE_PEM": "ssl_keyfile",
+    "SGLANG_SSL_CERTFILE_PEM": "ssl_certfile",
+    "SGLANG_SSL_CA_CERTS_PEM": "ssl_ca_certs",
+}
+
+
+def _materialize_ssl_pem_env_vars(server_args: ServerArgs) -> List[str]:
+    """Write PEM content from env vars to files."""
+    tmpfiles: List[str] = []
+    tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    for env_var, attr in _SSL_PEM_ENV_VARS.items():
+        content = os.environ.get(env_var)
+        if content and not getattr(server_args, attr):
+            fd, path = tempfile.mkstemp(dir=tmpdir, prefix="sglang_ssl_", suffix=".pem")
+            try:
+                os.fchmod(fd, stat.S_IRUSR)
+                os.write(fd, content.encode())
+            finally:
+                os.close(fd)
+            setattr(server_args, attr, path)
+            tmpfiles.append(path)
+
+    password = os.environ.get("SGLANG_SSL_KEYFILE_PASSWORD")
+    if password and not server_args.ssl_keyfile_password:
+        server_args.ssl_keyfile_password = password
+
+    return tmpfiles
+
+
+def _cleanup_ssl_tempfiles(tmpfiles: List[str]) -> None:
+    for path in tmpfiles:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -1918,6 +1957,9 @@ def launch_server(
             port_args, server_args, scheduler_infos[0]
         )
 
+    # Materialize any PEM content from env vars temp files.
+    ssl_tmpfiles = _materialize_ssl_pem_env_vars(server_args)
+
     try:
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
@@ -1933,6 +1975,12 @@ def launch_server(
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
                 loop="uvloop",
+                ssl_keyfile=server_args.ssl_keyfile,
+                ssl_certfile=server_args.ssl_certfile,
+                ssl_keyfile_password=server_args.ssl_keyfile_password,
+                ssl_ca_certs=server_args.ssl_ca_certs,
+                ssl_cert_reqs=server_args.ssl_cert_reqs,
+                ssl_ciphers=server_args.ssl_ciphers,
             )
         else:
             # Multiple tokenizer and http processes
@@ -1954,8 +2002,15 @@ def launch_server(
                 timeout_keep_alive=5,
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
+                ssl_keyfile=server_args.ssl_keyfile,
+                ssl_certfile=server_args.ssl_certfile,
+                ssl_keyfile_password=server_args.ssl_keyfile_password,
+                ssl_ca_certs=server_args.ssl_ca_certs,
+                ssl_cert_reqs=server_args.ssl_cert_reqs,
+                ssl_ciphers=server_args.ssl_ciphers,
             )
     finally:
+        _cleanup_ssl_tempfiles(ssl_tmpfiles)
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()

@@ -305,6 +305,14 @@ class ServerArgs:
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
+    # TLS/mTLS
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_cert_reqs: int = 0
+    ssl_ciphers: str = "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!MD5:!DSS"
+
     # Quantization and data type
     dtype: str = "auto"
     quantization: Optional[str] = None
@@ -2954,6 +2962,49 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+
+        # TLS/mTLS
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="Path to the SSL private key file (PEM format).",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="Path to the SSL certificate file (PEM format).",
+        )
+        parser.add_argument(
+            "--ssl-keyfile-password",
+            type=str,
+            default=ServerArgs.ssl_keyfile_password,
+            help="Password for the SSL key file, if encrypted.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="Path to the CA certificate file for client certificate verification (enables mTLS).",
+        )
+        parser.add_argument(
+            "--ssl-cert-reqs",
+            type=int,
+            default=ServerArgs.ssl_cert_reqs,
+            help="Whether client certificates are required. 0 = no client cert (ssl.CERT_NONE), "
+            "1 = optional (ssl.CERT_OPTIONAL), 2 = required (ssl.CERT_REQUIRED). "
+            "Set to 2 with --ssl-ca-certs to enforce mTLS.",
+        )
+        parser.add_argument(
+            "--ssl-ciphers",
+            type=str,
+            default=ServerArgs.ssl_ciphers,
+            help="Allowed SSL cipher suites (OpenSSL format). Only affects TLS 1.2 and below; "
+            "TLS 1.3 ciphers are not configurable via this option. "
+            "Default restricts to ECDHE key exchange with AESGCM or CHACHA20-POLY1305 "
+            "(forward secrecy + AEAD only).",
         )
 
         # Quantization and data type
