@@ -1822,26 +1822,26 @@ def _wait_weights_ready():
     )
 
 
-def _decrypt_cenv(encrypted_value: str) -> Optional[str]:
-    """Decrypt an encrypted env var value via the LD_PRELOAD'd C library.
+def _decrypt_string(ciphertext: str) -> Optional[str]:
+    """Decrypt a ciphertext string via the LD_PRELOAD'd C library Unix socket.
 
     Returns the decrypted string, or None if the decrypt function is
     unavailable (e.g. the preload library is not loaded).
     """
     try:
         lib = ctypes.CDLL(None)
-        decrypt_fn = lib.decrypt_cenv
+        decrypt_fn = lib.decrypt_string
         decrypt_fn.argtypes = [ctypes.c_char_p]
         decrypt_fn.restype = ctypes.c_char_p
     except (OSError, AttributeError):
         logger.warning(
-            "CENC_ env var found but decrypt_cenv symbol is not available "
+            "CENC_ env var found but decrypt_string symbol is not available "
             "(LD_PRELOAD library not loaded?). Ignoring encrypted value."
         )
         return None
-    result = decrypt_fn(encrypted_value.encode())
+    result = decrypt_fn(ciphertext.encode())
     if result is None:
-        logger.warning("decrypt_cenv returned NULL — decryption failed")
+        logger.warning("decrypt_string returned NULL — decryption failed")
         return None
     return result.decode()
 
@@ -1850,8 +1850,8 @@ def _get_env(name: str) -> Optional[str]:
     """Get an env var, transparently decrypting CENC_-prefixed variants."""
     encrypted = os.environ.get(f"CENC_{name}")
     if encrypted:
-        logger.info("Decrypting CENC_%s via LD_PRELOAD decrypt_cenv", name)
-        decrypted = _decrypt_cenv(encrypted)
+        logger.info("Decrypting CENC_%s via LD_PRELOAD decrypt_string", name)
+        decrypted = _decrypt_string(encrypted)
         if decrypted is not None:
             return decrypted
         # Fall through to plain env var if decryption failed.
