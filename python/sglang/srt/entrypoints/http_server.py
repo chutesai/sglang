@@ -18,6 +18,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import ctypes
 import dataclasses
 import logging
 import os
@@ -1821,6 +1822,42 @@ def _wait_weights_ready():
     )
 
 
+def _decrypt_cenv(encrypted_value: str) -> Optional[str]:
+    """Decrypt an encrypted env var value via the LD_PRELOAD'd C library.
+
+    Returns the decrypted string, or None if the decrypt function is
+    unavailable (e.g. the preload library is not loaded).
+    """
+    try:
+        lib = ctypes.CDLL(None)
+        decrypt_fn = lib.decrypt_cenv
+        decrypt_fn.argtypes = [ctypes.c_char_p]
+        decrypt_fn.restype = ctypes.c_char_p
+    except (OSError, AttributeError):
+        logger.warning(
+            "CENC_ env var found but decrypt_cenv symbol is not available "
+            "(LD_PRELOAD library not loaded?). Ignoring encrypted value."
+        )
+        return None
+    result = decrypt_fn(encrypted_value.encode())
+    if result is None:
+        logger.warning("decrypt_cenv returned NULL — decryption failed")
+        return None
+    return result.decode()
+
+
+def _get_env(name: str) -> Optional[str]:
+    """Get an env var, transparently decrypting CENC_-prefixed variants."""
+    encrypted = os.environ.get(f"CENC_{name}")
+    if encrypted:
+        logger.info("Decrypting CENC_%s via LD_PRELOAD decrypt_cenv", name)
+        decrypted = _decrypt_cenv(encrypted)
+        if decrypted is not None:
+            return decrypted
+        # Fall through to plain env var if decryption failed.
+    return os.environ.get(name)
+
+
 _SSL_PEM_ENV_VARS = {
     "SGLANG_SSL_KEYFILE_PEM": "ssl_keyfile",
     "SGLANG_SSL_CERTFILE_PEM": "ssl_certfile",
@@ -1833,7 +1870,7 @@ def _materialize_ssl_pem_env_vars(server_args: ServerArgs) -> List[str]:
     tmpfiles: List[str] = []
     tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") else None
     for env_var, attr in _SSL_PEM_ENV_VARS.items():
-        content = os.environ.get(env_var)
+        content = _get_env(env_var)
         if content and not getattr(server_args, attr):
             fd, path = tempfile.mkstemp(dir=tmpdir, prefix="sglang_ssl_", suffix=".pem")
             try:
@@ -1844,7 +1881,7 @@ def _materialize_ssl_pem_env_vars(server_args: ServerArgs) -> List[str]:
             setattr(server_args, attr, path)
             tmpfiles.append(path)
 
-    password = os.environ.get("SGLANG_SSL_KEYFILE_PASSWORD")
+    password = _get_env("SGLANG_SSL_KEYFILE_PASSWORD")
     if password and not server_args.ssl_keyfile_password:
         server_args.ssl_keyfile_password = password
 
