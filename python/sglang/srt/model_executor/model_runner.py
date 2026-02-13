@@ -945,24 +945,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 t.start()
 
-        # Verify HF cache integrity before loading (skip for dummy/remote formats).
-        if self.server_args.load_format not in (
-            "dummy",
-            "remote",
-            "remote_instance",
-        ):
-            from sglang.srt.utils.hf_cache_verify import verify_model_cache
-
-            hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
-                "HUGGING_FACE_HUB_TOKEN"
-            )
-            verify_model_cache(
-                model=self.model_config.model_path,
-                revision=self.model_config.revision,
-                download_dir=self.server_args.download_dir,
-                hf_token=hf_token,
-            )
-
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()

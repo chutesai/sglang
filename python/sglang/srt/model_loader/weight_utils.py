@@ -497,7 +497,14 @@ def download_weights_from_hf(
             model_name_or_path, cache_dir, allow_patterns, revision
         )
         if path is not None:
-            # Valid local cache found, skip download
+            # Valid local cache found — verify integrity before using.
+            from sglang.srt.utils.hf_cache_verify import verify_model_cache
+
+            verify_model_cache(
+                model=model_name_or_path,
+                revision=revision,
+                download_dir=cache_dir,
+            )
             return path
 
         # In CI, skip HF API calls if we're in offline mode or want to avoid rate limits
@@ -526,6 +533,16 @@ def download_weights_from_hf(
                 tqdm_class=DisabledTqdm,
                 revision=revision,
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+            # Verify HF cache integrity after download.
+            from sglang.srt.utils.hf_cache_verify import (
+                verify_model_cache,
+            )
+
+            verify_model_cache(
+                model=model_name_or_path,
+                revision=revision,
+                download_dir=cache_dir,
             )
             return hf_folder
         else:
