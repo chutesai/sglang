@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import gc
 import logging
 import os
 import signal
@@ -398,6 +399,9 @@ class Scheduler(
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
+
+        # Reclaim host memory before cache allocation (important for hicache with DP)
+        gc.collect()
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()

@@ -697,6 +697,8 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class LayeredModelLoader(DefaultModelLoader):

@@ -986,6 +986,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         monkey_patch_vllm_parallel_state(reverse=True)
 
+        # Free loader and transient objects to reclaim host memory before cache init
+        del self.loader
+        gc.collect()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
         get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled

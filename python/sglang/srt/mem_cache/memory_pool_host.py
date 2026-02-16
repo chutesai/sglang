@@ -145,6 +145,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        dp_size: int = 1,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -174,18 +175,37 @@ class HostKVCache(abc.ABC):
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        # When using data parallelism, multiple ranks share host memory.
+        # Divide available memory by dp_size to get per-rank budget.
+        available_bytes = (host_mem.available - ten_gb) // dp_size
         if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+            if host_size > 0:
+                # User explicitly requested a size that doesn't fit
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB per rank but only have "
+                    f"{available_bytes / 1e9:.2f} GB free per rank "
+                    f"(dp_size={dp_size}). Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+            else:
+                # Auto-sized: shrink to fit available memory
+                max_tokens = int(available_bytes // self.size_per_token)
+                self.page_num = max_tokens // self.page_size
+                self.size = self.page_num * self.page_size
+                assert (
+                    self.size > device_pool.size
+                ), "The host memory should be larger than the device memory with the current protocol"
+                requested_bytes = self.size * self.size_per_token
+                logger.warning(
+                    f"Reduced hierarchical KV cache from ratio to fit available "
+                    f"host memory: {requested_bytes / 1e9:.2f} GB per rank "
+                    f"({available_bytes / 1e9:.2f} GB available, dp_size={dp_size})."
+                )
+
+        logger.info(
+            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+        )
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -284,6 +304,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        dp_size: int = 1,
     ):
         super().__init__(
             device_pool,
@@ -294,6 +315,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dp_size=dp_size,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -697,6 +719,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        dp_size: int = 1,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -708,6 +731,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dp_size=dp_size,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
@@ -1038,6 +1062,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        dp_size: int = 1,
     ):
         # Initialize indexer metadata before HostKVCache.__init__ calls get_size_per_token.
         self.index_head_dim = device_pool.index_head_dim
@@ -1057,6 +1082,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device,
             allocator_type,
             override_kv_cache_dim=device_pool.kv_cache_dim,
+            dp_size=dp_size,
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
