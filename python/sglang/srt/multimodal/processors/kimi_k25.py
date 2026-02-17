@@ -24,8 +24,8 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # AutoProcessor may return just a tokenizer for Kimi-K2.5 because the
         # model's auto_map for AutoProcessor is only in preprocessor_config.json
-        # (not in config.json or processor_config.json), which some transformers
-        # versions don't check. Reconstruct the full processor if needed.
+        # (not config.json), which some transformers versions / kwargs combos
+        # cause to be missed.  Reconstruct the full processor when needed.
         if isinstance(_processor, PreTrainedTokenizerBase):
             _processor = self._build_full_processor(server_args, _processor)
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -39,25 +39,57 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     @staticmethod
     def _build_full_processor(server_args, tokenizer):
         """Build the full KimiK25Processor when AutoProcessor returned a bare tokenizer."""
-        from transformers import AutoImageProcessor
+        import json
+        import os
+
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
         logger.info(
             "AutoProcessor returned a bare tokenizer for Kimi-K2.5. "
             "Loading image processor separately to construct full processor."
         )
-        image_processor = AutoImageProcessor.from_pretrained(
-            server_args.tokenizer_path,
-            trust_remote_code=server_args.trust_remote_code,
-        )
-        # Load KimiK25Processor from the same dynamically-loaded module package
-        import importlib
 
-        vision_module = type(image_processor).__module__
-        processor_module_name = vision_module.replace(
-            "kimi_k25_vision_processing", "kimi_k25_processor"
+        # Find preprocessor_config.json — try local paths first, then HF cache
+        preprocessor_config = None
+        for path in [server_args.model_path, server_args.tokenizer_path]:
+            config_file = os.path.join(path, "preprocessor_config.json")
+            if os.path.isfile(config_file):
+                with open(config_file) as f:
+                    preprocessor_config = json.load(f)
+                break
+
+        if preprocessor_config is None:
+            # Files are in the HF cache from snapshot_download but offline
+            # flags may block normal resolution. Use local_files_only=True
+            # to read directly from cache.
+            from huggingface_hub import hf_hub_download
+
+            config_file = hf_hub_download(
+                server_args.tokenizer_path,
+                "preprocessor_config.json",
+                local_files_only=True,
+            )
+            with open(config_file) as f:
+                preprocessor_config = json.load(f)
+
+        # Load custom classes from the model's trust-remote-code modules.
+        # local_files_only=True ensures this works even with HF_HUB_OFFLINE=1
+        # since the files are already cached from the initial snapshot_download.
+        model_name = server_args.tokenizer_path
+        KimiK25VisionProcessor = get_class_from_dynamic_module(
+            "kimi_k25_vision_processing.KimiK25VisionProcessor",
+            model_name,
+            local_files_only=True,
         )
-        processor_module = importlib.import_module(processor_module_name)
-        KimiK25Processor = processor_module.KimiK25Processor
+        KimiK25Processor = get_class_from_dynamic_module(
+            "kimi_k25_processor.KimiK25Processor",
+            model_name,
+            local_files_only=True,
+        )
+
+        image_processor = KimiK25VisionProcessor(
+            media_proc_cfg=preprocessor_config["media_proc_cfg"],
+        )
         return KimiK25Processor(
             image_processor=image_processor, tokenizer=tokenizer
         )
