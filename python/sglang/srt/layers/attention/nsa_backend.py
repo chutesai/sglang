@@ -1438,7 +1438,21 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif nsa_impl == "fa3":
-            return self._forward_fa3(
+            # When DP attention pads the batch after metadata initialization
+            # (e.g. EAGLE V2 draft extend with skip_attn_backend_init=True),
+            # page_table_1 (from topk_indices on the padded q) may have more
+            # rows than the metadata's cu_seqlens_q expects.  The FA3 kernel
+            # requires page_table.size(0) == len(cu_seqlens_q) - 1.
+            # Truncate q and page_table to the metadata batch size and
+            # zero-pad the output back so the residual connection is safe.
+            nsa_bs = metadata.nsa_cu_seqlens_q.size(0) - 1
+            num_total_tokens = q_rope.size(0)
+            need_trim = page_table_1.size(0) != nsa_bs
+            if need_trim:
+                page_table_1 = page_table_1[:nsa_bs]
+                q_rope = q_rope[:nsa_bs]
+                q_nope = q_nope[:nsa_bs]
+            o = self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -1452,6 +1466,10 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+            if need_trim:
+                pad_size = num_total_tokens - nsa_bs
+                o = torch.nn.functional.pad(o, (0, 0, 0, pad_size))
+            return o
         elif nsa_impl == "trtllm":
             assert forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend(
                 include_v2=True
