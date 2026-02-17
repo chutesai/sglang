@@ -1,7 +1,9 @@
+import logging
 import re
 from typing import Dict, List, Tuple, Union
 
 import torch
+from transformers import PreTrainedTokenizerBase
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
@@ -12,12 +14,20 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        # AutoProcessor may return just a tokenizer for Kimi-K2.5 because the
+        # model's auto_map for AutoProcessor is only in preprocessor_config.json
+        # (not in config.json or processor_config.json), which some transformers
+        # versions don't check. Reconstruct the full processor if needed.
+        if isinstance(_processor, PreTrainedTokenizerBase):
+            _processor = self._build_full_processor(server_args, _processor)
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
@@ -25,6 +35,32 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             image_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
+
+    @staticmethod
+    def _build_full_processor(server_args, tokenizer):
+        """Build the full KimiK25Processor when AutoProcessor returned a bare tokenizer."""
+        from transformers import AutoImageProcessor
+
+        logger.info(
+            "AutoProcessor returned a bare tokenizer for Kimi-K2.5. "
+            "Loading image processor separately to construct full processor."
+        )
+        image_processor = AutoImageProcessor.from_pretrained(
+            server_args.tokenizer_path,
+            trust_remote_code=server_args.trust_remote_code,
+        )
+        # Load KimiK25Processor from the same dynamically-loaded module package
+        import importlib
+
+        vision_module = type(image_processor).__module__
+        processor_module_name = vision_module.replace(
+            "kimi_k25_vision_processing", "kimi_k25_processor"
+        )
+        processor_module = importlib.import_module(processor_module_name)
+        KimiK25Processor = processor_module.KimiK25Processor
+        return KimiK25Processor(
+            image_processor=image_processor, tokenizer=tokenizer
+        )
 
     async def process_mm_data_async(
         self,
