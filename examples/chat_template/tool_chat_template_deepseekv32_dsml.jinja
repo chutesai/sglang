@@ -86,7 +86,7 @@ Here are the functions available in JSONSchema format:
 {%- endfor -%}
 
 {# Emit BOS and system prompt #}
-{{- sp.text -}}
+{{- bos_token }}{{ sp.text -}}
 
 {# Render messages #}
 {%- for message in messages -%}
@@ -100,18 +100,20 @@ Here are the functions available in JSONSchema format:
       {%- set dev_content = dev_content + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
     {%- endif -%}
     {%- set dev_content = dev_content + "\n\n# The user's message is: " + content -%}
-    {{ "<｜User｜>" + dev_content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking else thinking_end_token }}
+    {{- "<｜User｜>" + dev_content + "<｜Assistant｜>" -}}
+    {{- thinking_start_token if idx == ns.last_user and thinking else thinking_end_token -}}
 
   {%- elif role == "user" -%}
-    {{ "<｜User｜>" + content + "<｜Assistant｜>" }}{{ thinking_start_token if idx == ns.last_user and thinking else thinking_end_token }}
+    {{- "<｜User｜>" + content + "<｜Assistant｜>" -}}
+    {{- thinking_start_token if idx == ns.last_user and thinking else thinking_end_token -}}
 
   {%- elif role == "assistant" -%}
     {%- if message.get("tool_calls") -%}
       {%- set first = true -%}
       {%- if idx > ns.last_user and thinking and (message.get("reasoning_content") or message.get("tool_calls")) -%}
-        {{ (message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "") + thinking_end_token }}
+        {{- (message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "") + thinking_end_token -}}
       {%- else -%}
-        {{ message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "" }}
+        {{- message.get("reasoning_content","") if not (thinking and drop_thinking and idx <= ns.last_user) else "" -}}
       {%- endif -%}
       {%- set tc = namespace(first=true) -%}
       {%- for tool in message["tool_calls"] -%}
@@ -144,21 +146,21 @@ Here are the functions available in JSONSchema format:
         {%- set param_block = param_ns.text -%}
         {%- if tc.first -%}
           {%- if content -%}
-            {{ content + "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+            {{- content + "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" -}}
           {%- else -%}
-            {{ "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+            {{- "\n\n<" + dsml_token + "function_calls>\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" -}}
           {%- endif -%}
           {%- set tc.first = false -%}
         {%- else -%}
-          {{ "\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" }}
+          {{- "\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" -}}
         {%- endif -%}
       {%- endfor -%}
-      {{ "\n</" + dsml_token + "function_calls>" + eos_token }}
+      {{- "\n</" + dsml_token + "function_calls>" + eos_token -}}
     {%- else -%}
       {%- if idx > ns.last_user and thinking and not (drop_thinking and idx <= ns.last_user) and message.get("reasoning_content") -%}
-        {{ message["reasoning_content"] + thinking_end_token }}
+        {{- message["reasoning_content"] + thinking_end_token -}}
       {%- endif -%}
-      {{ content + eos_token }}
+      {{- content + eos_token -}}
     {%- endif -%}
 
   {%- elif role == "tool" -%}
