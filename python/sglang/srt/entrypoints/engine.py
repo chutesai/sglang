@@ -1024,6 +1024,20 @@ def _launch_subprocesses(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
+    # Verify HF cache integrity once in the parent process before
+    # spawning workers, so DP/TP workers don't redundantly re-verify.
+    # Only skip for absolute local paths — relative paths like "org/model"
+    # could be HF repo IDs where a local dir was planted to bypass verification.
+    model_path = server_args.model_path
+    if not (os.path.isabs(model_path) and os.path.isdir(model_path)):
+        from sglang.srt.utils.hf_cache_verify import verify_model_cache
+
+        verify_model_cache(
+            model=model_path,
+            revision=server_args.revision,
+            download_dir=server_args.download_dir,
+        )
+
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
         server_args=server_args,
