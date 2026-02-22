@@ -72,7 +72,7 @@ global_workspace_buffer = None
 
 # Control whether to use fused metadata copy kernel (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
-_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get()
+_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
 # Control whether to verify fused metadata copy against individual copies (default: disabled)
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
@@ -1490,7 +1490,6 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
-<<<<<<< HEAD
             if need_trim:
                 pad_size = num_total_tokens - nsa_bs
                 o = torch.nn.functional.pad(o, (0, 0, 0, pad_size))
@@ -1510,8 +1509,6 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 seq_lens=metadata.nsa_cache_seqlens_int32,
             )
-=======
->>>>>>> 48fcd62d1f60110a4656805468dbd38e20c12bef
         else:
             raise ValueError(f"Unsupported {nsa_impl = }")
 
