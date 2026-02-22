@@ -91,7 +91,7 @@ def local_or_cached_path(
         from huggingface_hub import snapshot_download
         from huggingface_hub.utils import LocalEntryNotFoundError
     except Exception:
-        return False
+        return None
     try:
         base_dir = snapshot_download(
             repo_id=repo_id,
