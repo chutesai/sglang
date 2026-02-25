@@ -203,7 +203,10 @@ class AiterAttnBackend(AttentionBackend):
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
-            if self.num_head == 16 and self.kv_cache_dtype is not fp8_dtype:
+            # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
+            if (
+                self.num_head == 16 or self.num_head == 128
+            ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
@@ -1086,23 +1089,26 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
+            qo_indptr = None
+            kv_last_page_len = None
+            max_q_len = None
+
             if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = self.cuda_graph_kv_indices
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
+                    req_pool_indices,
+                    seq_lens,
                     kv_indptr,
                     None,
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
             else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -1687,6 +1693,7 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
+
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
