@@ -56,7 +56,7 @@ class GigaChat3Detector(BaseFormatDetector):
         Non-streaming parsing of complete model output.
         Extracts tool calls and content from the full text.
         """
-        logger.debug(f"[GigaChat3] detect_and_parse: {text}")
+        logger.debug(f"[GigaChat3] detect_and_parse: {len(text)} chars")
         model_output = text
         function_call = None
         content = None

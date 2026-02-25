@@ -220,7 +220,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not self._buffer:
             return StreamingParseResult()
 
-        logger.debug(f"Flushing buffer: {repr(self._buffer[:200])}")
+        logger.debug(f"Flushing buffer: {len(self._buffer)} chars")
 
         # Try to parse what we have, even without the closing tag
         result = self.detect_and_parse(self._buffer, tools)

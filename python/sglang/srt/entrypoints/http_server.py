@@ -1860,7 +1860,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
             if res.status_code == 200:
                 logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                    f"End of prefill disaggregation mode warmup with status {res.status_code}"
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:

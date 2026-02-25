@@ -934,7 +934,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             elif flush_result.normal_text:
                                 logger.warning(
                                     f"Flushed unparsable buffered content: "
-                                    f"{repr(flush_result.normal_text[:100])}"
+                                    f"{len(flush_result.normal_text)} chars"
                                 )
                                 choice_data = ChatCompletionResponseStreamChoice(
                                     index=index,
