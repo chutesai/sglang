@@ -41,8 +41,6 @@ from typing import (
 
 import setproctitle
 
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
