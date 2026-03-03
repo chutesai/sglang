@@ -4,9 +4,6 @@ from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
 
-import torch
-from tqdm import tqdm
-
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     disable_symmetric_memory_context,
     restore_symmetric_memory_context,
@@ -14,7 +11,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +143,15 @@ def _maybe_compile_deep_gemm_one_type_all(
         )
 
 
+# Map SGLang kernel type enum to DeepGEMM warmup kernel name string
+_KERNEL_NAME_MAP = {
+    DeepGemmKernelType.GEMM_NT_F8F8BF16: "fp8_gemm_nt",
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: "m_grouped_fp8_gemm_nt_masked",
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: "m_grouped_fp8_gemm_nt_contiguous",
+    DeepGemmKernelType.GEMM_NT_BF16BF16F32: "bf16_gemm_nt",
+}
+
+
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
 def _compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -157,97 +162,42 @@ def _compile_deep_gemm_one_type_all(
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
+    # Symmetric memory allocation performs a collective operation across all the GPUs.
+    # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-        # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
-
-        # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
-        max_m = max(m_list)
-        required_memory = _BaseWarmupExecutor.get_memory_requirement(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
-        )
-        logger.info(
-            f"Required memory for warmup: {required_memory}GB, Available memory: {memory_budget}GB"
-        )
-        if memory_budget < required_memory:
-            # TODO: Maybe compute the max_m based on the memory budget
-            while (
-                _BaseWarmupExecutor.get_memory_requirement(
-                    kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
-                )
-                > memory_budget
-                and max_m > 4096
-            ):
-                max_m = max_m // 2
-            logger.warning(
-                f"Available memory {memory_budget}GB is less than required memory {required_memory}GB for warmup, reducing max_m to {max_m} to avoid out of memory"
+        if hasattr(deep_gemm, "warmup_kernels"):
+            kernel_name = _KERNEL_NAME_MAP[kernel_type]
+            num_unique = deep_gemm.warmup_kernels(
+                kernel_name, m_list, n, k, num_groups
             )
-            m_list = [m for m in m_list if m <= max_m]
-
-        # Need some methods to estimate needed memory for warmup
-        executor = _BaseWarmupExecutor.create(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
-        )
-
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
-
-        # clean up input buffers
-        torch.cuda.current_stream().synchronize()
-        del executor
-        torch.cuda.empty_cache()
+            logger.info(
+                f"Compiled {num_unique} unique kernels for {kernel_name} N={n} K={k}"
+            )
+        else:
+            logger.warning(
+                "deep_gemm.warmup_kernels not available, "
+                "falling back to legacy per-M warmup. "
+                "Update DeepGEMM for faster warmup."
+            )
+            _compile_deep_gemm_legacy(kernel_type, n, k, num_groups, m_list)
     finally:
         # Restore symmetric memory context
         restore_symmetric_memory_context(saved_context)
 
 
-class _BaseWarmupExecutor:
-    @staticmethod
-    def create(kernel_type: DeepGemmKernelType, **kwargs):
-        return {
-            DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
-            DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
-        }[kernel_type](**kwargs)
-
-    @staticmethod
-    def get_memory_requirement(
-        kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
-    ) -> int:
-        # Return the required memory space in GB for warmup executor
-        _GB = 1 << 30
-        if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
-            return (max_m * k + n * k + max_m * n * 2) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
-            return (
-                num_groups * max_m * k
-                + num_groups * n * k
-                + num_groups * 4
-                + num_groups * max_m * n * 2
-            ) / _GB
-        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
-            # bf16 lhs + bf16 rhs + fp32 out
-            return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
-        else:
-            raise ValueError(f"Invalid kernel type: {kernel_type}")
-
-    def execute(self, m):
-        raise NotImplementedError
+_BLOCK_SIZE = 128
 
 
 def _empty_token_fp8(size):
+    import torch
+
+    from sglang.srt.utils import ceil_div
+
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
@@ -258,6 +208,10 @@ def _empty_token_fp8(size):
 
 
 def _empty_block_fp8(size):
+    import torch
+
+    from sglang.srt.utils import ceil_div
+
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
@@ -269,67 +223,131 @@ def _empty_block_fp8(size):
     )
 
 
-_BLOCK_SIZE = 128
+def _compile_deep_gemm_legacy(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: List[int],
+) -> None:
+    """Legacy per-M warmup for DeepGEMM versions without warmup_kernels API."""
+    import torch
+    from tqdm import tqdm
 
+    from sglang.srt.utils import get_available_gpu_memory
 
-class _NormalWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
-        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+    # Determine max_m and check memory budget
+    max_m = max(m_list)
+    memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+    _GB = 1 << 30
 
-    def execute(self, m):
-        deep_gemm.fp8_gemm_nt(
-            (self.lhs_q[:m], self.lhs_s[:m]),
-            (self.rhs_q, self.rhs_s),
-            self.out[:m],
+    if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+        required_memory = (max_m * k + n * k + max_m * n * 2) / _GB
+    elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        required_memory = (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+    elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+        required_memory = (
+            num_groups * max_m * k
+            + num_groups * n * k
+            + num_groups * 4
+            + num_groups * max_m * n * 2
+        ) / _GB
+    elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+        required_memory = (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+    else:
+        raise ValueError(f"Invalid kernel type: {kernel_type}")
+
+    logger.info(
+        f"Required memory for warmup: {required_memory:.1f}GB, Available memory: {memory_budget:.1f}GB"
+    )
+    if memory_budget < required_memory:
+        while (
+            max_m > 4096
+        ):
+            max_m = max_m // 2
+            if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+                req = (max_m * k + n * k + max_m * n * 2) / _GB
+            elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+                req = (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+            elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+                req = (
+                    num_groups * max_m * k
+                    + num_groups * n * k
+                    + num_groups * 4
+                    + num_groups * max_m * n * 2
+                ) / _GB
+            else:
+                req = (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+            if req <= memory_budget:
+                break
+        logger.warning(
+            f"Available memory {memory_budget:.1f}GB is less than required memory "
+            f"{required_memory:.1f}GB for warmup, reducing max_m to {max_m}"
         )
+        m_list = [m for m in m_list if m <= max_m]
 
+    # Create executor and pre-allocate tensors
+    if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+        lhs_q, lhs_s = _empty_token_fp8((max_m, k))
+        rhs_q, rhs_s = _empty_block_fp8((n, k))
+        out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
-class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
-        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
-        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        def execute(m):
+            deep_gemm.fp8_gemm_nt(
+                (lhs_q[:m], lhs_s[:m]), (rhs_q, rhs_s), out[:m]
+            )
 
-    def execute(self, m):
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (self.lhs_q[:m], self.lhs_s[:m]),
-            (self.rhs_q, self.rhs_s),
-            self.out[:m],
-            m_indices=self.m_indices[:m],
-        )
+    elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        lhs_q, lhs_s = _empty_token_fp8((max_m, k))
+        rhs_q, rhs_s = _empty_block_fp8((num_groups, n, k))
+        m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
+        def execute(m):
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                (lhs_q[:m], lhs_s[:m]),
+                (rhs_q, rhs_s),
+                out[:m],
+                m_indices=m_indices[:m],
+            )
 
-class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
-        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
-        self.out = torch.empty(
+    elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+        lhs_q, lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        rhs_q, rhs_s = _empty_block_fp8((num_groups, n, k))
+        masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
 
-    def execute(self, m):
-        deep_gemm.fp8_m_grouped_gemm_nt_masked(
-            (self.lhs_q, self.lhs_s),
-            (self.rhs_q, self.rhs_s),
-            self.out,
-            masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
-            expected_m=m,
-        )
+        def execute(m):
+            deep_gemm.fp8_m_grouped_gemm_nt_masked(
+                (lhs_q, lhs_s),
+                (rhs_q, rhs_s),
+                out,
+                masked_m=masked_m,
+                expected_m=m,
+            )
 
+    elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+        lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
 
-class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
-        self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
-        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
+        def execute(m):
+            deep_gemm.bf16_gemm_nt(lhs[:m], rhs, out[:m])
 
-    def execute(self, m):
-        deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+    else:
+        raise ValueError(f"Invalid kernel type: {kernel_type}")
+
+    old_compile_mode = deep_gemm.get_compile_mode()
+    deep_gemm.set_compile_mode(1)
+    for m in tqdm(m_list, desc="DeepGEMM warmup"):
+        execute(m=m)
+    deep_gemm.set_compile_mode(old_compile_mode)
+
+    torch.cuda.current_stream().synchronize()
+    del execute
+    torch.cuda.empty_cache()
 
 
 @contextmanager

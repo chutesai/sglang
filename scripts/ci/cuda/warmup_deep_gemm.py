@@ -19,7 +19,6 @@ import os
 import subprocess
 import sys
 import time
-from math import ceil
 from pathlib import Path
 
 # Configure DeepGEMM cache before importing deep_gemm
@@ -28,8 +27,6 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
     os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
 )
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
-
-BLOCK_SIZE = 128
 
 
 def get_config_json(model_name):
@@ -161,9 +158,21 @@ def compute_m_list(fast_warmup=False, chunked_prefill_size=8192):
     return m_list
 
 
+# Map shape kernel type strings to DeepGEMM warmup kernel name strings
+_KERNEL_NAME_MAP = {
+    "NORMAL": "fp8_gemm_nt",
+    "MASKED": "m_grouped_fp8_gemm_nt_masked",
+    "CONTIG": "m_grouped_fp8_gemm_nt_contiguous",
+}
+
+
+BLOCK_SIZE = 128
+
+
 def _empty_token_fp8(size):
     """Create FP8 token tensor + per-block scale tensor."""
     import torch
+    from math import ceil
 
     *dims, k = size
     return (
@@ -175,6 +184,7 @@ def _empty_token_fp8(size):
 def _empty_block_fp8(size):
     """Create FP8 block tensor + per-block scale tensor."""
     import torch
+    from math import ceil
 
     *dims, n, k = size
     return (
@@ -187,47 +197,28 @@ def _empty_block_fp8(size):
     )
 
 
-def get_memory_requirement(kernel_type, max_m, n, k, num_groups):
-    """Estimate GPU memory needed in GB for compilation buffers."""
-    _GB = 1 << 30
-    if kernel_type == "NORMAL":
-        return (max_m * k + n * k + max_m * n * 2) / _GB
-    elif kernel_type == "CONTIG":
-        return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
-    elif kernel_type == "MASKED":
-        return (
-            num_groups * max_m * k
-            + num_groups * n * k
-            + num_groups * 4
-            + num_groups * max_m * n * 2
-        ) / _GB
-    return 0
-
-
-def compile_one_shape(kernel_type, n, k, num_groups, m_list):
-    """Compile DeepGEMM kernels for one (kernel_type, N, K, num_groups) shape."""
+def _compile_one_shape_legacy(kernel_type, n, k, num_groups, m_list):
+    """Legacy per-M warmup for DeepGEMM versions without warmup_kernels API."""
     import deep_gemm
     import torch
     from tqdm import tqdm
-
-    # Filter M list for contiguous layout alignment
-    if kernel_type == "CONTIG":
-        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-        m_list = sorted(set(m for m in m_list if m % m_alignment == 0))
-
-    if not m_list:
-        return
 
     max_m = max(m_list)
 
     # Reduce max_m if not enough GPU memory
     mem_free = torch.cuda.mem_get_info()[0] / (1 << 30)
-    mem_required = get_memory_requirement(kernel_type, max_m, n, k, num_groups)
+    _GB = 1 << 30
+    mem_req_funcs = {
+        "NORMAL": lambda mm: (mm * k + n * k + mm * n * 2) / _GB,
+        "CONTIG": lambda mm: (mm * k + num_groups * n * k + mm * 4 + mm * n * 2) / _GB,
+        "MASKED": lambda mm: (
+            num_groups * mm * k + num_groups * n * k + num_groups * 4 + num_groups * mm * n * 2
+        ) / _GB,
+    }
+    mem_req = mem_req_funcs.get(kernel_type, lambda mm: 0)
+    mem_required = mem_req(max_m)
     if mem_required > mem_free:
-        while (
-            get_memory_requirement(kernel_type, max_m, n, k, num_groups) > mem_free
-            and max_m > 4096
-        ):
+        while max_m > 4096 and mem_req(max_m) > mem_free:
             max_m //= 2
         print(
             f"  Memory {mem_free:.1f}GB < required {mem_required:.1f}GB, "
@@ -278,6 +269,28 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
 
     torch.cuda.current_stream().synchronize()
     torch.cuda.empty_cache()
+
+
+def compile_one_shape(kernel_type, n, k, num_groups, m_list):
+    """Compile DeepGEMM kernels for one (kernel_type, N, K, num_groups) shape."""
+    import deep_gemm
+
+    # Filter M list for contiguous layout alignment
+    if kernel_type == "CONTIG":
+        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        m_list = sorted(set(m for m in m_list if m % m_alignment == 0))
+
+    if not m_list:
+        return
+
+    if not hasattr(deep_gemm, "warmup_kernels"):
+        print("  warmup_kernels not available, using legacy per-M warmup")
+        _compile_one_shape_legacy(kernel_type, n, k, num_groups, m_list)
+        return
+
+    kernel_name = _KERNEL_NAME_MAP[kernel_type]
+    num_unique = deep_gemm.warmup_kernels(kernel_name, m_list, n, k, num_groups)
+    print(f"  Compiled {num_unique} unique kernels for {kernel_name}")
 
 
 def compile_shapes_lightweight(shapes, m_list):
