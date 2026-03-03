@@ -120,6 +120,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
+def precompile_deep_gemm_shapes(hf_config, tp_size: int):
+    compile_utils.precompile_deep_gemm_shapes(hf_config, tp_size)
+
+
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None:

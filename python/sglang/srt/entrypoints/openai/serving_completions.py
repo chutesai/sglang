@@ -4,10 +4,10 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from cllmv import generate as get_chutes_verification_value
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from cllmv import generate as get_chutes_verification_value
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,

@@ -90,9 +90,7 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
         image_processor = KimiK25VisionProcessor(
             media_proc_cfg=preprocessor_config["media_proc_cfg"],
         )
-        return KimiK25Processor(
-            image_processor=image_processor, tokenizer=tokenizer
-        )
+        return KimiK25Processor(image_processor=image_processor, tokenizer=tokenizer)
 
     async def process_mm_data_async(
         self,

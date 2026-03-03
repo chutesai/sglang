@@ -172,9 +172,7 @@ def _compile_deep_gemm_one_type_all(
 
         if hasattr(deep_gemm, "warmup_kernels"):
             kernel_name = _KERNEL_NAME_MAP[kernel_type]
-            num_unique = deep_gemm.warmup_kernels(
-                kernel_name, m_list, n, k, num_groups
-            )
+            num_unique = deep_gemm.warmup_kernels(kernel_name, m_list, n, k, num_groups)
             logger.info(
                 f"Compiled {num_unique} unique kernels for {kernel_name} N={n} K={k}"
             )
@@ -244,7 +242,9 @@ def _compile_deep_gemm_legacy(
     if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
         required_memory = (max_m * k + n * k + max_m * n * 2) / _GB
     elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-        required_memory = (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+        required_memory = (
+            max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2
+        ) / _GB
     elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
         required_memory = (
             num_groups * max_m * k
@@ -261,9 +261,7 @@ def _compile_deep_gemm_legacy(
         f"Required memory for warmup: {required_memory:.1f}GB, Available memory: {memory_budget:.1f}GB"
     )
     if memory_budget < required_memory:
-        while (
-            max_m > 4096
-        ):
+        while max_m > 4096:
             max_m = max_m // 2
             if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
                 req = (max_m * k + n * k + max_m * n * 2) / _GB
@@ -293,9 +291,7 @@ def _compile_deep_gemm_legacy(
         out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
         def execute(m):
-            deep_gemm.fp8_gemm_nt(
-                (lhs_q[:m], lhs_s[:m]), (rhs_q, rhs_s), out[:m]
-            )
+            deep_gemm.fp8_gemm_nt((lhs_q[:m], lhs_s[:m]), (rhs_q, rhs_s), out[:m])
 
     elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
         lhs_q, lhs_s = _empty_token_fp8((max_m, k))
@@ -315,9 +311,7 @@ def _compile_deep_gemm_legacy(
         lhs_q, lhs_s = _empty_token_fp8((num_groups, max_m, k))
         rhs_q, rhs_s = _empty_block_fp8((num_groups, n, k))
         masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
-        out = torch.empty(
-            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
-        )
+        out = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
 
         def execute(m):
             deep_gemm.fp8_m_grouped_gemm_nt_masked(
@@ -348,6 +342,116 @@ def _compile_deep_gemm_legacy(
     torch.cuda.current_stream().synchronize()
     del execute
     torch.cuda.empty_cache()
+
+
+def _shape_type_to_kernel_type(shape_type: str) -> DeepGemmKernelType:
+    return {
+        "MASKED": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+        "CONTIG": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+        "NORMAL": DeepGemmKernelType.GEMM_NT_F8F8BF16,
+    }[shape_type]
+
+
+def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
+    """Precompile all DeepGEMM kernels at startup from HF model config.
+
+    Called during ModelRunner.__init__() before any forward passes, so each TP
+    rank compiles independently without NCCL collectives blocking.
+    """
+    if not _ENABLE_JIT_DEEPGEMM_PRECOMPILE or not _DO_COMPILE_ALL:
+        return
+
+    config = {}
+    for key in [
+        "hidden_size",
+        "num_attention_heads",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "v_head_dim",
+        "n_routed_experts",
+        "n_shared_experts",
+        "moe_intermediate_size",
+    ]:
+        val = getattr(hf_config, key, None)
+        if val is not None:
+            config[key] = val
+
+    if "hidden_size" not in config:
+        return
+
+    has_mla = config.get("kv_lora_rank", 0) > 0
+    has_moe = config.get("n_routed_experts", 0) > 0
+    if not has_mla and not has_moe:
+        return
+
+    try:
+        shapes = _compute_deepseek_shapes(config, tp_size)
+    except Exception as e:
+        logger.warning(
+            f"Failed to derive DeepGEMM shapes from config, skipping precompilation: {e}"
+        )
+        return
+
+    if not shapes:
+        return
+
+    logger.info(
+        f"Precompiling DeepGEMM kernels for {len(shapes)} shapes "
+        f"(tp={tp_size}, {len(_BUILTIN_M_LIST)} M values)"
+    )
+
+    for shape_type, n, k, num_groups in shapes:
+        kernel_type = _shape_type_to_kernel_type(shape_type)
+        query_key = (kernel_type, n, k, num_groups)
+        if _INITIALIZATION_DICT.get(query_key) is not None:
+            continue
+        _INITIALIZATION_DICT[query_key] = True
+
+        logger.info(
+            f"Precompiling <{kernel_type.name}> N={n}, K={k}, num_groups={num_groups}"
+        )
+        _compile_deep_gemm_one_type_all(
+            kernel_type=kernel_type,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            m_list=_BUILTIN_M_LIST,
+        )
+
+    logger.info("DeepGEMM precompilation complete")
+
+
+def _compute_deepseek_shapes(config: dict, tp: int):
+    shapes = []
+
+    hidden_size = config["hidden_size"]
+    num_attention_heads = config.get("num_attention_heads", 128)
+    kv_lora_rank = config.get("kv_lora_rank", 512)
+    qk_nope_head_dim = config.get("qk_nope_head_dim", 128)
+    v_head_dim = config.get("v_head_dim", 128)
+    n_routed_experts = config.get("n_routed_experts", 0)
+    n_shared_experts = config.get("n_shared_experts", 0)
+    moe_intermediate_size = config.get("moe_intermediate_size", 0)
+
+    num_local_heads = num_attention_heads // tp
+    num_local_experts = n_routed_experts + n_shared_experts
+
+    if n_routed_experts > 0 and moe_intermediate_size > 0:
+        moe_inter_per_tp = moe_intermediate_size // tp
+        shapes.append(("MASKED", moe_inter_per_tp * 2, hidden_size, num_local_experts))
+        shapes.append(("CONTIG", moe_inter_per_tp * 2, hidden_size, num_local_experts))
+        shapes.append(("MASKED", hidden_size, moe_inter_per_tp, num_local_experts))
+        shapes.append(("CONTIG", hidden_size, moe_inter_per_tp, num_local_experts))
+
+    if kv_lora_rank > 0 and num_local_heads > 0:
+        shapes.append(("MASKED", kv_lora_rank, qk_nope_head_dim, num_local_heads))
+        shapes.append(("MASKED", v_head_dim, kv_lora_rank, num_local_heads))
+
+    if kv_lora_rank > 0 and num_local_heads > 0:
+        kv_b_proj_n = num_local_heads * (qk_nope_head_dim + v_head_dim)
+        shapes.append(("NORMAL", kv_b_proj_n, kv_lora_rank, 1))
+
+    return shapes
 
 
 @contextmanager

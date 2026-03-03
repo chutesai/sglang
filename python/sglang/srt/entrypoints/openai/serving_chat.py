@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 
 import jinja2
 import orjson
-from cllmv import generate as get_chutes_verification_value
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from cllmv import generate as get_chutes_verification_value
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -149,9 +149,7 @@ class OpenAIServingChat(OpenAIServingBase):
         templated_prompt_val = getattr(request, "_templated_prompt", None)
 
         if chat_template:
-            template_sha256 = hashlib.sha256(
-                chat_template.encode("utf-8")
-            ).hexdigest()
+            template_sha256 = hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
 
         if templated_prompt_val:
             prompt_sha256 = hashlib.sha256(
@@ -609,9 +607,7 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = modalities if modalities else []
 
         # Capture chat template and templated prompt for echo_prompt feature
-        chat_template = getattr(
-            self.tokenizer_manager.tokenizer, "chat_template", None
-        )
+        chat_template = getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
         # Get the templated prompt string (decode if we have token IDs)
         if prompt:
             templated_prompt = prompt
@@ -951,7 +947,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 )
                                 chunk.chutes_verification = (
                                     get_chutes_verification_value(
-                                        chunk.id, chunk.created, flush_result.normal_text
+                                        chunk.id,
+                                        chunk.created,
+                                        flush_result.normal_text,
                                     )
                                 )
                                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1261,8 +1259,8 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Compute template hashes for echo_prompt feature
-        template_sha256, prompt_sha256, templated_prompt = self._compute_template_hashes(
-            request
+        template_sha256, prompt_sha256, templated_prompt = (
+            self._compute_template_hashes(request)
         )
 
         chunk = ChatCompletionResponse(

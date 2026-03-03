@@ -129,9 +129,7 @@ def _fetch_repo_info_from_proxy(
     with urllib.request.urlopen(req, timeout=30) as resp:
         if resp.status != 200:
             body = resp.read().decode(errors="replace")
-            raise RuntimeError(
-                f"Chutes proxy returned {resp.status}: {body}"
-            )
+            raise RuntimeError(f"Chutes proxy returned {resp.status}: {body}")
         return json.loads(resp.read().decode())
 
 
@@ -220,9 +218,7 @@ def _find_snapshot_dir(
     repo_dir = hf_cache / repo_folder
 
     if not repo_dir.is_dir():
-        logger.fatal(
-            "HF cache repo directory not found: %s", repo_dir
-        )
+        logger.fatal("HF cache repo directory not found: %s", repo_dir)
         os._exit(99)
 
     snapshots_dir = repo_dir / "snapshots"
@@ -242,9 +238,7 @@ def _find_snapshot_dir(
 
     # If there's exactly one snapshot, use that.
     if snapshots_dir.is_dir():
-        snapshot_dirs = [
-            d for d in snapshots_dir.iterdir() if d.is_dir()
-        ]
+        snapshot_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
         if len(snapshot_dirs) == 1:
             logger.info(
                 "Could not resolve revision '%s' from refs, using "
@@ -325,14 +319,10 @@ def _verify_cache(
     # (remote_path, resolved_path, expected_hash, hash_type)
     files_to_hash: list[tuple[str, Path, str, str]] = []
 
-    for remote_path, (remote_hash, remote_size, is_lfs) in (
-        remote_files.items()
-    ):
+    for remote_path, (remote_hash, remote_size, is_lfs) in remote_files.items():
         local_path = local_files.get(remote_path)
 
-        if not local_path or (
-            not local_path.exists() and not local_path.is_symlink()
-        ):
+        if not local_path or (not local_path.exists() and not local_path.is_symlink()):
             missing.append(remote_path)
             continue
 
@@ -373,8 +363,7 @@ def _verify_cache(
                         verified += 1
                 else:
                     errors.append(
-                        f"{remote_path}: LFS file not a symlink, "
-                        "cannot fast-verify"
+                        f"{remote_path}: LFS file not a symlink, " "cannot fast-verify"
                     )
         else:
             if full_hash_check:
@@ -423,13 +412,10 @@ def _verify_cache(
 
         for remote_path, computed, expected, error in results:
             if error:
-                errors.append(
-                    f"{remote_path}: hash computation failed: {error}"
-                )
+                errors.append(f"{remote_path}: hash computation failed: {error}")
             elif computed != expected:
                 mismatches.append(
-                    f"{remote_path}: hash {computed} "
-                    f"!= expected {expected}"
+                    f"{remote_path}: hash {computed} " f"!= expected {expected}"
                 )
             else:
                 verified += 1
@@ -444,9 +430,7 @@ def _verify_cache(
     ]
 
     if mismatches or missing or extra or errors:
-        msg_parts = [
-            f"Cache verification FAILED for {repo_id}@{revision}"
-        ]
+        msg_parts = [f"Cache verification FAILED for {repo_id}@{revision}"]
         if mismatches:
             msg_parts.append(f"  Mismatches ({len(mismatches)}):")
             for m in mismatches:
@@ -509,9 +493,7 @@ def verify_model_cache(
     if revision is None:
         revision = "main"
 
-    logger.info(
-        "Starting HF cache verification for %s@%s", model, revision
-    )
+    logger.info("Starting HF cache verification for %s@%s", model, revision)
 
     try:
         _verify_cache(
@@ -523,8 +505,7 @@ def verify_model_cache(
         )
     except Exception as e:
         logger.fatal(
-            "Unexpected error during cache verification for "
-            "%s@%s: %s",
+            "Unexpected error during cache verification for " "%s@%s: %s",
             model,
             revision,
             e,
