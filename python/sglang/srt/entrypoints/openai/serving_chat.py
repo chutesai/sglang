@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import uuid
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -748,8 +749,10 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get(
+                    "completion_tokens", 0
+                )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 reasoning_tokens[index] = content["meta_info"].get(
                     "reasoning_tokens", 0
@@ -758,7 +761,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"]["finish_reason"]
+                finish_reason = content["meta_info"].get("finish_reason", None)
                 choice_logprobs = None
                 if request.logprobs:
                     output_token_logprobs = content["meta_info"].get(
@@ -783,7 +786,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    finish_reasons[index] = finish_reason
+                    # If the abort is from scheduler.
+                    if finish_reason_type == "abort":
+                        code = finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        error = self.create_streaming_error_response(
+                            finish_reason.get("message", "Generation aborted."),
+                            code.name,
+                            code.value,
+                        )
+                        yield f"data: {error}\n\n"
+                        break
+                    else:
+                        finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):

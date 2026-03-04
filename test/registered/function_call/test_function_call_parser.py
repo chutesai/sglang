@@ -1558,9 +1558,11 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         tool_calls_by_index = {}
 
+        num_tool_call_chunks = 0
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
+                num_tool_call_chunks += 1
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
@@ -1574,6 +1576,8 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                         tool_calls_by_index[call.tool_index][
                             "parameters"
                         ] += call.parameters
+
+        self.assertGreater(num_tool_call_chunks, 8)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -1589,7 +1593,13 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
             {
-                "city": "San Francisco"
+                "city": "San Francisco",
+                "another_city": "London",
+                "topn": 10,
+                "obj": {
+                    "name": "John",
+                    "age": 30
+                }
             }
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
@@ -1603,9 +1613,11 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         tool_calls_by_index = {}
 
+        num_tool_call_chunks = 0
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
+                num_tool_call_chunks += 1
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
@@ -1620,6 +1632,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             "parameters"
                         ] += call.parameters
 
+        self.assertGreater(num_tool_call_chunks, 8)
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
 
