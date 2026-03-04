@@ -3,6 +3,8 @@ import logging
 import re
 from typing import Dict, List
 
+from partial_json_parser.core.options import Allow
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -11,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -36,41 +39,70 @@ class DeepSeekV32Detector(BaseFormatDetector):
     </｜DSML｜invoke>
     ...
     </｜DSML｜function_calls>
+
+    Features:
+    - Robust regex matching: tolerates whitespace, missing quotes, case variations
+    - Supports plain format (without DSML tokens) for compatibility
+    - Incremental streaming: streams tool names and arguments as they arrive
+    - Handles missing closing tags gracefully via flush_buffered_content
     """
 
     def __init__(self):
         super().__init__()
+        # Flexible prefix: supports both plain format and DSML format
         prefix = r"(?:｜\s*DSML\s*｜)?"
         tail = r"(?:｜)?\s*>"
         end_tail = r"(?:｜)?\s*>"
 
         flags = re.IGNORECASE
 
+        # Compiled patterns for robust matching
         self.bot_pattern = re.compile(rf"<\s*{prefix}function_calls{tail}", flags)
-        self.eot_pattern = re.compile(rf"</\s*{prefix}function_calls{end_tail}", flags)
+        self.eot_pattern = re.compile(
+            rf"</\s*{prefix}function_calls{end_tail}", flags
+        )
+
+        # Start tokens for partial-prefix detection during streaming
         self._start_tokens = [
             "<function_calls",
             "<｜dsml｜function_calls",
         ]
-        # Track whether we've emitted tool calls and should consume remaining tags
-        self._tool_calls_emitted = False
 
-        # Match invoke blocks - make closing quote optional to handle malformed output
-        # Handles both: name="foo" and name="foo> (missing closing quote)
+        # Match complete invoke blocks (for one-shot parsing)
+        # Make closing quote optional to handle malformed output
         self.invoke_pattern = re.compile(
             rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']?{tail}\s*(?P<body>.*?)\s*</\s*{prefix}invoke{end_tail}",
             re.DOTALL | flags,
         )
-        # Match parameter blocks - make closing quote optional for both name and string attributes
+
+        # Match invoke blocks that may be partial (for streaming)
+        # end group is closing tag or end of string
+        self.invoke_pattern_streaming = re.compile(
+            rf"<\s*{prefix}invoke\s+name\s*=\s*[\"'](?P<name>[^\"'>]+)[\"']?{tail}\s*(?P<body>.*?)(?P<end></\s*{prefix}invoke{end_tail}|$)",
+            re.DOTALL | flags,
+        )
+
+        # Match complete parameter blocks
         self.param_pattern = re.compile(
             rf"<\s*{prefix}parameter\s+name\s*=\s*[\"'](?P<key>[^\"'>]+)[\"']?(?:\s+string\s*=\s*[\"'](?P<string>true|false)[\"']?)?\s*{tail}\s*(?P<val>.*?)\s*</\s*{prefix}parameter{end_tail}",
             re.DOTALL | flags,
         )
 
+        # Match partial parameter blocks (for streaming, no closing tag required)
+        self.param_pattern_partial = re.compile(
+            rf"<\s*{prefix}parameter\s+name\s*=\s*[\"'](?P<key>[^\"'>]+)[\"']?(?:\s+string\s*=\s*[\"'](?P<string>true|false)[\"']?)?\s*{tail}\s*(?P<val>.*)$",
+            re.DOTALL | flags,
+        )
+
+        # Tokens for stripping partial closing tags during streaming
+        self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
+        self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
+
     def has_tool_call(self, text: str) -> bool:
         return bool(self.bot_pattern.search(text))
 
     def _parse_arguments(self, body: str) -> Dict:
+        """Parse arguments from an invoke body (one-shot, returns Dict)."""
         # First, try the direct JSON format for the entire invoke body
         stripped_body = body.strip()
         if stripped_body.startswith("{") and stripped_body.endswith("}"):
@@ -86,10 +118,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         args: Dict[str, object] = {}
         for match in self.param_pattern.finditer(body):
-            key = match.group("key").strip()  # Strip whitespace from parameter name
+            key = match.group("key").strip()
             string_flag = (match.group("string") or "true").lower().strip()
             is_str = string_flag == "true"
-            raw_val = match.group("val").strip()  # Strip whitespace from value
+            raw_val = match.group("val").strip()
             if is_str:
                 args[key] = raw_val
             else:
@@ -99,21 +131,82 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     args[key] = raw_val
         return args
 
+    def _parse_arguments_streaming(
+        self, body: str, allow_partial: bool = False
+    ) -> str:
+        """Parse arguments from an invoke body for streaming (returns JSON str).
+
+        When allow_partial=True, handles incomplete parameter tags and JSON."""
+        stripped_body = body.strip()
+        if stripped_body.startswith("{"):
+            if allow_partial:
+                # Remove incomplete invoke end call prefix
+                for token in reversed(self.prefix_invoke_end_call):
+                    stripped_body = stripped_body.rstrip(token)
+                return stripped_body
+            elif stripped_body.endswith("}"):
+                return stripped_body
+
+        # Fall back to XML parameter tag parsing
+        parameters: Dict[str, object] = {}
+        param_matches = list(self.param_pattern.finditer(body))
+        last_match_end = 0
+
+        for match in param_matches:
+            key = match.group("key").strip()
+            string_flag = (match.group("string") or "true").lower().strip()
+            is_str = string_flag == "true"
+            raw_val = match.group("val").strip()
+            last_match_end = match.end()
+
+            if is_str:
+                parameters[key] = raw_val
+            else:
+                try:
+                    parameters[key] = json.loads(raw_val)
+                except (json.JSONDecodeError, ValueError):
+                    parameters[key] = raw_val
+
+        # If allowed, try to parse a partial parameter at the end
+        if allow_partial:
+            remaining = body[last_match_end:]
+            for token in reversed(self.prefix_parameter_end_call):
+                remaining = remaining.rstrip(token)
+
+            partial_match = self.param_pattern_partial.search(remaining)
+            if partial_match and (param_value := partial_match.group("val")):
+                param_name = partial_match.group("key").strip()
+                string_flag = (
+                    (partial_match.group("string") or "true").lower().strip()
+                )
+                if string_flag == "true":
+                    parameters[param_name] = param_value.strip()
+                else:
+                    try:
+                        parameters[param_name] = _partial_json_loads(
+                            param_value, Allow.ALL
+                        )[0]
+                    except json.JSONDecodeError:
+                        parameters[param_name] = param_value.strip()
+
+        return json.dumps(parameters, ensure_ascii=False)
+
     def _decode_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
+        """Decode all invoke blocks within a function_calls block (one-shot)."""
         calls = []
         for match in self.invoke_pattern.finditer(block):
-            name = match.group("name").strip()  # Strip whitespace from function name
+            name = match.group("name").strip()
             args = self._parse_arguments(match.group("body"))
             parsed_calls = self.parse_base_json(
                 {"name": name, "parameters": args}, tools
             )
-            # Update tool_index to be the sequential position in the response
             for call in parsed_calls:
                 call.tool_index = len(calls)
                 calls.append(call)
         return calls
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """One-shot parsing with robust handling of missing closing tags."""
         start_match = self.bot_pattern.search(text)
         if not start_match:
             return StreamingParseResult(normal_text=text)
@@ -128,7 +221,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # If we couldn't find an end tag and also didn't decode anything,
         # check if we at least found complete invoke blocks
         if not end_match and not calls:
-            # Check if there are complete invoke blocks (even if undefined/invalid)
             has_complete_invoke = bool(self.invoke_pattern.search(block))
             if has_complete_invoke:
                 # We found invoke blocks but they were undefined/invalid
@@ -144,72 +236,130 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Simplified streaming: buffer until the closing </｜DSML｜function_calls> is seen,
-        then parse the complete block. After emitting tool calls, consume any remaining
-        tool-related tags.
+        Streaming incremental parsing with argument streaming support.
+
+        Streams tool names immediately when seen and incrementally delivers
+        argument diffs as they arrive. Uses robust compiled regex from HEAD
+        with incremental argument streaming from upstream.
         """
         self._buffer += new_text
 
-        # If we've already emitted tool calls, consume any remaining tool-related tags
-        if self._tool_calls_emitted:
-            # Check if we've hit the closing tag
-            end_match = self.eot_pattern.search(self._buffer)
-            if end_match:
-                # Found closing tag, consume it and reset
-                self._buffer = self._buffer[end_match.end() :]
-                self._tool_calls_emitted = False
-                # Return any remaining text after the closing tag
-                if self._buffer:
-                    remaining = self._buffer
-                    self._buffer = ""
-                    return StreamingParseResult(normal_text=remaining)
-                return StreamingParseResult()
-
-            # Keep consuming until we see the complete closing tag
-            # Just buffer everything and return empty - the closing tag will eventually arrive
-            return StreamingParseResult()
-
-        # No start token yet; keep buffering if current buffer could be a partial prefix
-        # of the start token (e.g. "<function" across chunks).
-        if not self.bot_pattern.search(self._buffer):
-            buffer_low = self._buffer.lower()
-            for token in self._start_tokens:
-                token_low = token.lower()
-                # Treat both strict prefixes and the full token (without the closing '>') as partial
-                if buffer_low.endswith(token_low) or self._ends_with_partial_token(
-                    buffer_low, token_low
-                ):
-                    return StreamingParseResult()
-
-            normal_text = self._buffer
-            self._buffer = ""
-            return StreamingParseResult(normal_text=normal_text)
-
-        if self.eot_pattern.search(self._buffer):
-            result = self.detect_and_parse(self._buffer, tools)
-            self._buffer = ""
-            # No need to set _tool_calls_emitted here since we already have the closing tag
-            return result
-
-        # Fallback: if we have a complete invoke block that reaches the current end
-        # of the buffer but the model never emitted </function_calls>, parse what we
-        # have so far.
-        # Search in the trimmed buffer to avoid issues with trailing whitespace
-        trimmed_buffer = self._buffer.rstrip()
-        if trimmed_buffer:
-            last_invoke_end = None
-            for match in self.invoke_pattern.finditer(trimmed_buffer):
-                last_invoke_end = match.end()
-
-            if last_invoke_end is not None and last_invoke_end == len(trimmed_buffer):
-                result = self.detect_and_parse(self._buffer, tools)
+        # Phase 1: Haven't entered function_calls block yet
+        if self.current_tool_id < 0:
+            if not self.bot_pattern.search(self._buffer):
+                # Check for partial prefix of start token
+                buffer_low = self._buffer.lower()
+                for token in self._start_tokens:
+                    token_low = token.lower()
+                    if buffer_low.endswith(
+                        token_low
+                    ) or self._ends_with_partial_token(buffer_low, token_low):
+                        return StreamingParseResult()
+                # No tool call starting, emit as normal text
+                normal_text = self._buffer
                 self._buffer = ""
-                # Mark that we've processed tool call markup - consume any remaining tags
-                # Set flag even if calls are empty (undefined/invalid tools) since we found invoke blocks
-                self._tool_calls_emitted = True
-                return result
+                return StreamingParseResult(normal_text=normal_text)
 
-        return StreamingParseResult()
+        # Phase 2: Inside function_calls, process invoke blocks
+        current_text = self._buffer
+        all_calls: List[ToolCallItem] = []
+
+        try:
+            while True:
+                invoke_match = self.invoke_pattern_streaming.search(current_text)
+                if not invoke_match:
+                    break
+
+                func_name = invoke_match.group("name").strip()
+                invoke_content = invoke_match.group("body")
+                end_group = invoke_match.group("end")
+                is_tool_end = bool(end_group) and bool(end_group.strip())
+
+                # Initialize state on first tool call
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+
+                # Ensure arrays are large enough
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                # Send tool name if not sent yet
+                if not self.current_tool_name_sent:
+                    all_calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
+                    )
+                    self.current_tool_name_sent = True
+
+                # Parse parameters (partial or complete)
+                current_params = self._parse_arguments_streaming(
+                    invoke_content, allow_partial=not is_tool_end
+                )
+
+                # Calculate incremental argument diff
+                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
+                prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
+                    "arguments"
+                )
+
+                argument_diff = None
+
+                if is_tool_end:
+                    # Complete: send everything remaining
+                    argument_diff = current_params[sent_len:]
+                elif prev_params is not None:
+                    # Partial: send stable prefix diff
+                    if current_params != prev_params:
+                        prefix = _find_common_prefix(current_params, prev_params)
+                        if len(prefix) > sent_len:
+                            argument_diff = prefix[sent_len:]
+
+                if argument_diff:
+                    all_calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=argument_diff,
+                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+
+                # Update stored arguments
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": current_params,
+                }
+
+                if is_tool_end:
+                    # Remove completed invoke block from buffer
+                    current_text = current_text[invoke_match.end() :]
+                    self._buffer = current_text
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    continue
+                else:
+                    break
+
+            # Check for closing function_calls tag
+            eot_match = self.eot_pattern.search(self._buffer)
+            if eot_match:
+                self._buffer = self._buffer[eot_match.end() :]
+                # Reset streaming state
+                self.current_tool_id = -1
+                self.current_tool_name_sent = False
+
+            return StreamingParseResult(normal_text="", calls=all_calls)
+
+        except Exception as e:
+            logger.error(f"Error in parse_streaming_increment: {e}")
+            return StreamingParseResult(normal_text="")
 
     def flush_buffered_content(self, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -226,14 +376,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
         result = self.detect_and_parse(self._buffer, tools)
         self._buffer = ""
 
-        # Reset state
-        self._tool_calls_emitted = False
+        # Reset streaming state
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
 
         return result
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}"',
-            end="</｜DSML｜invoke",
-            trigger=f'<｜DSML｜invoke name="{name}"',
+            begin=f'<｜DSML｜invoke name="{name}">',
+            end="</｜DSML｜invoke>",
+            trigger="<｜DSML｜invoke",
         )
