@@ -414,7 +414,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
             deep_gemm_wrapper.precompile_deep_gemm_shapes(
-                self.model_config.hf_config, self.tp_size
+                self.model_config.hf_config, self.tp_size, server_args
             )
 
         # Initialize the model runner

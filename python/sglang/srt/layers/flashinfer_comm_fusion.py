@@ -44,6 +44,7 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
+        self._init_failed = False
 
     def initialize(
         self,
@@ -55,10 +56,14 @@ class FlashInferWorkspaceManager:
         use_oneshot: Optional[bool] = None,
     ):
         """Initialize workspace"""
+        if self._init_failed:
+            return
+
         if _flashinfer_comm is None:
             logger.warning(
                 "FlashInfer comm not available, skipping workspace " "initialization"
             )
+            self._init_failed = True
             return
 
         self.cleanup()
@@ -76,6 +81,7 @@ class FlashInferWorkspaceManager:
             logger.warning(f"Failed to initialize FlashInfer workspace: {e}")
             self.workspace = None
             self.initialized = False
+            self._init_failed = True
             return
 
         self.world_size = world_size

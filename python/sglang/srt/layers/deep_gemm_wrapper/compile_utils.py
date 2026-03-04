@@ -352,7 +352,7 @@ def _shape_type_to_kernel_type(shape_type: str) -> DeepGemmKernelType:
     }[shape_type]
 
 
-def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
+def precompile_deep_gemm_shapes(hf_config, tp_size: int, server_args) -> None:
     """Precompile all DeepGEMM kernels at startup from HF model config.
 
     Called during ModelRunner.__init__() before any forward passes, so each TP
@@ -367,10 +367,14 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
         "num_attention_heads",
         "kv_lora_rank",
         "qk_nope_head_dim",
+        "qk_rope_head_dim",
         "v_head_dim",
+        "q_lora_rank",
         "n_routed_experts",
         "n_shared_experts",
         "moe_intermediate_size",
+        "intermediate_size",
+        "first_k_dense_replace",
     ]:
         val = getattr(hf_config, key, None)
         if val is not None:
@@ -384,8 +388,12 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
     if not has_mla and not has_moe:
         return
 
+    # Compute effective attention TP size (accounts for dp_attention)
+    dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+    attn_tp_size = tp_size // dp_size
+
     try:
-        shapes = _compute_deepseek_shapes(config, tp_size)
+        shapes = _compute_deepseek_shapes(config, tp_size, attn_tp_size)
     except Exception as e:
         logger.warning(
             f"Failed to derive DeepGEMM shapes from config, skipping precompilation: {e}"
@@ -397,7 +405,7 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
 
     logger.info(
         f"Precompiling DeepGEMM kernels for {len(shapes)} shapes "
-        f"(tp={tp_size}, {len(_BUILTIN_M_LIST)} M values)"
+        f"(tp={tp_size}, attn_tp={attn_tp_size}, {len(_BUILTIN_M_LIST)} M values)"
     )
 
     for shape_type, n, k, num_groups in shapes:
@@ -421,21 +429,29 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int) -> None:
     logger.info("DeepGEMM precompilation complete")
 
 
-def _compute_deepseek_shapes(config: dict, tp: int):
+def _compute_deepseek_shapes(config: dict, tp: int, attn_tp: int):
     shapes = []
 
     hidden_size = config["hidden_size"]
     num_attention_heads = config.get("num_attention_heads", 128)
     kv_lora_rank = config.get("kv_lora_rank", 512)
     qk_nope_head_dim = config.get("qk_nope_head_dim", 128)
+    qk_rope_head_dim = config.get("qk_rope_head_dim", 64)
     v_head_dim = config.get("v_head_dim", 128)
+    q_lora_rank = config.get("q_lora_rank", 0)
     n_routed_experts = config.get("n_routed_experts", 0)
     n_shared_experts = config.get("n_shared_experts", 0)
     moe_intermediate_size = config.get("moe_intermediate_size", 0)
+    intermediate_size = config.get("intermediate_size", 0)
+    first_k_dense_replace = config.get("first_k_dense_replace", 1)
 
-    num_local_heads = num_attention_heads // tp
+    # Attention heads are sharded by attn_tp (which accounts for dp_attention)
+    num_local_heads = num_attention_heads // attn_tp
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    # MoE experts are sharded by regular tp
     num_local_experts = n_routed_experts + n_shared_experts
 
+    # --- MoE expert GEMM shapes (MASKED/CONTIG, sharded by tp) ---
     if n_routed_experts > 0 and moe_intermediate_size > 0:
         moe_inter_per_tp = moe_intermediate_size // tp
         shapes.append(("MASKED", moe_inter_per_tp * 2, hidden_size, num_local_experts))
@@ -443,13 +459,40 @@ def _compute_deepseek_shapes(config: dict, tp: int):
         shapes.append(("MASKED", hidden_size, moe_inter_per_tp, num_local_experts))
         shapes.append(("CONTIG", hidden_size, moe_inter_per_tp, num_local_experts))
 
+    # --- MLA grouped GEMM shapes (MASKED, sharded by attn_tp) ---
     if kv_lora_rank > 0 and num_local_heads > 0:
+        # Q_nope -> compressed K
         shapes.append(("MASKED", kv_lora_rank, qk_nope_head_dim, num_local_heads))
+        # Attention output -> V
         shapes.append(("MASKED", v_head_dim, kv_lora_rank, num_local_heads))
 
+    # --- GEMM_NT (non-grouped FP8) shapes for all linear layers ---
     if kv_lora_rank > 0 and num_local_heads > 0:
+        # kv_b_proj: ColumnParallelLinear(kv_lora_rank, num_heads*(qk_nope+v_head_dim))
         kv_b_proj_n = num_local_heads * (qk_nope_head_dim + v_head_dim)
         shapes.append(("NORMAL", kv_b_proj_n, kv_lora_rank, 1))
+
+        # o_proj: RowParallelLinear(num_heads*v_head_dim, hidden_size)
+        o_proj_k = num_local_heads * v_head_dim
+        shapes.append(("NORMAL", hidden_size, o_proj_k, 1))
+
+    if q_lora_rank > 0:
+        # fused_qkv_a_proj_with_mqa: ReplicatedLinear (no TP sharding)
+        # N = q_lora_rank + kv_lora_rank + qk_rope_head_dim, K = hidden_size
+        fused_n = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+        shapes.append(("NORMAL", fused_n, hidden_size, 1))
+
+        # q_b_proj: ColumnParallelLinear(q_lora_rank, num_heads*qk_head_dim)
+        q_b_proj_n = num_local_heads * qk_head_dim
+        shapes.append(("NORMAL", q_b_proj_n, q_lora_rank, 1))
+
+    # --- Dense MLP layers (first_k_dense_replace layers, sharded by tp) ---
+    if first_k_dense_replace > 0 and intermediate_size > 0:
+        dense_inter_per_tp = intermediate_size // tp
+        # gate_up_proj: MergedColumnParallelLinear(hidden_size, [inter, inter])
+        shapes.append(("NORMAL", dense_inter_per_tp * 2, hidden_size, 1))
+        # down_proj: RowParallelLinear(inter, hidden_size)
+        shapes.append(("NORMAL", hidden_size, dense_inter_per_tp, 1))
 
     return shapes
 

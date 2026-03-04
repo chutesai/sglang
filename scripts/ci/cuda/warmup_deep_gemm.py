@@ -171,8 +171,9 @@ BLOCK_SIZE = 128
 
 def _empty_token_fp8(size):
     """Create FP8 token tensor + per-block scale tensor."""
-    import torch
     from math import ceil
+
+    import torch
 
     *dims, k = size
     return (
@@ -183,8 +184,9 @@ def _empty_token_fp8(size):
 
 def _empty_block_fp8(size):
     """Create FP8 block tensor + per-block scale tensor."""
-    import torch
     from math import ceil
+
+    import torch
 
     *dims, n, k = size
     return (
@@ -212,8 +214,12 @@ def _compile_one_shape_legacy(kernel_type, n, k, num_groups, m_list):
         "NORMAL": lambda mm: (mm * k + n * k + mm * n * 2) / _GB,
         "CONTIG": lambda mm: (mm * k + num_groups * n * k + mm * 4 + mm * n * 2) / _GB,
         "MASKED": lambda mm: (
-            num_groups * mm * k + num_groups * n * k + num_groups * 4 + num_groups * mm * n * 2
-        ) / _GB,
+            num_groups * mm * k
+            + num_groups * n * k
+            + num_groups * 4
+            + num_groups * mm * n * 2
+        )
+        / _GB,
     }
     mem_req = mem_req_funcs.get(kernel_type, lambda mm: 0)
     mem_required = mem_req(max_m)

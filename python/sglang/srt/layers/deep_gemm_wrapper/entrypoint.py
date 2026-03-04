@@ -120,8 +120,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
-def precompile_deep_gemm_shapes(hf_config, tp_size: int):
-    compile_utils.precompile_deep_gemm_shapes(hf_config, tp_size)
+def precompile_deep_gemm_shapes(hf_config, tp_size: int, server_args: ServerArgs):
+    compile_utils.precompile_deep_gemm_shapes(hf_config, tp_size, server_args)
 
 
 @contextmanager
