@@ -58,9 +58,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Compiled patterns for robust matching
         self.bot_pattern = re.compile(rf"<\s*{prefix}function_calls{tail}", flags)
-        self.eot_pattern = re.compile(
-            rf"</\s*{prefix}function_calls{end_tail}", flags
-        )
+        self.eot_pattern = re.compile(rf"</\s*{prefix}function_calls{end_tail}", flags)
 
         # Start tokens for partial-prefix detection during streaming
         self._start_tokens = [
@@ -131,9 +129,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     args[key] = raw_val
         return args
 
-    def _parse_arguments_streaming(
-        self, body: str, allow_partial: bool = False
-    ) -> str:
+    def _parse_arguments_streaming(self, body: str, allow_partial: bool = False) -> str:
         """Parse arguments from an invoke body for streaming (returns JSON str).
 
         When allow_partial=True, handles incomplete parameter tags and JSON."""
@@ -176,9 +172,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             partial_match = self.param_pattern_partial.search(remaining)
             if partial_match and (param_value := partial_match.group("val")):
                 param_name = partial_match.group("key").strip()
-                string_flag = (
-                    (partial_match.group("string") or "true").lower().strip()
-                )
+                string_flag = (partial_match.group("string") or "true").lower().strip()
                 if string_flag == "true":
                     parameters[param_name] = param_value.strip()
                 else:
@@ -251,9 +245,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 buffer_low = self._buffer.lower()
                 for token in self._start_tokens:
                     token_low = token.lower()
-                    if buffer_low.endswith(
-                        token_low
-                    ) or self._ends_with_partial_token(buffer_low, token_low):
+                    if buffer_low.endswith(token_low) or self._ends_with_partial_token(
+                        buffer_low, token_low
+                    ):
                         return StreamingParseResult()
                 # No tool call starting, emit as normal text
                 normal_text = self._buffer

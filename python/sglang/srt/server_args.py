@@ -1491,7 +1491,11 @@ class ServerArgs:
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_blackwell_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if (
+                    not self.enable_dp_attention
+                    and self.nnodes == 1
+                    and not self.disable_custom_all_reduce
+                ):
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -1832,6 +1836,7 @@ class ServerArgs:
         )
         if (
             not self.enable_flashinfer_allreduce_fusion
+            and not self.disable_custom_all_reduce
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
