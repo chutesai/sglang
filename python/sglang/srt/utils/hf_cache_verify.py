@@ -138,36 +138,69 @@ def _is_hf_offline_mode() -> bool:
     return os.environ.get("HF_HUB_OFFLINE", "0") in ("1", "true", "True")
 
 
+def _override_hf_offline(offline: bool) -> None:
+    """Override the huggingface_hub cached offline mode flag.
+
+    huggingface_hub caches HF_HUB_OFFLINE as a module-level constant
+    at import time, so just changing the env var isn't enough.
+    We monkey-patch the cached constant directly.
+    """
+    import huggingface_hub.constants as hf_constants
+
+    hf_constants.HF_HUB_OFFLINE = offline
+
+
 def _get_repo_info(
     repo_id: str,
     revision: str,
     hf_token: Optional[str] = None,
 ) -> dict:
-    """Get repo info from HF directly, falling back to chutes proxy."""
-    # Skip HF direct if offline mode is enabled — go straight to proxy.
-    hf_error = None
-    if _is_hf_offline_mode():
+    """Get repo info from HF directly, falling back to chutes proxy.
+
+    If HF_HUB_OFFLINE is set, we temporarily disable it (both the env var
+    and the cached module-level constant in huggingface_hub) so that HfApi
+    can reach the network, then restore everything afterwards.
+    """
+    was_offline = _is_hf_offline_mode()
+    if was_offline:
         logger.info(
-            "HF offline mode detected, using chutes proxy for %s@%s",
+            "Temporarily disabling HF offline mode for cache " "verification of %s@%s",
             repo_id,
             revision,
         )
-    else:
-        # Try HuggingFace directly first.
-        try:
-            logger.info(
-                "Fetching repo info from HuggingFace for %s@%s",
-                repo_id,
-                revision,
-            )
-            return _fetch_repo_info_from_hf(repo_id, revision, hf_token)
-        except Exception as e:
-            hf_error = e
-            logger.warning(
-                "Failed to fetch repo info from HuggingFace directly: %s. "
-                "Falling back to chutes proxy.",
-                e,
-            )
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        _override_hf_offline(False)
+
+    try:
+        return _get_repo_info_inner(repo_id, revision, hf_token)
+    finally:
+        if was_offline:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            _override_hf_offline(True)
+
+
+def _get_repo_info_inner(
+    repo_id: str,
+    revision: str,
+    hf_token: Optional[str] = None,
+) -> dict:
+    """Get repo info from HF directly, falling back to chutes proxy."""
+    hf_error = None
+    # Try HuggingFace directly first.
+    try:
+        logger.info(
+            "Fetching repo info from HuggingFace for %s@%s",
+            repo_id,
+            revision,
+        )
+        return _fetch_repo_info_from_hf(repo_id, revision, hf_token)
+    except Exception as e:
+        hf_error = e
+        logger.warning(
+            "Failed to fetch repo info from HuggingFace directly: %s. "
+            "Falling back to chutes proxy.",
+            e,
+        )
 
     # Fallback: chutes proxy.
     try:
@@ -459,6 +492,27 @@ def _verify_cache(
     )
 
 
+def _parse_hf_cache_path(model_path: str) -> Optional[tuple[str, str]]:
+    """Try to extract (repo_id, revision) from an HF cache snapshot path.
+
+    HF cache paths look like:
+        .../models--{org}--{name}/snapshots/{commit_hash}[/...]
+
+    Returns (repo_id, revision) if the path matches, else None.
+    """
+    parts = Path(model_path).parts
+    for i, part in enumerate(parts):
+        if (
+            part.startswith("models--")
+            and i + 2 < len(parts)
+            and parts[i + 1] == "snapshots"
+        ):
+            repo_id = part[len("models--") :].replace("--", "/", 1)
+            revision = parts[i + 2]
+            return repo_id, revision
+    return None
+
+
 def verify_model_cache(
     model: str,
     revision: Optional[str],
@@ -479,27 +533,46 @@ def verify_model_cache(
         full_hash_check: If True, compute full file hashes instead of
             checking symlink names. Much slower but more thorough.
     """
-    # Skip verification for local model paths — but only for absolute paths.
-    # Relative paths that happen to match a directory (e.g. "org/model")
-    # could be HF repo IDs where an attacker planted a local directory
-    # to bypass verification.
+    repo_id = model
+    cache_dir = download_dir
+
     if os.path.isabs(model) and os.path.isdir(model):
-        logger.info(
-            "Skipping HF cache verification for local model path: %s",
-            model,
-        )
-        return
+        # The model path is an absolute local directory. Check if it's an
+        # HF cache snapshot path (e.g. offline mode resolves to
+        # /cache/hub/models--org--name/snapshots/{hash}) — if so, parse
+        # out the repo_id and revision so we can still verify.
+        parsed = _parse_hf_cache_path(model)
+        if parsed is not None:
+            repo_id, parsed_revision = parsed
+            if revision is None:
+                revision = parsed_revision
+            # Derive cache_dir from the path (everything before models--).
+            idx = model.find("models--")
+            if idx > 0:
+                cache_dir = model[:idx].rstrip("/")
+            logger.info(
+                "Detected HF cache path, verifying %s@%s (cache_dir=%s)",
+                repo_id,
+                revision,
+                cache_dir,
+            )
+        else:
+            logger.info(
+                "Skipping HF cache verification for local model path: %s",
+                model,
+            )
+            return
 
     if revision is None:
         revision = "main"
 
-    logger.info("Starting HF cache verification for %s@%s", model, revision)
+    logger.info("Starting HF cache verification for %s@%s", repo_id, revision)
 
     try:
         _verify_cache(
-            repo_id=model,
+            repo_id=repo_id,
             revision=revision,
-            cache_dir=download_dir,
+            cache_dir=cache_dir,
             hf_token=hf_token,
             full_hash_check=full_hash_check,
         )
