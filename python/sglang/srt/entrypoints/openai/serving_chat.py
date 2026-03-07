@@ -1535,7 +1535,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 not chat_template_kwargs
                 or chat_template_kwargs.get("thinking") is not False
             )
-        if self.reasoning_parser in ["qwen3", "nano_v3", "interns1"]:
+        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "nano_v3", "interns1"]:
             # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not chat_template_kwargs

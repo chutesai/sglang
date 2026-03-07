@@ -443,9 +443,9 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
-class NanoV3Detector(BaseReasoningFormatDetector):
+class Nemotron3Detector(BaseReasoningFormatDetector):
     """
-    Detector for NanoV3 model.
+    Detector for Nemotron3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
 
     """
@@ -492,7 +492,7 @@ class ReasoningParser:
         "step3": DeepSeekR1Detector,
         "longcat": LongCatDetector,
         "step3p5": DeepSeekR1Detector,
-        "nano_v3": NanoV3Detector,
+        "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
     }
 
