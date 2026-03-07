@@ -273,6 +273,14 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
 
+        # Filter grammars to only keep active indices
+        if self.grammars is not None:
+            self.grammars = [self.grammars[i] for i in keep_indices]
+            if all(g is None for g in self.grammars):
+                self.grammars = None
+                self.vocab_mask = None
+                self.apply_mask_func = None
+
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
@@ -387,7 +395,8 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        # Drop grammars in the forward copy — vocab_mask is already computed
+        return dataclasses.replace(self, penalizer_orchestrator=None, grammars=None)
 
 
 def merge_bias_tensor(

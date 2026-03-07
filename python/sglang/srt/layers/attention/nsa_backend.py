@@ -1467,7 +1467,7 @@ class NativeSparseAttnBackend(
                 include_v2=True
             ), "TRT-LLM NSA only supports target_verify/draft_extend; normal extend untested."
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             # Use expanded seq_lens for per-token decode in target_verify/draft_extend.
             return self._forward_trtllm(
                 q_all=q_all,

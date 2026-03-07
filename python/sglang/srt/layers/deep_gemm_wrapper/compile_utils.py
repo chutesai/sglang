@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 from contextlib import contextmanager
@@ -340,7 +341,10 @@ def _compile_deep_gemm_legacy(
     deep_gemm.set_compile_mode(old_compile_mode)
 
     torch.cuda.current_stream().synchronize()
+    # Deleting execute drops the closure which holds refs to all warmup
+    # tensors (lhs_q, lhs_s, rhs_q, rhs_s, out, m_indices, etc.).
     del execute
+    gc.collect()
     torch.cuda.empty_cache()
 
 
