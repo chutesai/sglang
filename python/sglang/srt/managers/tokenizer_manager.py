@@ -1913,7 +1913,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         else:
             assert self.tokenizer is not None
-            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            # Wrap each token ID in a list so both transformers v4 and v5/nightly
+            # decode each token individually. In v5, batch_decode treats a flat
+            # list of ints as a single sequence instead of separate tokens.
+            token_texts = self.tokenizer.batch_decode(
+                [[tid] for tid in token_logprobs_idx]
+            )
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
