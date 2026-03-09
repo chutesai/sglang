@@ -107,7 +107,7 @@ class GigaChat3Detector(BaseFormatDetector):
         """
         if not new_text:
             return StreamingParseResult()
-        logger.debug(f"[GigaChat3] parse_streaming_increment: '{new_text}'")
+        logger.debug(f"[GigaChat3] parse_streaming_increment: {len(new_text)} chars")
         self._buffer += new_text
         current_text = self._buffer
         delta_text = new_text
