@@ -215,7 +215,7 @@ def run_lm_eval(
     chat_model: bool = False,
     num_fewshot: int = 0,
     limit: Optional[int] = None,
-    num_concurrent: int = 128,
+    num_concurrent: int = 24,
     gen_kwargs: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run lm-eval harness against a running server.
@@ -247,13 +247,13 @@ def run_lm_eval(
             "base_url": f"{base_url}/v1/chat/completions",
             "num_concurrent": num_concurrent,
             "tokenized_requests": False,
-            "max_retries": 20,
-            "max_length": 32768,
+            "max_retries": 25,
+            "max_length": 100000,
         }
         # Default gen_kwargs for chat models — CoT tasks need large
         # max_gen_toks or the response gets truncated before the answer.
         if gen_kwargs is None:
-            gen_kwargs = "max_gen_toks=65536,temperature=1.0,top_p=0.95"
+            gen_kwargs = "max_gen_toks=100000,temperature=1.0,top_p=0.95"
     else:
         model_type = "local-completions"
         model_args = {

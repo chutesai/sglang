@@ -427,6 +427,8 @@ def collect_indices(
     tp_size: int,
     calibration_prompts: List[str],
     max_new_tokens: int = 1,
+    batch_size: int = 8,
+    mem_fraction_static: float = 0.80,
 ) -> Dict[int, np.ndarray]:
     """Collect top-k indices from all layers using SGLang's offline Engine.
 
@@ -441,6 +443,10 @@ def collect_indices(
         calibration_prompts: List of calibration text prompts.
         max_new_tokens: Tokens to generate per prompt (1 is sufficient for
             capturing prefill indices).
+        batch_size: Number of prompts to send per batch (prevents OOM with
+            long prompts by limiting concurrent prefill).
+        mem_fraction_static: GPU memory fraction for model weights/KV cache.
+            Lower than default to leave room for long-context prefill.
 
     Returns:
         Dict mapping layer_id -> np.ndarray of shape (total_tokens, topk).
@@ -461,17 +467,24 @@ def collect_indices(
         index_cache_capture_dir=capture_dir,
         # Disable CUDA graphs — incompatible with per-pass file I/O
         disable_cuda_graph=True,
+        mem_fraction_static=mem_fraction_static,
         log_level="info",
     )
 
     try:
-        # Run calibration prompts through the engine
+        # Send prompts in batches to prevent OOM on long sequences.
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+        total = len(calibration_prompts)
         logger.info(
-            f"Running {len(calibration_prompts)} calibration prompts "
+            f"Running {total} calibration prompts in batches of {batch_size} "
             f"(max_new_tokens={max_new_tokens})..."
         )
-        engine.generate(calibration_prompts, sampling_params)
+        for i in range(0, total, batch_size):
+            batch = calibration_prompts[i : i + batch_size]
+            engine.generate(batch, sampling_params)
+            done = min(i + batch_size, total)
+            if done % 100 == 0 or done == total:
+                logger.info(f"  Progress: {done}/{total} prompts")
         logger.info("Inference complete. Reading captured indices...")
     finally:
         engine.shutdown()
@@ -734,6 +747,22 @@ Examples:
         help="Target sequence length per sample in tokens (single-dataset mode only, default: 2048)",
     )
 
+    # Engine resource args
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of prompts to send per batch during calibration (default: 8). "
+        "Lower this if you hit OOM with long prompts.",
+    )
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=0.80,
+        help="GPU memory fraction for model weights/KV cache (default: 0.80). "
+        "Lower than serving default to leave room for long-context prefill.",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -774,6 +803,8 @@ Examples:
             model_path=args.model,
             tp_size=args.tp,
             calibration_prompts=calibration_prompts,
+            batch_size=args.batch_size,
+            mem_fraction_static=args.mem_fraction_static,
         )
         measure_similarity_report(layer_indices, num_layers)
         return
