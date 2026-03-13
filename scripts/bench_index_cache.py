@@ -216,15 +216,17 @@ def run_lm_eval(
     num_fewshot: int = 0,
     limit: Optional[int] = None,
     num_concurrent: int = 128,
-    apply_chat_template: bool = False,
+    gen_kwargs: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run lm-eval harness against a running server.
 
     Args:
         chat_model: If True, use local-chat-completions (chat API).
                     If False, use local-completions (completions API).
-        apply_chat_template: If True, pass --apply_chat_template to lm-eval.
-                             Automatically set when chat_model=True.
+        gen_kwargs: Generation kwargs string for lm-eval
+                    (e.g. "max_gen_toks=65536,temperature=1.0,top_p=0.95").
+                    When chat_model=True and gen_kwargs is None, defaults to
+                    sensible values for CoT tasks.
     """
     try:
         import lm_eval
@@ -245,7 +247,13 @@ def run_lm_eval(
             "base_url": f"{base_url}/v1/chat/completions",
             "num_concurrent": num_concurrent,
             "tokenized_requests": False,
+            "max_retries": 20,
+            "max_length": 32768,
         }
+        # Default gen_kwargs for chat models — CoT tasks need large
+        # max_gen_toks or the response gets truncated before the answer.
+        if gen_kwargs is None:
+            gen_kwargs = "max_gen_toks=65536,temperature=1.0,top_p=0.95"
     else:
         model_type = "local-completions"
         model_args = {
@@ -261,14 +269,16 @@ def run_lm_eval(
         num_fewshot=num_fewshot,
         batch_size="auto",
     )
-    if chat_model or apply_chat_template:
+    if chat_model:
         kwargs["apply_chat_template"] = True
+    if gen_kwargs:
+        kwargs["gen_kwargs"] = gen_kwargs
     if limit is not None:
         kwargs["limit"] = limit
 
     logger.info(
         f"Running lm-eval: model_type={model_type}, tasks={tasks}, "
-        f"num_fewshot={num_fewshot}, limit={limit}"
+        f"num_fewshot={num_fewshot}, limit={limit}, gen_kwargs={gen_kwargs}"
     )
 
     # Set dummy API key for local server
@@ -367,6 +377,7 @@ def run_benchmark_config(
     lm_eval_tasks: List[str],
     lm_eval_limit: Optional[int],
     lm_eval_num_fewshot: int,
+    lm_eval_gen_kwargs: Optional[str],
     chat_model: bool,
     run_latency: bool,
     input_lens: List[int],
@@ -387,6 +398,7 @@ def run_benchmark_config(
                 chat_model=chat_model,
                 num_fewshot=lm_eval_num_fewshot,
                 limit=lm_eval_limit,
+                gen_kwargs=lm_eval_gen_kwargs,
             )
 
         # Latency benchmark via bench_serving
@@ -573,6 +585,15 @@ Examples:
         action="store_true",
         help="Skip lm-eval quality benchmarks entirely",
     )
+    parser.add_argument(
+        "--gen-kwargs",
+        type=str,
+        default=None,
+        help="Generation kwargs for lm-eval (e.g. "
+        "'max_gen_toks=65536,temperature=1.0,top_p=0.95'). "
+        "For --chat-model, defaults to max_gen_toks=65536,temperature=1.0,top_p=0.95 "
+        "if not specified (required for CoT tasks).",
+    )
 
     # Latency benchmark args
     parser.add_argument(
@@ -651,6 +672,7 @@ Examples:
             lm_eval_tasks=lm_eval_tasks,
             lm_eval_limit=args.lm_eval_limit,
             lm_eval_num_fewshot=args.lm_eval_num_fewshot,
+            lm_eval_gen_kwargs=args.gen_kwargs,
             chat_model=args.chat_model,
             run_latency=args.run_latency,
             input_lens=args.input_lens,
@@ -675,6 +697,7 @@ Examples:
         lm_eval_tasks=lm_eval_tasks,
         lm_eval_limit=args.lm_eval_limit,
         lm_eval_num_fewshot=args.lm_eval_num_fewshot,
+        lm_eval_gen_kwargs=args.gen_kwargs,
         chat_model=args.chat_model,
         run_latency=args.run_latency,
         input_lens=args.input_lens,
