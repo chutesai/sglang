@@ -520,9 +520,9 @@ Examples:
     parser.add_argument(
         "--extra-server-args",
         type=str,
-        nargs="*",
-        default=[],
-        help="Additional args passed to both baseline and IndexCache servers",
+        default=None,
+        help="Additional args passed to both baseline and IndexCache servers, "
+        "as a single quoted string (e.g. '--reasoning-parser glm45 --mem-fraction-static 0.9')",
     )
     parser.add_argument(
         "--server-timeout",
@@ -648,9 +648,10 @@ Examples:
         lm_eval_tasks = ["gsm8k", "gpqa_diamond_cot_zeroshot"] if args.chat_model else ["gsm8k"]
 
     base_url = f"http://127.0.0.1:{args.port}"
+    extra_server_args = args.extra_server_args.split() if args.extra_server_args else []
 
     # Build IndexCache server args
-    ic_extra_args = list(args.extra_server_args)
+    ic_extra_args = list(extra_server_args)
     if args.index_cache_ratio is not None:
         ic_extra_args += ["--index-cache-ratio", str(args.index_cache_ratio)]
         ic_name = f"IndexCache(ratio={args.index_cache_ratio})"
@@ -667,7 +668,7 @@ Examples:
             model=args.model,
             tp=args.tp,
             base_url=base_url,
-            extra_server_args=list(args.extra_server_args),
+            extra_server_args=list(extra_server_args),
             config_name="baseline",
             lm_eval_tasks=lm_eval_tasks,
             lm_eval_limit=args.lm_eval_limit,
