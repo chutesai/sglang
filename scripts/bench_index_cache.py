@@ -103,30 +103,44 @@ def launch_server(
     ] + extra_args
 
     logger.info(f"Launching server: {' '.join(cmd)}")
+
+    # Write server output to a log file to avoid pipe buffer deadlock.
+    # The subprocess blocks and zombifies if stdout pipe fills without being read.
+    log_path = Path(f"/tmp/bench_index_cache_server_{os.getpid()}.log")
+    log_file = open(log_path, "w")
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
     )
+    logger.info(f"Server PID={proc.pid}, log={log_path}")
 
     if not wait_for_server(base_url, timeout=timeout):
-        proc.kill()
+        kill_server(proc)
+        # Print last 50 lines of server log for debugging
+        if log_path.exists():
+            lines = log_path.read_text().splitlines()
+            logger.error("Server log (last 50 lines):\n" + "\n".join(lines[-50:]))
         raise RuntimeError("Server failed to start")
 
     return proc
 
 
 def kill_server(proc: subprocess.Popen):
-    """Kill the server process tree."""
+    """Kill the server process group."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except (ProcessLookupError, OSError):
         pass
     try:
-        proc.kill()
-        proc.wait(timeout=30)
-    except Exception:
-        pass
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        proc.wait(timeout=10)
     time.sleep(5)
 
 
