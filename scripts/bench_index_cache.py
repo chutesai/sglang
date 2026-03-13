@@ -389,6 +389,32 @@ def run_benchmark_config(
 
     proc = launch_server(model, base_url, tp, extra_server_args, timeout=server_timeout)
     try:
+        # Warmup: send a few requests to trigger CUDA graph capture,
+        # speculative decoding warmup, etc. before benchmarking.
+        logger.info(f"Warming up server ({config_name})...")
+        warmup_cmd = [
+            sys.executable,
+            "-m",
+            "sglang.bench_serving",
+            "--backend",
+            "sglang",
+            "--base-url",
+            base_url,
+            "--dataset-name",
+            "random",
+            "--num-prompts",
+            "16",
+            "--random-input",
+            "512",
+            "--random-output",
+            "64",
+            "--request-rate",
+            "1",
+        ]
+        subprocess.run(warmup_cmd, capture_output=True, text=True, timeout=300)
+        requests.get(f"{base_url}{FLUSH_CACHE_ENDPOINT}")
+        logger.info("Warmup complete.")
+
         # Quality benchmark via lm-eval
         if lm_eval_tasks:
             result.lm_eval_results = run_lm_eval(
@@ -605,7 +631,7 @@ Examples:
         "--input-lens",
         type=int,
         nargs="*",
-        default=[1024, 4096, 16384, 65536],
+        default=[1024, 4096, 16384, 32768, 65536],
         help="Input lengths for latency tests",
     )
     parser.add_argument(
