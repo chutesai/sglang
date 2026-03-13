@@ -205,7 +205,9 @@ class GptOssDetector(BaseFormatDetector):
         match = self.tool_extract_pattern.search(content)
 
         if not match:
-            logger.debug(f"Could not extract tool call from content ({len(content)} chars)")
+            logger.debug(
+                f"Could not extract tool call from content ({len(content)} chars)"
+            )
             return None
 
         full_function_name = match.group(1)

@@ -380,6 +380,9 @@ class Envs:
     SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
 
+    # IndexCache: cross-layer index reuse ratio (e.g. 0.25 = 25% Full layers)
+    SGLANG_INDEX_CACHE_RATIO = EnvFloat(None)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
