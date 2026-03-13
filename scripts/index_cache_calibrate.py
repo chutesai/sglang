@@ -13,16 +13,18 @@ Supports three modes:
    removes Full layers that have highest Jaccard similarity to neighbors.
 
    python scripts/index_cache_calibrate.py \\
-       --model zai-org/GLM-5 --tp 8 --target-ratio 0.25 \\
-       --calibration-samples 128 -o config.json
+       --model zai-org/GLM-5 --tp 8 --target-ratio 0.25 -o config.json
 
 3. **Similarity analysis** (requires GPU, runs model offline):
    Measures and reports pairwise Jaccard similarity between consecutive
    layers to validate cross-layer index reuse assumptions.
 
    python scripts/index_cache_calibrate.py \\
-       --model zai-org/GLM-5 --tp 8 --measure-similarity \\
-       --calibration-samples 64
+       --model zai-org/GLM-5 --tp 8 --measure-similarity
+
+Calibration uses a stratified mix of datasets across domains (code, books,
+web, math, chat) and sequence lengths (2K to 120K tokens), biased toward
+longer sequences to ensure IndexCache correctness at long context.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -38,44 +41,130 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Supported calibration datasets.
-# Default is SlimPajama-6B which is a multi-source sample (C4, CommonCrawl,
-# StackExchange, GitHub, Wikipedia) with proper val/test splits and manageable
-# size. Research (EMNLP 2024, "Is C4 Dataset Optimal for Pruning?") shows
-# source diversity matters for sparsity calibration — SlimPajama's multi-source
-# nature makes it a good default.
+# Individual calibration datasets, organized by domain.
+# Each entry has: hf_path, hf_name (subset), split, text_column,
+# and max_doc_tokens (approximate max usable length per document).
 CALIBRATION_DATASETS = {
+    # General web text (short-medium)
     "slimpajama": {
         "hf_path": "DKYoon/SlimPajama-6B",
         "hf_name": None,
         "split": "validation",
         "text_column": "text",
+        "max_doc_tokens": 8192,
+        "domain": "web",
     },
     "c4": {
         "hf_path": "allenai/c4",
         "hf_name": "en",
         "split": "validation",
         "text_column": "text",
-    },
-    "pile": {
-        "hf_path": "monology/pile-uncopyrighted",
-        "hf_name": None,
-        "split": "validation",
-        "text_column": "text",
-    },
-    "wikitext": {
-        "hf_path": "wikitext",
-        "hf_name": "wikitext-2-raw-v1",
-        "split": "test",
-        "text_column": "text",
+        "max_doc_tokens": 4096,
+        "domain": "web",
     },
     "redpajama": {
         "hf_path": "togethercomputer/RedPajama-Data-1T-Sample",
         "hf_name": None,
         "split": "train",
         "text_column": "text",
+        "max_doc_tokens": 8192,
+        "domain": "web",
+    },
+    # Code
+    "starcoderdata": {
+        "hf_path": "bigcode/starcoderdata",
+        "hf_name": "python",
+        "split": "train",
+        "text_column": "content",
+        "max_doc_tokens": 32768,
+        "domain": "code",
+    },
+    # Books (long context)
+    "pg19": {
+        "hf_path": "deepmind/pg19",
+        "hf_name": None,
+        "split": "test",
+        "text_column": "text",
+        "max_doc_tokens": 200000,
+        "domain": "books",
+    },
+    # Academic papers
+    "pile": {
+        "hf_path": "monology/pile-uncopyrighted",
+        "hf_name": None,
+        "split": "validation",
+        "text_column": "text",
+        "max_doc_tokens": 16384,
+        "domain": "academic",
+    },
+    # Wiki
+    "wikitext": {
+        "hf_path": "wikitext",
+        "hf_name": "wikitext-103-raw-v1",
+        "split": "test",
+        "text_column": "text",
+        "max_doc_tokens": 4096,
+        "domain": "wiki",
+    },
+    # Long-context QA
+    "longbench": {
+        "hf_path": "THUDM/LongBench",
+        "hf_name": "qasper",
+        "split": "test",
+        "text_column": "context",
+        "max_doc_tokens": 32768,
+        "domain": "long_qa",
+    },
+    # Very long context (100K+)
+    "infinitebench": {
+        "hf_path": "xinrongzhang2022/InfiniteBench",
+        "hf_name": "longbook_qa_eng",
+        "split": "test",
+        "text_column": "context",
+        "max_doc_tokens": 200000,
+        "domain": "books",
     },
 }
+
+# Stratified length distribution for comprehensive calibration.
+# Biased toward longer sequences since that's where IndexCache matters most
+# and where calibration failures are most damaging.
+# Format: (min_tokens, max_tokens, fraction_of_total)
+LENGTH_STRATA = [
+    (1024, 4096, 0.10),       # 10% short
+    (4096, 16384, 0.15),      # 15% medium
+    (16384, 32768, 0.20),     # 20% medium-long
+    (32768, 65536, 0.25),     # 25% long
+    (65536, 120000, 0.30),    # 30% very long
+]
+
+# Which datasets to use for each length stratum.
+# Short strata can use any dataset; long strata need datasets with long docs.
+LENGTH_DATASET_MAP = {
+    (1024, 4096): ["slimpajama", "c4", "redpajama", "wikitext", "starcoderdata", "pile"],
+    (4096, 16384): ["slimpajama", "redpajama", "starcoderdata", "pile", "longbench"],
+    (16384, 32768): ["starcoderdata", "pile", "longbench", "pg19"],
+    (32768, 65536): ["pg19", "infinitebench"],
+    (65536, 120000): ["pg19", "infinitebench"],
+}
+
+
+def _load_single_dataset(ds_name: str):
+    """Load a single dataset in streaming mode, return (iterator, text_column)."""
+    from datasets import load_dataset
+
+    if ds_name in CALIBRATION_DATASETS:
+        cfg = CALIBRATION_DATASETS[ds_name]
+        ds = load_dataset(
+            cfg["hf_path"],
+            cfg["hf_name"],
+            split=cfg["split"],
+            streaming=True,
+        )
+        return ds, cfg["text_column"]
+    else:
+        ds = load_dataset(ds_name, split="train", streaming=True)
+        return ds, "text"
 
 
 def load_calibration_prompts(
@@ -84,52 +173,14 @@ def load_calibration_prompts(
     seq_len: int = 2048,
     tokenizer_name: Optional[str] = None,
 ) -> List[str]:
-    """Load calibration prompts from a standard dataset.
+    """Load calibration prompts from a single dataset at a fixed length.
 
-    Samples documents, tokenizes to seq_len tokens, and returns as strings.
-    This ensures consistent-length inputs for fair cross-layer comparison.
-
-    Args:
-        dataset_name: One of the CALIBRATION_DATASETS keys, or a HuggingFace
-            dataset path (uses "text" column from "train" split).
-        num_samples: Number of calibration samples to use.
-        seq_len: Target sequence length in tokens per sample.
-        tokenizer_name: Tokenizer to use for length normalization. If None,
-            uses character-based approximation (4 chars ~= 1 token).
+    Used when --calibration-dataset is specified (legacy single-dataset mode).
     """
     from datasets import load_dataset
 
-    if dataset_name in CALIBRATION_DATASETS:
-        ds_config = CALIBRATION_DATASETS[dataset_name]
-        logger.info(
-            f"Loading calibration dataset: {ds_config['hf_path']} "
-            f"(split={ds_config['split']})"
-        )
-        ds = load_dataset(
-            ds_config["hf_path"],
-            ds_config["hf_name"],
-            split=ds_config["split"],
-            streaming=True,
-        )
-        text_column = ds_config["text_column"]
-    else:
-        # Treat as a HuggingFace dataset path
-        logger.info(f"Loading custom calibration dataset: {dataset_name}")
-        ds = load_dataset(dataset_name, split="train", streaming=True)
-        text_column = "text"
-
-    # Try to use tokenizer for accurate length normalization
-    tokenizer = None
-    if tokenizer_name:
-        try:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name, trust_remote_code=True
-            )
-            logger.info(f"Using tokenizer {tokenizer_name} for length normalization")
-        except Exception as e:
-            logger.warning(f"Could not load tokenizer: {e}. Using char approximation.")
+    ds, text_column = _load_single_dataset(dataset_name)
+    tokenizer = _get_tokenizer(tokenizer_name)
 
     prompts = []
     for item in ds:
@@ -140,20 +191,9 @@ def load_calibration_prompts(
         if not text or len(text.strip()) < 100:
             continue
 
-        if tokenizer:
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            if len(tokens) < seq_len // 2:
-                continue  # Skip very short documents
-            tokens = tokens[:seq_len]
-            prompt = tokenizer.decode(tokens, skip_special_tokens=True)
-        else:
-            # Approximate: 4 chars per token
-            char_len = seq_len * 4
-            if len(text) < char_len // 2:
-                continue
-            prompt = text[:char_len]
-
-        prompts.append(prompt)
+        prompt = _truncate_to_length(text, seq_len, tokenizer)
+        if prompt is not None:
+            prompts.append(prompt)
 
     if len(prompts) < num_samples:
         logger.warning(
@@ -166,6 +206,141 @@ def load_calibration_prompts(
         f"(target seq_len={seq_len} tokens)"
     )
     return prompts
+
+
+def load_stratified_calibration_prompts(
+    num_samples: int = 20000,
+    tokenizer_name: Optional[str] = None,
+    length_strata: Optional[List] = None,
+) -> List[str]:
+    """Load calibration prompts stratified across datasets and sequence lengths.
+
+    Samples from multiple domains (code, books, web, academic, QA) at multiple
+    sequence lengths (2K-120K), biased toward longer sequences.
+
+    Args:
+        num_samples: Total number of calibration prompts to collect.
+        tokenizer_name: Tokenizer for accurate length measurement.
+        length_strata: Override default LENGTH_STRATA.
+
+    Returns:
+        List of prompts covering diverse domains and lengths.
+    """
+    if length_strata is None:
+        length_strata = LENGTH_STRATA
+
+    tokenizer = _get_tokenizer(tokenizer_name)
+    all_prompts = []
+    rng = random.Random(42)
+
+    for min_tok, max_tok, fraction in length_strata:
+        target_count = max(1, int(num_samples * fraction))
+        datasets_for_stratum = LENGTH_DATASET_MAP.get(
+            (min_tok, max_tok),
+            list(CALIBRATION_DATASETS.keys()),
+        )
+        # Divide target evenly across datasets, then round-robin
+        per_dataset = max(1, target_count // len(datasets_for_stratum))
+        stratum_prompts = []
+
+        logger.info(
+            f"Loading stratum [{min_tok}-{max_tok} tok] "
+            f"({fraction:.0%}, target={target_count}): "
+            f"datasets={datasets_for_stratum}"
+        )
+
+        for ds_name in datasets_for_stratum:
+            if len(stratum_prompts) >= target_count:
+                break
+
+            try:
+                ds, text_column = _load_single_dataset(ds_name)
+            except Exception as e:
+                logger.warning(f"  Skipping {ds_name}: {e}")
+                continue
+
+            ds_count = 0
+            # Target the middle of the stratum range for this dataset
+            target_len = (min_tok + max_tok) // 2
+
+            for item in ds:
+                if ds_count >= per_dataset:
+                    break
+                if len(stratum_prompts) >= target_count:
+                    break
+
+                text = item.get(text_column, "")
+                if not text or len(text.strip()) < 100:
+                    continue
+
+                # Check document is long enough for this stratum
+                approx_tokens = len(text) // 4
+                if approx_tokens < min_tok:
+                    continue
+
+                # Sample a random length within the stratum range
+                sample_len = rng.randint(min_tok, min(max_tok, approx_tokens))
+                prompt = _truncate_to_length(text, sample_len, tokenizer)
+                if prompt is not None:
+                    stratum_prompts.append(prompt)
+                    ds_count += 1
+
+            logger.info(f"  {ds_name}: {ds_count} prompts")
+
+        all_prompts.extend(stratum_prompts)
+        logger.info(
+            f"  Stratum [{min_tok}-{max_tok}]: "
+            f"{len(stratum_prompts)}/{target_count} prompts collected"
+        )
+
+    # Shuffle so strata are interleaved during inference
+    rng.shuffle(all_prompts)
+
+    # Log distribution summary
+    if tokenizer:
+        lengths = [len(tokenizer.encode(p, add_special_tokens=False)) for p in all_prompts[:100]]
+    else:
+        lengths = [len(p) // 4 for p in all_prompts[:100]]
+    logger.info(
+        f"Loaded {len(all_prompts)} total calibration prompts. "
+        f"Length distribution (sample of 100): "
+        f"min={min(lengths)}, median={sorted(lengths)[len(lengths)//2]}, "
+        f"max={max(lengths)} tokens"
+    )
+    return all_prompts
+
+
+def _get_tokenizer(tokenizer_name: Optional[str]):
+    """Load tokenizer for length normalization, or return None."""
+    if not tokenizer_name:
+        return None
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, trust_remote_code=True
+        )
+        logger.info(f"Using tokenizer {tokenizer_name} for length normalization")
+        return tokenizer
+    except Exception as e:
+        logger.warning(f"Could not load tokenizer: {e}. Using char approximation.")
+        return None
+
+
+def _truncate_to_length(
+    text: str, target_tokens: int, tokenizer=None
+) -> Optional[str]:
+    """Truncate text to target token length. Returns None if too short."""
+    if tokenizer:
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if len(tokens) < target_tokens // 2:
+            return None
+        tokens = tokens[:target_tokens]
+        return tokenizer.decode(tokens, skip_special_tokens=True)
+    else:
+        char_len = target_tokens * 4
+        if len(text) < char_len // 2:
+            return None
+        return text[:char_len]
 
 
 def compute_jaccard_similarity(
@@ -464,32 +639,30 @@ def main():
         description="Calibrate IndexCache Full/Shared layer assignment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Calibration datasets (--calibration-dataset):
-  slimpajama  DKYoon/SlimPajama-6B validation split (default, multi-source)
-  c4          allenai/c4 validation split
-  pile        monology/pile-uncopyrighted validation split
-  wikitext    wikitext-2-raw-v1 test split (simple, small)
-  redpajama   RedPajama-Data-1T-Sample (diverse, large)
-  <hf_path>   Any HuggingFace dataset with a "text" column
-
 Examples:
-  # Generate uniform config (no GPU needed):
+  # Production calibration (20K prompts, all domains, 2K-120K tokens):
+  python scripts/index_cache_calibrate.py \\
+      --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 \\
+      --stratified -o config.json
+
+  # Faster calibration (fewer samples, still stratified):
+  python scripts/index_cache_calibrate.py \\
+      --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 \\
+      --stratified --calibration-samples 2000 -o config.json
+
+  # Single-dataset calibration at specific length:
+  python scripts/index_cache_calibrate.py \\
+      --model zai-org/GLM-5 --tp 8 --target-ratio 0.25 \\
+      --calibration-dataset pg19 --calibration-seq-len 65536 \\
+      --calibration-samples 128 -o config.json
+
+  # Uniform config (no GPU needed):
   python scripts/index_cache_calibrate.py \\
       --model zai-org/GLM-5 --uniform --target-ratio 0.25 -o config.json
 
-  # Greedy calibration with SlimPajama (default, requires GPU):
+  # Analyze layer similarity:
   python scripts/index_cache_calibrate.py \\
-      --model zai-org/GLM-5 --tp 8 --target-ratio 0.25 \\
-      --calibration-samples 128 -o config.json
-
-  # Use Pile instead (better for sparsity per EMNLP 2024 findings):
-  python scripts/index_cache_calibrate.py \\
-      --model zai-org/GLM-5 --tp 8 --target-ratio 0.25 \\
-      --calibration-dataset pile -o config.json
-
-  # Analyze layer similarity (requires GPU):
-  python scripts/index_cache_calibrate.py \\
-      --model zai-org/GLM-5 --tp 8 --measure-similarity
+      --model zai-org/GLM-5 --tp 8 --measure-similarity --stratified
         """,
     )
     parser.add_argument(
@@ -518,7 +691,7 @@ Examples:
     parser.add_argument(
         "--uniform",
         action="store_true",
-        help="Use uniform spacing (recommended, no GPU needed)",
+        help="Use uniform spacing (no GPU needed)",
     )
     parser.add_argument(
         "--measure-similarity",
@@ -526,28 +699,39 @@ Examples:
         help="Measure and report inter-layer index similarity (requires GPU)",
     )
 
-    # Calibration data arguments
+    # Stratified calibration (recommended for production)
+    parser.add_argument(
+        "--stratified",
+        action="store_true",
+        help="Use stratified multi-dataset, multi-length calibration. "
+        "Samples from code, books, web, academic, QA datasets at lengths "
+        "from 2K to 120K tokens, biased toward longer sequences. "
+        "Recommended for production configs.",
+    )
+
+    # Single-dataset calibration (legacy / quick testing)
     parser.add_argument(
         "--calibration-dataset",
         type=str,
         default="slimpajama",
         help=(
-            f"Calibration dataset name or HuggingFace path. "
+            f"Single calibration dataset (used when --stratified is not set). "
             f"Built-in: {', '.join(CALIBRATION_DATASETS.keys())}. "
-            f"Default: slimpajama (DKYoon/SlimPajama-6B)"
+            f"Default: slimpajama"
         ),
     )
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=512,
-        help="Number of calibration samples (default: 512, recommend 1024 for production configs)",
+        default=None,
+        help="Number of calibration samples. "
+        "Default: 20000 for --stratified, 512 for single-dataset.",
     )
     parser.add_argument(
         "--calibration-seq-len",
         type=int,
         default=2048,
-        help="Target sequence length per sample in tokens (default: 2048)",
+        help="Target sequence length per sample in tokens (single-dataset mode only, default: 2048)",
     )
 
     args = parser.parse_args()
@@ -563,13 +747,27 @@ Examples:
         generate_uniform_config(num_layers, args.target_ratio, args.output)
         return
 
-    # Load calibration data for GPU-based modes
-    calibration_prompts = load_calibration_prompts(
-        dataset_name=args.calibration_dataset,
-        num_samples=args.calibration_samples,
-        seq_len=args.calibration_seq_len,
-        tokenizer_name=args.model,
-    )
+    # Determine sample count
+    if args.calibration_samples is not None:
+        num_samples = args.calibration_samples
+    elif args.stratified:
+        num_samples = 20000
+    else:
+        num_samples = 512
+
+    # Load calibration data
+    if args.stratified:
+        calibration_prompts = load_stratified_calibration_prompts(
+            num_samples=num_samples,
+            tokenizer_name=args.model,
+        )
+    else:
+        calibration_prompts = load_calibration_prompts(
+            dataset_name=args.calibration_dataset,
+            num_samples=num_samples,
+            seq_len=args.calibration_seq_len,
+            tokenizer_name=args.model,
+        )
 
     if args.measure_similarity:
         layer_indices = collect_indices(
@@ -585,7 +783,7 @@ Examples:
     logger.info(
         f"Calibrating IndexCache for {args.model}: "
         f"{num_layers} layers, target {target_num_full} Full layers, "
-        f"dataset={args.calibration_dataset}, "
+        f"mode={'stratified' if args.stratified else args.calibration_dataset}, "
         f"samples={len(calibration_prompts)}"
     )
 
@@ -603,9 +801,17 @@ Examples:
         "target_ratio": args.target_ratio,
         "actual_ratio": len(full_layers) / num_layers,
         "method": "greedy_calibration",
-        "calibration_dataset": args.calibration_dataset,
+        "calibration_mode": "stratified" if args.stratified else "single_dataset",
         "calibration_samples": len(calibration_prompts),
     }
+    if args.stratified:
+        config["calibration_length_strata"] = [
+            {"min_tokens": s[0], "max_tokens": s[1], "fraction": s[2]}
+            for s in LENGTH_STRATA
+        ]
+    else:
+        config["calibration_dataset"] = args.calibration_dataset
+        config["calibration_seq_len"] = args.calibration_seq_len
 
     with open(args.output, "w") as f:
         json.dump(config, f, indent=2)
@@ -613,6 +819,12 @@ Examples:
     logger.info(
         f"Wrote calibrated config to {args.output}: "
         f"{len(full_layers)}/{num_layers} Full layers"
+    )
+    print(f"\nConfig written to: {args.output}")
+    print(f"Full layers ({len(full_layers)}/{num_layers}): {sorted(full_layers)}")
+    print(
+        f"\nTo use: python -m sglang.launch_server --model MODEL "
+        f"--index-cache-config {args.output}"
     )
 
 
