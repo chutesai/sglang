@@ -4,29 +4,53 @@ Launches an SGLang server in two configurations (baseline vs IndexCache),
 runs lm-eval quality benchmarks and bench_serving latency/throughput tests,
 and produces a comparison report.
 
+Uses lm-eval-harness for all quality benchmarks:
+  - local-completions: for loglikelihood tasks (MMLU, HellaSwag, ARC, etc.)
+  - local-chat-completions: for generate_until tasks with chat models
+    (GSM8K, GPQA Diamond CoT, IFEval, MATH, RULER NIAH, etc.)
+
 Usage:
-    # Quick quality check (GSM8K subset)
+    # Chat model quality (GPQA Diamond zero-shot + GSM8K)
     python scripts/bench_index_cache.py \
-        --model zai-org/GLM-5 --tp 8 \
-        --index-cache-ratio 0.25
+        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+        --index-cache-ratio 0.25 \
+        --chat-model \
+        --lm-eval-tasks gpqa_diamond_cot_zeroshot gsm8k
 
-    # Full benchmark with latency tests
+    # Chat model with long-context RULER NIAH tasks
+    python scripts/bench_index_cache.py \
+        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+        --index-cache-ratio 0.25 \
+        --chat-model \
+        --lm-eval-tasks niah_single_1 niah_single_2 niah_single_3
+
+    # Base model quality (MMLU, HellaSwag via loglikelihood)
     python scripts/bench_index_cache.py \
         --model zai-org/GLM-5 --tp 8 \
         --index-cache-ratio 0.25 \
-        --run-latency \
-        --input-lens 1024 4096 16384 65536
+        --lm-eval-tasks mmlu hellaswag
 
-    # Use calibrated config
+    # Latency-only benchmark
     python scripts/bench_index_cache.py \
-        --model zai-org/GLM-5 --tp 8 \
-        --index-cache-config path/to/config.json
-
-    # Custom lm-eval tasks
-    python scripts/bench_index_cache.py \
-        --model zai-org/GLM-5 --tp 8 \
+        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
         --index-cache-ratio 0.25 \
-        --lm-eval-tasks gsm8k mmlu hellaswag
+        --skip-lm-eval --run-latency \
+        --input-lens 1024 4096 16384 65536 131072
+
+    # Calibrated config with full eval suite
+    python scripts/bench_index_cache.py \
+        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+        --index-cache-config path/to/config.json \
+        --chat-model \
+        --lm-eval-tasks gpqa_diamond_cot_zeroshot gsm8k ifeval
+
+    # Task presets (shorthand for common task sets)
+    python scripts/bench_index_cache.py \
+        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+        --index-cache-ratio 0.25 --chat-model \
+        --preset chat-quality          # gsm8k + gpqa_diamond_cot_zeroshot + ifeval
+        --preset chat-long-context     # RULER NIAH tasks
+        --preset chat-full             # all of the above
 
 Requirements:
     pip install lm-eval
@@ -52,8 +76,50 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 30000
 HEALTH_ENDPOINT = "/health"
-COMPLETIONS_ENDPOINT = "/v1/completions"
 FLUSH_CACHE_ENDPOINT = "/flush_cache"
+
+# Task presets for common evaluation scenarios.
+# generate_until tasks work with both local-completions and local-chat-completions.
+# loglikelihood tasks (mmlu, hellaswag, arc, etc.) only work with local-completions.
+TASK_PRESETS = {
+    # Chat model presets (generate_until only — work with local-chat-completions)
+    "chat-quality": [
+        "gsm8k",
+        "gpqa_diamond_cot_zeroshot",
+        "ifeval",
+    ],
+    "chat-long-context": [
+        "niah_single_1",
+        "niah_single_2",
+        "niah_single_3",
+        "niah_multikey_1",
+    ],
+    "chat-full": [
+        "gsm8k",
+        "gpqa_diamond_cot_zeroshot",
+        "ifeval",
+        "niah_single_1",
+        "niah_single_2",
+        "niah_single_3",
+        "niah_multikey_1",
+    ],
+    # Base model presets (loglikelihood — require local-completions)
+    "base-quality": [
+        "mmlu",
+        "hellaswag",
+        "arc_challenge",
+        "winogrande",
+        "truthfulqa_mc2",
+    ],
+    "base-full": [
+        "mmlu",
+        "hellaswag",
+        "arc_challenge",
+        "winogrande",
+        "truthfulqa_mc2",
+        "gsm8k",
+    ],
+}
 
 
 @dataclass
@@ -105,7 +171,6 @@ def launch_server(
     logger.info(f"Launching server: {' '.join(cmd)}")
 
     # Write server output to a log file to avoid pipe buffer deadlock.
-    # The subprocess blocks and zombifies if stdout pipe fills without being read.
     log_path = Path(f"/tmp/bench_index_cache_server_{os.getpid()}.log")
     log_file = open(log_path, "w")
     proc = subprocess.Popen(
@@ -118,7 +183,6 @@ def launch_server(
 
     if not wait_for_server(base_url, timeout=timeout):
         kill_server(proc)
-        # Print last 50 lines of server log for debugging
         if log_path.exists():
             lines = log_path.read_text().splitlines()
             logger.error("Server log (last 50 lines):\n" + "\n".join(lines[-50:]))
@@ -148,37 +212,77 @@ def run_lm_eval(
     base_url: str,
     model_name: str,
     tasks: List[str],
-    num_fewshot: int = 5,
+    chat_model: bool = False,
+    num_fewshot: int = 0,
     limit: Optional[int] = None,
     num_concurrent: int = 128,
-    gen_kwargs: Optional[str] = None,
+    apply_chat_template: bool = False,
 ) -> Dict[str, Any]:
-    """Run lm-eval harness against a running server."""
-    import lm_eval
+    """Run lm-eval harness against a running server.
+
+    Args:
+        chat_model: If True, use local-chat-completions (chat API).
+                    If False, use local-completions (completions API).
+        apply_chat_template: If True, pass --apply_chat_template to lm-eval.
+                             Automatically set when chat_model=True.
+    """
+    try:
+        import lm_eval
+    except ImportError:
+        logger.error(
+            "lm_eval not installed. Install with: pip install lm-eval\n"
+            "Skipping quality benchmark. Use --skip-lm-eval to suppress this."
+        )
+        return {}
 
     # Flush cache before evaluation
     requests.get(f"{base_url}{FLUSH_CACHE_ENDPOINT}")
 
-    model_args = {
-        "model": model_name,
-        "base_url": f"{base_url}{COMPLETIONS_ENDPOINT}",
-        "num_concurrent": num_concurrent,
-    }
+    if chat_model:
+        model_type = "local-chat-completions"
+        model_args = {
+            "model": model_name,
+            "base_url": f"{base_url}/v1/chat/completions",
+            "num_concurrent": num_concurrent,
+            "tokenized_requests": False,
+        }
+    else:
+        model_type = "local-completions"
+        model_args = {
+            "model": model_name,
+            "base_url": f"{base_url}/v1/completions",
+            "num_concurrent": num_concurrent,
+        }
 
     kwargs = dict(
-        model="local-completions",
+        model=model_type,
         model_args=model_args,
         tasks=tasks,
         num_fewshot=num_fewshot,
         batch_size="auto",
     )
+    if chat_model or apply_chat_template:
+        kwargs["apply_chat_template"] = True
     if limit is not None:
         kwargs["limit"] = limit
-    if gen_kwargs is not None:
-        kwargs["gen_kwargs"] = gen_kwargs
 
-    logger.info(f"Running lm-eval: tasks={tasks}, limit={limit}")
-    results = lm_eval.simple_evaluate(**kwargs)
+    logger.info(
+        f"Running lm-eval: model_type={model_type}, tasks={tasks}, "
+        f"num_fewshot={num_fewshot}, limit={limit}"
+    )
+
+    # Set dummy API key for local server
+    old_key = os.environ.get("OPENAI_API_KEY")
+    if not old_key:
+        os.environ["OPENAI_API_KEY"] = "EMPTY"
+
+    try:
+        results = lm_eval.simple_evaluate(**kwargs)
+    finally:
+        if not old_key:
+            os.environ.pop("OPENAI_API_KEY", None)
+        elif old_key:
+            os.environ["OPENAI_API_KEY"] = old_key
 
     # Extract key metrics
     summary = {}
@@ -202,6 +306,7 @@ def run_latency_bench(
     results = {}
     for input_len in input_lens:
         logger.info(f"Benchmarking latency: input_len={input_len}")
+        output_file = Path(f"/tmp/bench_index_cache_{input_len}_{os.getpid()}.json")
         cmd = [
             sys.executable,
             "-m",
@@ -221,17 +326,16 @@ def run_latency_bench(
             "--request-rate",
             str(concurrency),
             "--output-file",
-            f"/tmp/bench_index_cache_{input_len}.json",
+            str(output_file),
         ]
 
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=1800,
         )
 
-        output_file = Path(f"/tmp/bench_index_cache_{input_len}.json")
         if output_file.exists():
             with open(output_file) as f:
                 bench_data = json.load(f)
@@ -263,7 +367,7 @@ def run_benchmark_config(
     lm_eval_tasks: List[str],
     lm_eval_limit: Optional[int],
     lm_eval_num_fewshot: int,
-    lm_eval_gen_kwargs: Optional[str],
+    chat_model: bool,
     run_latency: bool,
     input_lens: List[int],
     output_len: int,
@@ -274,18 +378,18 @@ def run_benchmark_config(
 
     proc = launch_server(model, base_url, tp, extra_server_args, timeout=server_timeout)
     try:
-        # Quality benchmark
+        # Quality benchmark via lm-eval
         if lm_eval_tasks:
             result.lm_eval_results = run_lm_eval(
                 base_url=base_url,
                 model_name=model,
                 tasks=lm_eval_tasks,
+                chat_model=chat_model,
                 num_fewshot=lm_eval_num_fewshot,
                 limit=lm_eval_limit,
-                gen_kwargs=lm_eval_gen_kwargs,
             )
 
-        # Latency benchmark
+        # Latency benchmark via bench_serving
         if run_latency:
             result.latency_results = run_latency_bench(
                 base_url=base_url,
@@ -310,8 +414,11 @@ def print_comparison(baseline: BenchResult, index_cache: BenchResult):
     # Quality comparison
     if baseline.lm_eval_results and index_cache.lm_eval_results:
         print("\n--- Quality (lm-eval) ---")
-        print(f"{'Task':<20} {'Metric':<35} {'Baseline':>10} {'IndexCache':>10} {'Delta':>10}")
-        print("-" * 85)
+        print(
+            f"{'Task':<30} {'Metric':<30} {'Baseline':>10} "
+            f"{'IndexCache':>10} {'Delta':>10}"
+        )
+        print("-" * 90)
         for task in baseline.lm_eval_results:
             if task not in index_cache.lm_eval_results:
                 continue
@@ -321,12 +428,18 @@ def print_comparison(baseline: BenchResult, index_cache: BenchResult):
                 b_val = baseline.lm_eval_results[task][metric]
                 ic_val = index_cache.lm_eval_results[task][metric]
                 delta = ic_val - b_val
-                print(f"{task:<20} {metric:<35} {b_val:>10.4f} {ic_val:>10.4f} {delta:>+10.4f}")
+                print(
+                    f"{task:<30} {metric:<30} {b_val:>10.4f} "
+                    f"{ic_val:>10.4f} {delta:>+10.4f}"
+                )
 
     # Latency comparison
     if baseline.latency_results and index_cache.latency_results:
         print("\n--- Latency ---")
-        print(f"{'Input Len':<12} {'Metric':<25} {'Baseline':>12} {'IndexCache':>12} {'Speedup':>10}")
+        print(
+            f"{'Input Len':<12} {'Metric':<25} {'Baseline':>12} "
+            f"{'IndexCache':>12} {'Speedup':>10}"
+        )
         print("-" * 71)
         for key in baseline.latency_results:
             if key not in index_cache.latency_results:
@@ -334,30 +447,64 @@ def print_comparison(baseline: BenchResult, index_cache: BenchResult):
             b_data = baseline.latency_results[key]
             ic_data = index_cache.latency_results[key]
             input_len = b_data["input_len"]
-            for metric in ["median_ttft_ms", "median_tpot_ms", "output_throughput"]:
+            for metric in [
+                "median_ttft_ms",
+                "median_tpot_ms",
+                "output_throughput",
+            ]:
                 b_val = b_data.get(metric)
                 ic_val = ic_data.get(metric)
                 if b_val is None or ic_val is None:
                     continue
                 if "throughput" in metric:
                     speedup = ic_val / b_val if b_val > 0 else float("inf")
-                    print(f"{input_len:<12} {metric:<25} {b_val:>12.2f} {ic_val:>12.2f} {speedup:>9.2f}x")
                 else:
                     speedup = b_val / ic_val if ic_val > 0 else float("inf")
-                    print(f"{input_len:<12} {metric:<25} {b_val:>12.2f} {ic_val:>12.2f} {speedup:>9.2f}x")
+                print(
+                    f"{input_len:<12} {metric:<25} {b_val:>12.2f} "
+                    f"{ic_val:>12.2f} {speedup:>9.2f}x"
+                )
 
     print("\n" + "=" * 80)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark IndexCache quality and performance impact"
+        description="Benchmark IndexCache quality and performance impact",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Task presets (use with --preset):
+  chat-quality       gsm8k, gpqa_diamond_cot_zeroshot, ifeval
+  chat-long-context  RULER NIAH tasks (niah_single_1/2/3, niah_multikey_1)
+  chat-full          all of the above
+  base-quality       mmlu, hellaswag, arc_challenge, winogrande, truthfulqa_mc2
+  base-full          base-quality + gsm8k
+
+Examples:
+  # GPQA Diamond zero-shot (chat model)
+  %(prog)s --model deepseek-ai/DeepSeek-V3.2 --tp 8 \\
+      --index-cache-ratio 0.25 --chat-model \\
+      --lm-eval-tasks gpqa_diamond_cot_zeroshot
+
+  # Full chat eval suite
+  %(prog)s --model deepseek-ai/DeepSeek-V3.2 --tp 8 \\
+      --index-cache-ratio 0.25 --chat-model --preset chat-full
+
+  # Latency only
+  %(prog)s --model deepseek-ai/DeepSeek-V3.2 --tp 8 \\
+      --index-cache-ratio 0.25 --skip-lm-eval --run-latency \\
+      --input-lens 1024 4096 16384 65536 131072
+""",
     )
 
     # Model / server args
-    parser.add_argument("--model", type=str, required=True, help="Model path or HF ID")
+    parser.add_argument(
+        "--model", type=str, required=True, help="Model path or HF ID"
+    )
     parser.add_argument("--tp", type=int, default=8, help="Tensor parallel size")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Server port")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="Server port"
+    )
     parser.add_argument(
         "--extra-server-args",
         type=str,
@@ -385,49 +532,59 @@ def main():
         help="Path to calibrated IndexCache JSON config",
     )
 
+    # Model type
+    parser.add_argument(
+        "--chat-model",
+        action="store_true",
+        help="Use local-chat-completions (chat API) for lm-eval. "
+        "Required for chat/instruct models. Only supports generate_until "
+        "tasks (gsm8k, gpqa_diamond_cot_zeroshot, ifeval, RULER NIAH, etc.)",
+    )
+
     # Quality benchmark args
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=list(TASK_PRESETS.keys()),
+        default=None,
+        help="Use a predefined task set (overrides --lm-eval-tasks)",
+    )
     parser.add_argument(
         "--lm-eval-tasks",
         type=str,
         nargs="*",
-        default=["gsm8k"],
-        help="lm-eval tasks to run (default: gsm8k)",
+        default=None,
+        help="lm-eval task names (default: gsm8k). See lm-eval docs for full list.",
     )
     parser.add_argument(
         "--lm-eval-limit",
         type=int,
-        default=200,
-        help="Max examples per task (default: 200, set 0 for unlimited)",
+        default=None,
+        help="Max examples per task (default: unlimited, set for faster runs)",
     )
     parser.add_argument(
         "--lm-eval-num-fewshot",
         type=int,
-        default=5,
-        help="Number of few-shot examples",
-    )
-    parser.add_argument(
-        "--lm-eval-gen-kwargs",
-        type=str,
-        default=None,
-        help="Generation kwargs for lm-eval (e.g. 'max_gen_toks=2048')",
+        default=0,
+        help="Number of few-shot examples (default: 0 = zero-shot)",
     )
     parser.add_argument(
         "--skip-lm-eval",
         action="store_true",
-        help="Skip lm-eval quality benchmarks",
+        help="Skip lm-eval quality benchmarks entirely",
     )
 
     # Latency benchmark args
     parser.add_argument(
         "--run-latency",
         action="store_true",
-        help="Run latency/throughput benchmarks",
+        help="Run latency/throughput benchmarks via bench_serving",
     )
     parser.add_argument(
         "--input-lens",
         type=int,
         nargs="*",
-        default=[1024, 4096, 16384],
+        default=[1024, 4096, 16384, 65536],
         help="Input lengths for latency tests",
     )
     parser.add_argument(
@@ -457,9 +614,19 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Resolve tasks
+    if args.skip_lm_eval:
+        lm_eval_tasks = []
+    elif args.preset:
+        lm_eval_tasks = TASK_PRESETS[args.preset]
+        logger.info(f"Using preset '{args.preset}': {lm_eval_tasks}")
+    elif args.lm_eval_tasks:
+        lm_eval_tasks = args.lm_eval_tasks
+    else:
+        # Default based on model type
+        lm_eval_tasks = ["gsm8k", "gpqa_diamond_cot_zeroshot"] if args.chat_model else ["gsm8k"]
+
     base_url = f"http://127.0.0.1:{args.port}"
-    lm_eval_tasks = [] if args.skip_lm_eval else args.lm_eval_tasks
-    lm_eval_limit = None if args.lm_eval_limit == 0 else args.lm_eval_limit
 
     # Build IndexCache server args
     ic_extra_args = list(args.extra_server_args)
@@ -482,9 +649,9 @@ def main():
             extra_server_args=list(args.extra_server_args),
             config_name="baseline",
             lm_eval_tasks=lm_eval_tasks,
-            lm_eval_limit=lm_eval_limit,
+            lm_eval_limit=args.lm_eval_limit,
             lm_eval_num_fewshot=args.lm_eval_num_fewshot,
-            lm_eval_gen_kwargs=args.lm_eval_gen_kwargs,
+            chat_model=args.chat_model,
             run_latency=args.run_latency,
             input_lens=args.input_lens,
             output_len=args.output_len,
@@ -506,9 +673,9 @@ def main():
         extra_server_args=ic_extra_args,
         config_name=ic_name,
         lm_eval_tasks=lm_eval_tasks,
-        lm_eval_limit=lm_eval_limit,
+        lm_eval_limit=args.lm_eval_limit,
         lm_eval_num_fewshot=args.lm_eval_num_fewshot,
-        lm_eval_gen_kwargs=args.lm_eval_gen_kwargs,
+        chat_model=args.chat_model,
         run_latency=args.run_latency,
         input_lens=args.input_lens,
         output_len=args.output_len,
