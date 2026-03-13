@@ -347,17 +347,53 @@ def get_num_layers(model_path: str, num_layers_override: Optional[int]) -> int:
     """Get the number of layers from model config."""
     if num_layers_override is not None:
         return num_layers_override
+
+    # Try AutoConfig first (works for most models)
     try:
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         return config.num_hidden_layers
-    except Exception as e:
-        logger.error(
-            f"Could not auto-detect num_layers: {e}. "
-            f"Please specify --num-layers."
-        )
-        sys.exit(1)
+    except Exception:
+        pass
+
+    # Fallback: load raw config.json directly (handles models like DeepSeek-V3.2
+    # whose model_type isn't registered in transformers yet)
+    try:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(model_path, "config.json")
+        with open(config_path) as f:
+            raw_config = json.load(f)
+        num_layers = raw_config.get("num_hidden_layers")
+        if num_layers is not None:
+            logger.info(
+                f"Auto-detected num_layers={num_layers} from raw config.json"
+            )
+            return num_layers
+    except Exception:
+        pass
+
+    # Fallback: try local path
+    try:
+        local_config = Path(model_path) / "config.json"
+        if local_config.exists():
+            with open(local_config) as f:
+                raw_config = json.load(f)
+            num_layers = raw_config.get("num_hidden_layers")
+            if num_layers is not None:
+                logger.info(
+                    f"Auto-detected num_layers={num_layers} from local config.json"
+                )
+                return num_layers
+    except Exception:
+        pass
+
+    logger.error(
+        f"Could not auto-detect num_layers for {model_path}. "
+        f"Please specify --num-layers."
+    )
+    sys.exit(1)
 
 
 def generate_uniform_config(
@@ -504,8 +540,8 @@ Examples:
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=128,
-        help="Number of calibration samples (default: 128)",
+        default=512,
+        help="Number of calibration samples (default: 512, recommend 1024 for production configs)",
     )
     parser.add_argument(
         "--calibration-seq-len",
