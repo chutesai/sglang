@@ -53,6 +53,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.nsa.index_cache import IndexCacheConfig
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -176,6 +177,41 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Singleton IndexCacheConfig, created once per process
+_index_cache_config_instance: Optional[IndexCacheConfig] = None
+_index_cache_config_initialized: bool = False
+
+
+def _get_index_cache_config(model_config) -> Optional[IndexCacheConfig]:
+    """Get or create the IndexCacheConfig singleton."""
+    global _index_cache_config_instance, _index_cache_config_initialized
+    if _index_cache_config_initialized:
+        return _index_cache_config_instance
+
+    server_args = get_global_server_args()
+    config_path = server_args.index_cache_config
+    ratio = server_args.index_cache_ratio
+
+    # Fall back to env var if CLI arg not set
+    if ratio is None:
+        env_ratio = envs.SGLANG_INDEX_CACHE_RATIO.get()
+        if env_ratio is not None:
+            ratio = env_ratio
+
+    if config_path is None and ratio is None:
+        _index_cache_config_initialized = True
+        _index_cache_config_instance = None
+        return None
+
+    num_layers = model_config.num_hidden_layers
+    _index_cache_config_instance = IndexCacheConfig(
+        num_layers=num_layers,
+        config_path=config_path,
+        ratio=ratio,
+    )
+    _index_cache_config_initialized = True
+    return _index_cache_config_instance
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1141,6 +1177,20 @@ class DeepseekV2AttentionMLA(
             )
 
         if self.use_nsa:
+            # IndexCache: determine if this layer should skip the indexer
+            index_cache_cfg = _get_index_cache_config(config)
+            self.index_cache_enabled = index_cache_cfg is not None
+            self.index_cache_is_shared = (
+                index_cache_cfg is not None
+                and index_cache_cfg.is_shared_layer(layer_id)
+            )
+            # Only capture on TP rank 0 to avoid duplicate writes
+            _capture_dir = get_global_server_args().index_cache_capture_dir
+            if _capture_dir and get_attention_tp_rank() == 0:
+                self.index_cache_capture_dir = _capture_dir
+            else:
+                self.index_cache_capture_dir = None
+
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
