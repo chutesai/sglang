@@ -35,17 +35,23 @@ def _capture_topk_indices(
     capture_dir: str,
     layer_id: int,
     topk_indices: torch.Tensor,
+    subsample_stride: int = 16,
 ):
     """Save topk_indices to disk for IndexCache calibration.
 
     Writes to {capture_dir}/layer_{layer_id}/pass_{pass_id}.pt
     Only called when index_cache_capture_dir is set on the attention layer.
+
+    Subsamples every `subsample_stride`-th token to reduce disk usage (~16x).
+    topk_indices are int32 (KV block indices); values can exceed int16 range
+    at long context, so we keep int32.
     """
     layer_dir = os.path.join(capture_dir, f"layer_{layer_id}")
     os.makedirs(layer_dir, exist_ok=True)
     global _index_cache_capture_pass_id
     path = os.path.join(layer_dir, f"pass_{_index_cache_capture_pass_id}.pt")
-    torch.save(topk_indices.cpu(), path)
+    sampled = topk_indices[::subsample_stride].cpu()
+    torch.save(sampled, path)
 
 
 def _increment_capture_pass_id():
