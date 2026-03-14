@@ -101,8 +101,8 @@ CALIBRATION_DATASETS = {
     # Very long context (100K+)
     "infinitebench": {
         "hf_path": "xinrongzhang2022/InfiniteBench",
-        "hf_name": "longbook_qa_eng",
-        "split": "test",
+        "hf_name": None,
+        "split": "longbook_qa_eng",
         "text_column": "context",
         "max_doc_tokens": 200000,
         "domain": "books",
@@ -382,7 +382,10 @@ def greedy_layer_assignment(
     its nearest remaining Full layer).
     """
     full_layers = set(range(num_layers))
-    candidates = set(range(1, num_layers))  # Layer 0 always Full
+    # Layer 0 (NextN/dense) and layer 1 (first DSA layer) are always Full.
+    # Matches THUDM reference: layer 0 is dense attention (not DSA), so its
+    # indices are meaningless for DSA layers. Layer 1 must compute its own.
+    candidates = set(range(2, num_layers))
 
     layers_to_remove = len(full_layers) - target_num_full
     removed = 0
@@ -617,7 +620,7 @@ def generate_uniform_config(
 ):
     """Generate a uniform-spacing IndexCache config."""
     step = max(1, int(round(1.0 / target_ratio)))
-    full_layers = sorted(set(range(0, num_layers, step)))
+    full_layers = sorted(set(range(0, num_layers, step)) | {0, 1})
 
     config = {
         "full_layers": full_layers,
