@@ -63,11 +63,11 @@ CALIBRATION_DATASETS = {
         "domain": "web",
     },
     # Code (public, no auth needed)
-    "the_stack": {
-        "hf_path": "bigcode/the-stack-smol",
-        "hf_name": "data/python",
+    "code_python": {
+        "hf_path": "codeparrot/github-code",
+        "hf_name": "Python-all",
         "split": "train",
-        "text_column": "content",
+        "text_column": "code",
         "max_doc_tokens": 32768,
         "domain": "code",
     },
@@ -80,13 +80,13 @@ CALIBRATION_DATASETS = {
         "max_doc_tokens": 200000,
         "domain": "books",
     },
-    # Academic/mixed (long docs available)
-    "pile": {
-        "hf_path": "monology/pile-uncopyrighted",
+    # Academic/mixed (long docs)
+    "long_data": {
+        "hf_path": "emozilla/Long-Data-Collections-Fine-Tune",
         "hf_name": None,
         "split": "train",
         "text_column": "text",
-        "max_doc_tokens": 16384,
+        "max_doc_tokens": 65536,
         "domain": "academic",
     },
     # Long-context QA
@@ -124,11 +124,11 @@ LENGTH_STRATA = [
 # Which datasets to use for each length stratum.
 # Short strata can use any dataset; long strata need datasets with long docs.
 LENGTH_DATASET_MAP = {
-    (1024, 4096): ["slimpajama", "c4", "the_stack", "pile"],
-    (4096, 16384): ["slimpajama", "the_stack", "pile", "longbench"],
-    (16384, 32768): ["the_stack", "pile", "longbench", "pg19"],
-    (32768, 65536): ["pg19", "infinitebench"],
-    (65536, 120000): ["pg19", "infinitebench"],
+    (1024, 4096): ["slimpajama", "c4", "code_python", "long_data"],
+    (4096, 16384): ["slimpajama", "code_python", "long_data", "longbench"],
+    (16384, 32768): ["code_python", "long_data", "longbench", "pg19"],
+    (32768, 65536): ["pg19", "long_data", "infinitebench"],
+    (65536, 120000): ["pg19", "long_data", "infinitebench"],
 }
 
 

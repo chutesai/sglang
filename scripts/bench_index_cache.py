@@ -48,9 +48,11 @@ Usage:
     python scripts/bench_index_cache.py \
         --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
         --index-cache-ratio 0.25 --chat-model \
-        --preset chat-quality          # gsm8k + gpqa_diamond_cot_zeroshot + ifeval
-        --preset chat-long-context     # RULER NIAH tasks
-        --preset chat-full             # all of the above
+        --preset chat-quality             # gsm8k + gpqa + ifeval
+        --preset chat-long-context        # RULER (NIAH variants, up to 128K)
+        --preset chat-long-context-64k    # BABILong reasoning at 64K
+        --preset chat-longbench2          # LongBench v2 (real-world MC, 8K-2M)
+        --preset chat-full                # quality + RULER
 
 Requirements:
     pip install lm-eval
@@ -89,19 +91,39 @@ TASK_PRESETS = {
         "ifeval",
     ],
     "chat-long-context": [
-        "niah_single_1",
-        "niah_single_2",
-        "niah_single_3",
-        "niah_multikey_1",
+        # RULER: synthetic NIAH variants, configurable lengths up to 128K
+        "ruler",
+    ],
+    "chat-long-context-32k": [
+        # BABILong: reasoning-in-haystack at 32K
+        "babilong_qa1_32k",
+        "babilong_qa2_32k",
+        "babilong_qa3_32k",
+        "babilong_qa5_32k",
+    ],
+    "chat-long-context-64k": [
+        # BABILong: reasoning-in-haystack at 64K
+        "babilong_qa1_64k",
+        "babilong_qa2_64k",
+        "babilong_qa3_64k",
+        "babilong_qa5_64k",
+    ],
+    "chat-long-context-128k": [
+        # BABILong: reasoning-in-haystack at 128K
+        "babilong_qa1_128k",
+        "babilong_qa2_128k",
+        "babilong_qa3_128k",
+        "babilong_qa5_128k",
+    ],
+    "chat-longbench2": [
+        # LongBench v2: 503 MC questions, 8K-2M context (real-world tasks)
+        "longbench2",
     ],
     "chat-full": [
         "gsm8k",
         "gpqa_diamond_cot_zeroshot",
         "ifeval",
-        "niah_single_1",
-        "niah_single_2",
-        "niah_single_3",
-        "niah_multikey_1",
+        "ruler",
     ],
     # Base model presets (loglikelihood — require local-completions)
     "base-quality": [
