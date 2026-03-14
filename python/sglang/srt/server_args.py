@@ -660,7 +660,6 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "round-robin-split"
     index_cache_config: Optional[str] = None
     index_cache_ratio: Optional[float] = None
-    index_cache_capture_dir: Optional[str] = None
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -5229,12 +5228,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.index_cache_ratio,
             help="Fraction of layers to keep as Full indexer layers (e.g. 0.25 = 25%% Full, 75%% Shared). Uniform spacing. Overridden by --index-cache-config if both provided.",
-        )
-        parser.add_argument(
-            "--index-cache-capture-dir",
-            type=str,
-            default=ServerArgs.index_cache_capture_dir,
-            help="Directory to capture per-layer topk_indices during inference (for IndexCache calibration). Each layer writes indices as .pt files.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

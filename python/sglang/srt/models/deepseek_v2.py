@@ -1184,12 +1184,6 @@ class DeepseekV2AttentionMLA(
                 index_cache_cfg is not None
                 and index_cache_cfg.is_shared_layer(layer_id)
             )
-            # Only capture on TP rank 0 to avoid duplicate writes
-            _capture_dir = get_global_server_args().index_cache_capture_dir
-            if _capture_dir and get_attention_tp_rank() == 0:
-                self.index_cache_capture_dir = _capture_dir
-            else:
-                self.index_cache_capture_dir = None
 
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(

@@ -722,6 +722,17 @@ class Engine(EngineBase):
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    def update_index_cache(self, shared_layers: List[int]):
+        """Toggle IndexCache layers between Full/Shared at runtime.
+
+        Args:
+            shared_layers: List of layer IDs that should be Shared (reuse indices).
+                           All other IndexCache-capable layers become Full.
+        """
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_index_cache(shared_layers)
+        )
+
     def open_session(
         self,
         capacity_of_str_len: int,

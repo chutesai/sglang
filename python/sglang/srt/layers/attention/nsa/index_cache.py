@@ -34,23 +34,28 @@ class IndexCacheConfig:
                 data = json.load(f)
             self.full_layers = set(data["full_layers"])
         elif ratio is not None and ratio < 1.0:
-            # Uniform spacing: keep every 1/ratio layers as Full
+            # Uniform spacing matching THUDM reference formula:
+            # skip_topk = (max(layer_id-1, 0) % freq != 0)
+            # This keeps layers 0, 1 always Full, then every freq-th layer
+            # starting from layer 1: {0, 1, 1+freq, 1+2*freq, ...}
             step = max(1, int(round(1.0 / ratio)))
-            self.full_layers = set(range(0, num_layers, step))
+            self.full_layers = {0, 1} | set(range(1, num_layers, step))
         else:
             # All layers are Full = IndexCache disabled
             self.full_layers = set(range(num_layers))
 
-        # Layer 0 must always be Full — shared layers reuse indices from
-        # preceding Full layers, so there must be a Full layer before any
-        # Shared layer. Without layer 0 as Full, the first Shared layers
-        # would read uninitialized indices and crash.
-        if 0 not in self.full_layers:
-            logger.warning(
-                "IndexCache: layer 0 was not marked as Full. "
-                "Forcing layer 0 to Full (required for correctness)."
-            )
-            self.full_layers.add(0)
+        # Layers 0 and 1 must always be Full.
+        # Layer 0: NextN/dense attention, has no preceding Full layer to
+        # reuse from. Layer 1: first DSA layer, must run its own indexer
+        # to establish the initial index K cache (reference enforces this
+        # via max(layer_id-1, 0) which makes both 0 and 1 always Full).
+        for protected_layer in (0, 1):
+            if protected_layer < num_layers and protected_layer not in self.full_layers:
+                logger.warning(
+                    f"IndexCache: layer {protected_layer} was not marked as Full. "
+                    f"Forcing to Full (required for correctness)."
+                )
+                self.full_layers.add(protected_layer)
 
         self.shared_layers = set(range(num_layers)) - self.full_layers
         # Map each shared layer to its nearest preceding full layer

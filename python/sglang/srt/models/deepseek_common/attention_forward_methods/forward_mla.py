@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -26,39 +25,6 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
-
-# IndexCache capture: global forward pass counter for unique filenames
-_index_cache_capture_pass_id = 0
-
-
-def _capture_topk_indices(
-    capture_dir: str,
-    layer_id: int,
-    topk_indices: torch.Tensor,
-    subsample_stride: int = 16,
-):
-    """Save topk_indices to disk for IndexCache calibration.
-
-    Writes to {capture_dir}/layer_{layer_id}/pass_{pass_id}.pt
-    Only called when index_cache_capture_dir is set on the attention layer.
-
-    Subsamples every `subsample_stride`-th token to reduce disk usage (~16x).
-    topk_indices are int32 (KV block indices); values can exceed int16 range
-    at long context, so we keep int32.
-    """
-    layer_dir = os.path.join(capture_dir, f"layer_{layer_id}")
-    os.makedirs(layer_dir, exist_ok=True)
-    global _index_cache_capture_pass_id
-    path = os.path.join(layer_dir, f"pass_{_index_cache_capture_pass_id}.pt")
-    sampled = topk_indices[::subsample_stride].cpu()
-    torch.save(sampled, path)
-
-
-def _increment_capture_pass_id():
-    """Increment the global capture pass counter. Called once per forward pass."""
-    global _index_cache_capture_pass_id
-    _index_cache_capture_pass_id += 1
-
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -126,14 +92,6 @@ class DeepseekMLAForwardMixin:
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-        # IndexCache capture: increment pass counter on layer 0
-        if (
-            self.use_nsa
-            and getattr(self, "index_cache_capture_dir", None)
-            and self.layer_id == 0
-        ):
-            _increment_capture_pass_id()
 
         q_lora = None
         topk_indices = None
@@ -235,12 +193,6 @@ class DeepseekMLAForwardMixin:
                     )
                     if self.index_cache_enabled:
                         forward_batch.index_cache_topk_indices = topk_indices
-                    if self.index_cache_capture_dir and topk_indices is not None:
-                        _capture_topk_indices(
-                            self.index_cache_capture_dir,
-                            self.layer_id,
-                            topk_indices,
-                        )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -258,12 +210,6 @@ class DeepseekMLAForwardMixin:
                         )
                         if self.index_cache_enabled:
                             forward_batch.index_cache_topk_indices = topk_indices
-                        if self.index_cache_capture_dir and topk_indices is not None:
-                            _capture_topk_indices(
-                                self.index_cache_capture_dir,
-                                self.layer_id,
-                                topk_indices,
-                            )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim

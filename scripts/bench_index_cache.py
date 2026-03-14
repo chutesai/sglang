@@ -49,10 +49,11 @@ Usage:
         --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
         --index-cache-ratio 0.25 --chat-model \
         --preset chat-quality             # gsm8k + gpqa + ifeval
-        --preset chat-long-context        # RULER (NIAH variants, up to 128K)
-        --preset chat-long-context-64k    # BABILong reasoning at 64K
-        --preset chat-longbench2          # LongBench v2 (real-world MC, 8K-2M)
-        --preset chat-full                # quality + RULER
+        --preset chat-long-context        # ruler + babilong + longbench2
+        --preset chat-long-context-ruler  # RULER only
+        --preset chat-long-context-babilong  # BABILong only
+        --preset chat-long-context-longbench2  # LongBench v2 only
+        --preset chat-full                # quality + long-context
 
 Requirements:
     pip install lm-eval
@@ -91,32 +92,23 @@ TASK_PRESETS = {
         "ifeval",
     ],
     "chat-long-context": [
-        # RULER: synthetic NIAH variants, configurable lengths up to 128K
+        # RULER: synthetic NIAH variants, default 4K context.
+        # For longer contexts pass --lm-eval-extra-args with:
+        #   --metadata='{"max_seq_lengths":[4096,8192,16384,32768,65536,131072]}'
+        "ruler",
+        # BABILong: reasoning-in-haystack (qa1-qa5, default context from dataset)
+        "babilong_longctx",
+        # LongBench v2: 503 MC questions, 8K-2M context (real-world tasks)
+        "longbench2",
+    ],
+    "chat-long-context-ruler": [
         "ruler",
     ],
-    "chat-long-context-32k": [
-        # BABILong: reasoning-in-haystack at 32K
-        "babilong_qa1_32k",
-        "babilong_qa2_32k",
-        "babilong_qa3_32k",
-        "babilong_qa5_32k",
+    "chat-long-context-babilong": [
+        # BABILong long-context group (qa1-qa5)
+        "babilong_longctx",
     ],
-    "chat-long-context-64k": [
-        # BABILong: reasoning-in-haystack at 64K
-        "babilong_qa1_64k",
-        "babilong_qa2_64k",
-        "babilong_qa3_64k",
-        "babilong_qa5_64k",
-    ],
-    "chat-long-context-128k": [
-        # BABILong: reasoning-in-haystack at 128K
-        "babilong_qa1_128k",
-        "babilong_qa2_128k",
-        "babilong_qa3_128k",
-        "babilong_qa5_128k",
-    ],
-    "chat-longbench2": [
-        # LongBench v2: 503 MC questions, 8K-2M context (real-world tasks)
+    "chat-long-context-longbench2": [
         "longbench2",
     ],
     "chat-full": [
@@ -124,6 +116,8 @@ TASK_PRESETS = {
         "gpqa_diamond_cot_zeroshot",
         "ifeval",
         "ruler",
+        "babilong_longctx",
+        "longbench2",
     ],
     # Base model presets (loglikelihood — require local-completions)
     "base-quality": [
@@ -239,6 +233,7 @@ def run_lm_eval(
     limit: Optional[int] = None,
     num_concurrent: int = 24,
     gen_kwargs: Optional[str] = None,
+    metadata: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run lm-eval harness against a running server.
 
@@ -297,6 +292,10 @@ def run_lm_eval(
         kwargs["gen_kwargs"] = gen_kwargs
     if limit is not None:
         kwargs["limit"] = limit
+    if metadata is not None:
+        import json as _json
+
+        kwargs["metadata"] = _json.loads(metadata)
 
     logger.info(
         f"Running lm-eval: model_type={model_type}, tasks={tasks}, "
@@ -400,6 +399,7 @@ def run_benchmark_config(
     lm_eval_limit: Optional[int],
     lm_eval_num_fewshot: int,
     lm_eval_gen_kwargs: Optional[str],
+    lm_eval_metadata: Optional[str],
     chat_model: bool,
     run_latency: bool,
     input_lens: List[int],
@@ -447,6 +447,7 @@ def run_benchmark_config(
                 num_fewshot=lm_eval_num_fewshot,
                 limit=lm_eval_limit,
                 gen_kwargs=lm_eval_gen_kwargs,
+                metadata=lm_eval_metadata,
             )
 
         # Latency benchmark via bench_serving
@@ -534,11 +535,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Task presets (use with --preset):
-  chat-quality       gsm8k, gpqa_diamond_cot_zeroshot, ifeval
-  chat-long-context  RULER NIAH tasks (niah_single_1/2/3, niah_multikey_1)
-  chat-full          all of the above
-  base-quality       mmlu, hellaswag, arc_challenge, winogrande, truthfulqa_mc2
-  base-full          base-quality + gsm8k
+  chat-quality              gsm8k, gpqa_diamond_cot_zeroshot, ifeval
+  chat-long-context         ruler, babilong_longctx, longbench2
+  chat-long-context-ruler   ruler only
+  chat-long-context-babilong  babilong_longctx only
+  chat-long-context-longbench2  longbench2 only
+  chat-full                 quality + long-context
+  base-quality              mmlu, hellaswag, arc_challenge, winogrande, truthfulqa_mc2
+  base-full                 base-quality + gsm8k
 
 Examples:
   # GPQA Diamond zero-shot (chat model)
@@ -558,13 +562,9 @@ Examples:
     )
 
     # Model / server args
-    parser.add_argument(
-        "--model", type=str, required=True, help="Model path or HF ID"
-    )
+    parser.add_argument("--model", type=str, required=True, help="Model path or HF ID")
     parser.add_argument("--tp", type=int, default=8, help="Tensor parallel size")
-    parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help="Server port"
-    )
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Server port")
     parser.add_argument(
         "--extra-server-args",
         type=str,
@@ -642,6 +642,14 @@ Examples:
         "For --chat-model, defaults to max_gen_toks=65536,temperature=1.0,top_p=0.95 "
         "if not specified (required for CoT tasks).",
     )
+    parser.add_argument(
+        "--lm-eval-metadata",
+        type=str,
+        default=None,
+        help="JSON metadata string for lm-eval tasks. "
+        "For RULER long-context: "
+        """'{"max_seq_lengths":[4096,8192,16384,32768,65536,131072]}'""",
+    )
 
     # Latency benchmark args
     parser.add_argument(
@@ -693,7 +701,9 @@ Examples:
         lm_eval_tasks = args.lm_eval_tasks
     else:
         # Default based on model type
-        lm_eval_tasks = ["gsm8k", "gpqa_diamond_cot_zeroshot"] if args.chat_model else ["gsm8k"]
+        lm_eval_tasks = (
+            ["gsm8k", "gpqa_diamond_cot_zeroshot"] if args.chat_model else ["gsm8k"]
+        )
 
     base_url = f"http://127.0.0.1:{args.port}"
     extra_server_args = args.extra_server_args.split() if args.extra_server_args else []
@@ -722,6 +732,7 @@ Examples:
             lm_eval_limit=args.lm_eval_limit,
             lm_eval_num_fewshot=args.lm_eval_num_fewshot,
             lm_eval_gen_kwargs=args.gen_kwargs,
+            lm_eval_metadata=args.lm_eval_metadata,
             chat_model=args.chat_model,
             run_latency=args.run_latency,
             input_lens=args.input_lens,
@@ -747,6 +758,7 @@ Examples:
         lm_eval_limit=args.lm_eval_limit,
         lm_eval_num_fewshot=args.lm_eval_num_fewshot,
         lm_eval_gen_kwargs=args.gen_kwargs,
+        lm_eval_metadata=args.lm_eval_metadata,
         chat_model=args.chat_model,
         run_latency=args.run_latency,
         input_lens=args.input_lens,

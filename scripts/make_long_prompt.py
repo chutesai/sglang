@@ -1,6 +1,7 @@
 """Generate a long-context JSON request file using a real book from PG-19."""
 
 import json
+
 from datasets import load_dataset
 
 ds = load_dataset("deepmind/pg19", split="test", streaming=True)
@@ -33,4 +34,6 @@ with open("long_prompt_65k.json", "w") as f:
 
 print(f"Context length: ~{len(context)//4} tokens ({len(context)} chars)")
 print(f"Saved to long_prompt_65k.json")
-print(f"Test with: curl -X POST http://localhost:30000/v1/chat/completions -H 'Content-Type: application/json' -d @long_prompt_65k.json")
+print(
+    f"Test with: curl -X POST http://localhost:30000/v1/chat/completions -H 'Content-Type: application/json' -d @long_prompt_65k.json"
+)
