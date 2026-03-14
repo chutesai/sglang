@@ -62,10 +62,10 @@ CALIBRATION_DATASETS = {
         "max_doc_tokens": 4096,
         "domain": "web",
     },
-    # Code
-    "starcoderdata": {
-        "hf_path": "bigcode/starcoderdata",
-        "hf_name": "python",
+    # Code (public, no auth needed)
+    "the_stack": {
+        "hf_path": "bigcode/the-stack-smol",
+        "hf_name": "data/python",
         "split": "train",
         "text_column": "content",
         "max_doc_tokens": 32768,
@@ -80,23 +80,14 @@ CALIBRATION_DATASETS = {
         "max_doc_tokens": 200000,
         "domain": "books",
     },
-    # Academic papers
+    # Academic/mixed (long docs available)
     "pile": {
         "hf_path": "monology/pile-uncopyrighted",
         "hf_name": None,
-        "split": "validation",
+        "split": "train",
         "text_column": "text",
         "max_doc_tokens": 16384,
         "domain": "academic",
-    },
-    # Wiki
-    "wikitext": {
-        "hf_path": "wikitext",
-        "hf_name": "wikitext-103-raw-v1",
-        "split": "test",
-        "text_column": "text",
-        "max_doc_tokens": 4096,
-        "domain": "wiki",
     },
     # Long-context QA
     "longbench": {
@@ -133,9 +124,9 @@ LENGTH_STRATA = [
 # Which datasets to use for each length stratum.
 # Short strata can use any dataset; long strata need datasets with long docs.
 LENGTH_DATASET_MAP = {
-    (1024, 4096): ["slimpajama", "c4", "wikitext", "starcoderdata", "pile"],
-    (4096, 16384): ["slimpajama", "starcoderdata", "pile", "longbench"],
-    (16384, 32768): ["starcoderdata", "pile", "longbench", "pg19"],
+    (1024, 4096): ["slimpajama", "c4", "the_stack", "pile"],
+    (4096, 16384): ["slimpajama", "the_stack", "pile", "longbench"],
+    (16384, 32768): ["the_stack", "pile", "longbench", "pg19"],
     (32768, 65536): ["pg19", "infinitebench"],
     (65536, 120000): ["pg19", "infinitebench"],
 }
@@ -152,6 +143,7 @@ def _load_single_dataset(ds_name: str):
             cfg["hf_name"],
             split=cfg["split"],
             streaming=True,
+            trust_remote_code=True,
         )
         return ds, cfg["text_column"]
     else:
