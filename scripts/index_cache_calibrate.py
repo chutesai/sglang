@@ -62,14 +62,6 @@ CALIBRATION_DATASETS = {
         "max_doc_tokens": 4096,
         "domain": "web",
     },
-    "redpajama": {
-        "hf_path": "togethercomputer/RedPajama-Data-1T-Sample",
-        "hf_name": None,
-        "split": "train",
-        "text_column": "text",
-        "max_doc_tokens": 8192,
-        "domain": "web",
-    },
     # Code
     "starcoderdata": {
         "hf_path": "bigcode/starcoderdata",
@@ -141,8 +133,8 @@ LENGTH_STRATA = [
 # Which datasets to use for each length stratum.
 # Short strata can use any dataset; long strata need datasets with long docs.
 LENGTH_DATASET_MAP = {
-    (1024, 4096): ["slimpajama", "c4", "redpajama", "wikitext", "starcoderdata", "pile"],
-    (4096, 16384): ["slimpajama", "redpajama", "starcoderdata", "pile", "longbench"],
+    (1024, 4096): ["slimpajama", "c4", "wikitext", "starcoderdata", "pile"],
+    (4096, 16384): ["slimpajama", "starcoderdata", "pile", "longbench"],
     (16384, 32768): ["starcoderdata", "pile", "longbench", "pg19"],
     (32768, 65536): ["pg19", "infinitebench"],
     (65536, 120000): ["pg19", "infinitebench"],
@@ -233,6 +225,12 @@ def load_stratified_calibration_prompts(
     all_prompts = []
     rng = random.Random(42)
 
+    try:
+        from tqdm import tqdm
+        has_tqdm = True
+    except ImportError:
+        has_tqdm = False
+
     for min_tok, max_tok, fraction in length_strata:
         target_count = max(1, int(num_samples * fraction))
         datasets_for_stratum = LENGTH_DATASET_MAP.get(
@@ -260,10 +258,18 @@ def load_stratified_calibration_prompts(
                 continue
 
             ds_count = 0
+            skipped = 0
             # Target the middle of the stratum range for this dataset
             target_len = (min_tok + max_tok) // 2
 
-            for item in ds:
+            ds_iter = ds
+            if has_tqdm:
+                ds_iter = tqdm(
+                    ds, desc=f"  {ds_name}", leave=False,
+                    unit="doc",
+                )
+
+            for item in ds_iter:
                 if ds_count >= per_dataset:
                     break
                 if len(stratum_prompts) >= target_count:
@@ -276,6 +282,9 @@ def load_stratified_calibration_prompts(
                 # Check document is long enough for this stratum
                 approx_tokens = len(text) // 4
                 if approx_tokens < min_tok:
+                    skipped += 1
+                    if has_tqdm and hasattr(ds_iter, 'set_postfix'):
+                        ds_iter.set_postfix(found=ds_count, skipped=skipped)
                     continue
 
                 # Sample a random length within the stratum range
@@ -383,6 +392,8 @@ def greedy_layer_assignment(
     full_layers = set(range(num_layers))
     candidates = set(range(1, num_layers))  # Layer 0 always Full
 
+    layers_to_remove = len(full_layers) - target_num_full
+    removed = 0
     while len(full_layers) > target_num_full and candidates:
         best_layer = None
         best_similarity = -1.0
@@ -413,8 +424,9 @@ def greedy_layer_assignment(
 
         full_layers.remove(best_layer)
         candidates.remove(best_layer)
+        removed += 1
         logger.info(
-            f"Converted layer {best_layer} to Shared "
+            f"[{removed}/{layers_to_remove}] Converted layer {best_layer} to Shared "
             f"(similarity={best_similarity:.4f}, "
             f"remaining Full={len(full_layers)})"
         )
@@ -475,16 +487,40 @@ def collect_indices(
         # Send prompts in batches to prevent OOM on long sequences.
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
         total = len(calibration_prompts)
+        num_batches = (total + batch_size - 1) // batch_size
         logger.info(
-            f"Running {total} calibration prompts in batches of {batch_size} "
-            f"(max_new_tokens={max_new_tokens})..."
+            f"Running {total} calibration prompts in {num_batches} batches "
+            f"(batch_size={batch_size}, max_new_tokens={max_new_tokens})..."
         )
-        for i in range(0, total, batch_size):
+
+        try:
+            from tqdm import tqdm
+            batch_iter = tqdm(
+                range(0, total, batch_size),
+                desc="Calibration",
+                total=num_batches,
+                unit="batch",
+            )
+        except ImportError:
+            batch_iter = range(0, total, batch_size)
+
+        for i in batch_iter:
             batch = calibration_prompts[i : i + batch_size]
+            # Log approximate token count for this batch
+            batch_chars = sum(len(p) for p in batch)
+            approx_tokens = batch_chars // 4
+            if not isinstance(batch_iter, range):
+                batch_iter.set_postfix(
+                    prompts=f"{min(i + batch_size, total)}/{total}",
+                    approx_tok=f"~{approx_tokens:,}",
+                )
+            else:
+                done = min(i + batch_size, total)
+                logger.info(
+                    f"  Batch {i // batch_size + 1}/{num_batches}: "
+                    f"{done}/{total} prompts (~{approx_tokens:,} tokens)"
+                )
             engine.generate(batch, sampling_params)
-            done = min(i + batch_size, total)
-            if done % 100 == 0 or done == total:
-                logger.info(f"  Progress: {done}/{total} prompts")
         logger.info("Inference complete. Reading captured indices...")
     finally:
         engine.shutdown()
@@ -653,15 +689,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Production calibration (20K prompts, all domains, 2K-120K tokens):
+  # Production calibration (2K prompts, all domains, 2K-120K tokens):
   python scripts/index_cache_calibrate.py \\
       --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 \\
       --stratified -o config.json
 
-  # Faster calibration (fewer samples, still stratified):
+  # Thorough calibration (more samples):
   python scripts/index_cache_calibrate.py \\
       --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 \\
-      --stratified --calibration-samples 2000 -o config.json
+      --stratified --calibration-samples 5000 -o config.json
 
   # Single-dataset calibration at specific length:
   python scripts/index_cache_calibrate.py \\
@@ -738,7 +774,7 @@ Examples:
         type=int,
         default=None,
         help="Number of calibration samples. "
-        "Default: 20000 for --stratified, 512 for single-dataset.",
+        "Default: 2000 for --stratified, 512 for single-dataset.",
     )
     parser.add_argument(
         "--calibration-seq-len",
@@ -780,7 +816,7 @@ Examples:
     if args.calibration_samples is not None:
         num_samples = args.calibration_samples
     elif args.stratified:
-        num_samples = 20000
+        num_samples = 2000
     else:
         num_samples = 512
 
@@ -822,6 +858,8 @@ Examples:
         model_path=args.model,
         tp_size=args.tp,
         calibration_prompts=calibration_prompts,
+        batch_size=args.batch_size,
+        mem_fraction_static=args.mem_fraction_static,
     )
 
     full_layers = greedy_layer_assignment(layer_indices, num_layers, target_num_full)
