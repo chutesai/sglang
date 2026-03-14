@@ -304,6 +304,7 @@ def _measure_loss(
             prompt,
             sampling_params,
             return_logprob=True,
+            logprob_start_len=0,  # Return logprobs for all input tokens
             top_logprobs_num=0,
         )
         if isinstance(outputs, list):
@@ -312,15 +313,18 @@ def _measure_loss(
             output = outputs
 
         # Extract input token log probs (prefill)
+        # Format: list of (logprob, token_id, token_text) tuples
         meta = output.get("meta_info", {})
         input_token_logprobs = meta.get("input_token_logprobs", None)
 
         if input_token_logprobs is not None and len(input_token_logprobs) > 0:
-            # input_token_logprobs is list of log-probs for each input token
-            logprobs = [lp for lp in input_token_logprobs if lp is not None]
-            if logprobs:
-                total_nll -= sum(logprobs)
-                total_tokens += len(logprobs)
+            for entry in input_token_logprobs:
+                if entry is not None:
+                    # Each entry is (logprob, token_id, token_text)
+                    lp = entry[0] if isinstance(entry, (list, tuple)) else entry
+                    if lp is not None:
+                        total_nll -= lp
+                        total_tokens += 1
 
     if total_tokens == 0:
         logger.warning("No log-probs returned. Is return_logprob supported?")
