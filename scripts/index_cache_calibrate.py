@@ -30,6 +30,7 @@ longer sequences to ensure IndexCache correctness at long context.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import random
@@ -192,26 +193,62 @@ def load_calibration_prompts(
     return prompts
 
 
+def _cache_key(num_samples: int, length_strata: List, tokenizer_name: Optional[str]) -> str:
+    """Compute a deterministic hash for the calibration config."""
+    key_data = json.dumps({
+        "num_samples": num_samples,
+        "length_strata": length_strata,
+        "datasets": {k: v["hf_path"] for k, v in CALIBRATION_DATASETS.items()},
+        "length_dataset_map": {str(k): v for k, v in LENGTH_DATASET_MAP.items()},
+        "tokenizer": tokenizer_name or "char_approx",
+    }, sort_keys=True)
+    return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+
+def _cache_path(cache_key: str) -> Path:
+    """Return the cache file path for a given key."""
+    cache_dir = Path.home() / ".cache" / "index_cache_calibration"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"prompts_{cache_key}.jsonl"
+
+
 def load_stratified_calibration_prompts(
     num_samples: int = 20000,
     tokenizer_name: Optional[str] = None,
     length_strata: Optional[List] = None,
+    no_cache: bool = False,
 ) -> List[str]:
     """Load calibration prompts stratified across datasets and sequence lengths.
 
     Samples from multiple domains (code, books, web, academic, QA) at multiple
     sequence lengths (2K-120K), biased toward longer sequences.
 
+    Results are cached to a JSONL file keyed on (num_samples, strata, datasets,
+    tokenizer). Re-run with --no-cache to force regeneration.
+
     Args:
         num_samples: Total number of calibration prompts to collect.
         tokenizer_name: Tokenizer for accurate length measurement.
         length_strata: Override default LENGTH_STRATA.
+        no_cache: If True, skip loading from cache and regenerate.
 
     Returns:
         List of prompts covering diverse domains and lengths.
     """
     if length_strata is None:
         length_strata = LENGTH_STRATA
+
+    # Check cache
+    key = _cache_key(num_samples, length_strata, tokenizer_name)
+    cached = _cache_path(key)
+    if not no_cache and cached.exists():
+        logger.info(f"Loading cached calibration prompts from {cached}")
+        all_prompts = []
+        with open(cached) as f:
+            for line in f:
+                all_prompts.append(json.loads(line))
+        logger.info(f"Loaded {len(all_prompts)} cached prompts (cache key: {key})")
+        return all_prompts
 
     tokenizer = _get_tokenizer(tokenizer_name)
     all_prompts = []
@@ -294,8 +331,9 @@ def load_stratified_calibration_prompts(
             f"{len(stratum_prompts)}/{target_count} prompts collected"
         )
 
-    # Shuffle so strata are interleaved during inference
-    rng.shuffle(all_prompts)
+    # Sort by length (shortest first) so short prompts finish fast
+    # and tqdm ETA is more accurate as it processes longer ones later.
+    all_prompts.sort(key=lambda p: len(p))
 
     # Log distribution summary
     if tokenizer:
@@ -308,6 +346,13 @@ def load_stratified_calibration_prompts(
         f"min={min(lengths)}, median={sorted(lengths)[len(lengths)//2]}, "
         f"max={max(lengths)} tokens"
     )
+
+    # Cache to disk for reuse
+    with open(cached, "w") as f:
+        for prompt in all_prompts:
+            f.write(json.dumps(prompt) + "\n")
+    logger.info(f"Cached calibration prompts to {cached} (key: {key})")
+
     return all_prompts
 
 
@@ -479,41 +524,60 @@ def collect_indices(
     )
 
     try:
-        # Send prompts in batches to prevent OOM on long sequences.
+        # Send prompts in adaptive batches based on token budget.
+        # Short prompts get large batches; long prompts get small batches.
+        MAX_BATCH_TOKENS = 131072  # ~128K tokens per batch
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
         total = len(calibration_prompts)
-        num_batches = (total + batch_size - 1) // batch_size
+
+        # Build adaptive batches by token budget
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        for prompt in calibration_prompts:
+            prompt_tokens = len(prompt) // 4
+            # Always allow at least 1 prompt per batch
+            if current_batch and current_tokens + prompt_tokens > MAX_BATCH_TOKENS:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(prompt)
+            current_tokens += prompt_tokens
+        if current_batch:
+            batches.append(current_batch)
+
         logger.info(
-            f"Running {total} calibration prompts in {num_batches} batches "
-            f"(batch_size={batch_size}, max_new_tokens={max_new_tokens})..."
+            f"Running {total} calibration prompts in {len(batches)} adaptive batches "
+            f"(max ~{MAX_BATCH_TOKENS:,} tokens/batch, max_new_tokens={max_new_tokens})..."
         )
 
         try:
             from tqdm import tqdm
             batch_iter = tqdm(
-                range(0, total, batch_size),
+                enumerate(batches),
                 desc="Calibration",
-                total=num_batches,
+                total=len(batches),
                 unit="batch",
             )
         except ImportError:
-            batch_iter = range(0, total, batch_size)
+            batch_iter = enumerate(batches)
 
-        for i in batch_iter:
-            batch = calibration_prompts[i : i + batch_size]
-            # Log approximate token count for this batch
+        prompts_done = 0
+        for batch_idx, batch in batch_iter:
             batch_chars = sum(len(p) for p in batch)
             approx_tokens = batch_chars // 4
-            if not isinstance(batch_iter, range):
+            prompts_done += len(batch)
+            if hasattr(batch_iter, 'set_postfix'):
                 batch_iter.set_postfix(
-                    prompts=f"{min(i + batch_size, total)}/{total}",
+                    prompts=f"{prompts_done}/{total}",
+                    batch_sz=len(batch),
                     approx_tok=f"~{approx_tokens:,}",
                 )
             else:
-                done = min(i + batch_size, total)
                 logger.info(
-                    f"  Batch {i // batch_size + 1}/{num_batches}: "
-                    f"{done}/{total} prompts (~{approx_tokens:,} tokens)"
+                    f"  Batch {batch_idx + 1}/{len(batches)}: "
+                    f"{prompts_done}/{total} prompts, "
+                    f"batch_size={len(batch)} (~{approx_tokens:,} tokens)"
                 )
             engine.generate(batch, sampling_params)
         logger.info("Inference complete. Reading captured indices...")
@@ -793,6 +857,11 @@ Examples:
         help="GPU memory fraction for model weights/KV cache (default: 0.80). "
         "Lower than serving default to leave room for long-context prefill.",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force regeneration of calibration prompts (ignore cached data).",
+    )
 
     args = parser.parse_args()
 
@@ -820,6 +889,7 @@ Examples:
         calibration_prompts = load_stratified_calibration_prompts(
             num_samples=num_samples,
             tokenizer_name=args.model,
+            no_cache=args.no_cache,
         )
     else:
         calibration_prompts = load_calibration_prompts(
