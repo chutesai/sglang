@@ -296,14 +296,16 @@ def _measure_loss(
     sampling_params = {
         "max_new_tokens": max_new_tokens,
         "temperature": 0,
-        "return_logprob": True,
-        "top_logprobs_num": 0,
-        "return_text_in_logprobs": False,
     }
 
     # Process one prompt at a time to avoid OOM at max context
     for prompt in prompts:
-        outputs = engine.generate(prompt, sampling_params)
+        outputs = engine.generate(
+            prompt,
+            sampling_params,
+            return_logprob=True,
+            top_logprobs_num=0,
+        )
         if isinstance(outputs, list):
             output = outputs[0]
         else:
@@ -562,12 +564,18 @@ Examples:
         if context_length is None:
             logger.error("Could not auto-detect context length. Use --context-length.")
             sys.exit(1)
-    logger.info(f"Calibration context length: {context_length}")
+    # Reserve a small margin so prompts fit strictly within context window
+    # (SGLang requires input_tokens < context_length).
+    prompt_length = context_length - 32
+    logger.info(
+        f"Calibration context length: {context_length}, "
+        f"prompt length: {prompt_length}"
+    )
 
     # Load calibration data
     calibration_prompts = load_calibration_prompts(
         num_samples=args.calibration_samples,
-        context_length=context_length,
+        context_length=prompt_length,
         tokenizer_name=args.model,
         no_cache=args.no_cache,
     )
