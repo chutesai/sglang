@@ -679,15 +679,16 @@ Examples:
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=8,
-        help="Number of calibration prompts (default: 8). "
-        "4 used per greedy step, rest for final validation.",
+        default=768,
+        help="Number of calibration prompts (default: 768, matching THUDM paper). "
+        "eval-prompts used per greedy step, rest for final validation.",
     )
     parser.add_argument(
         "--eval-prompts",
         type=int,
-        default=4,
-        help="Number of prompts used per greedy step (default: 4). "
+        default=8,
+        help="Number of prompts used per greedy step (default: 8). "
+        "Set to a multiple of --dp for full utilization. "
         "Lower = faster but noisier. Must be <= calibration-samples.",
     )
     parser.add_argument(
