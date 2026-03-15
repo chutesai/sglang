@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 from typing import List, Optional, Set
@@ -411,11 +412,11 @@ def _make_blocks(
 
 def greedy_loss_calibration(
     engine,
-    calibration_prompts: List[str],
+    all_prompts: List[str],
     num_layers: int,
     target_num_full: int,
     num_blocks: int = 1,
-    validation_prompts: Optional[List[str]] = None,
+    eval_prompts: int = 128,
     batch_size: int = 1,
 ) -> Set[int]:
     """Greedy calibration matching THUDM reference Algorithm 1.
@@ -425,13 +426,17 @@ def greedy_loss_calibration(
     acceleration. Layers divided into P blocks, best candidate in each
     block committed per step. ~P times fewer forward passes.
 
+    Each candidate evaluation uses a random subset of eval_prompts from the
+    full calibration pool, reducing overfitting to a fixed subset while
+    keeping per-step cost manageable.
+
     Args:
         engine: Running SGLang Engine instance.
-        calibration_prompts: Prompts for loss measurement.
+        all_prompts: Full pool of calibration prompts.
         num_layers: Total number of model layers.
         target_num_full: Target number of Full layers to keep.
         num_blocks: Number of blocks for block-wise search (1=pure greedy).
-        validation_prompts: If provided, used for final validation loss.
+        eval_prompts: Number of prompts to sample per candidate evaluation.
         batch_size: Number of prompts per generate call (set to dp_size).
 
     Returns:
@@ -444,11 +449,26 @@ def greedy_loss_calibration(
 
     layers_to_remove = len(full_layers) - target_num_full
 
-    # Verify IPC works and measure baseline loss (all Full)
+    # If eval_prompts >= pool size, use all prompts (no sampling)
+    use_all = eval_prompts >= len(all_prompts)
+    if use_all:
+        logger.info(f"Using all {len(all_prompts)} prompts per evaluation")
+    else:
+        logger.info(
+            f"Randomly sampling {eval_prompts}/{len(all_prompts)} prompts "
+            f"per candidate evaluation"
+        )
+
+    def _sample_prompts() -> List[str]:
+        if use_all:
+            return all_prompts
+        return random.sample(all_prompts, eval_prompts)
+
+    # Verify IPC works and measure baseline loss (all Full, using all prompts)
     result = _set_layer_pattern(engine, shared_layers)
     logger.info(f"IndexCache IPC ready (toggled {result.num_toggled} layers)")
     logger.info("Measuring baseline loss (all layers Full)...")
-    baseline_loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
+    baseline_loss = _measure_loss(engine, all_prompts, batch_size=batch_size)
 
     try:
         from tqdm import tqdm
@@ -464,6 +484,10 @@ def greedy_loss_calibration(
         while len(full_layers) > target_num_full:
             step += 1
             committed_this_step = []
+
+            # Sample a fixed subset for this step (shared across all
+            # candidates within the step for fair comparison)
+            step_prompts = _sample_prompts()
 
             for block_idx, block_candidates in enumerate(blocks):
                 if len(full_layers) <= target_num_full:
@@ -490,7 +514,7 @@ def greedy_loss_calibration(
                 for layer_id in iter_candidates:
                     trial_shared = shared_layers | {layer_id}
                     _set_layer_pattern(engine, trial_shared)
-                    loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
+                    loss = _measure_loss(engine, step_prompts, batch_size=batch_size)
 
                     if loss < best_loss:
                         best_loss = loss
@@ -534,6 +558,9 @@ def greedy_loss_calibration(
             if not step_candidates:
                 break
 
+            # Sample fresh prompts for this step
+            step_prompts = _sample_prompts()
+
             desc = f"Step {step + 1}/{layers_to_remove}"
             iter_candidates = (
                 tqdm(step_candidates, desc=desc, leave=False, unit="layer")
@@ -544,7 +571,7 @@ def greedy_loss_calibration(
             for layer_id in iter_candidates:
                 trial_shared = shared_layers | {layer_id}
                 _set_layer_pattern(engine, trial_shared)
-                loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
+                loss = _measure_loss(engine, step_prompts, batch_size=batch_size)
 
                 if loss < best_loss:
                     best_loss = loss
@@ -565,19 +592,18 @@ def greedy_loss_calibration(
                 f"remaining Full={len(full_layers)})"
             )
 
-    # Final validation
-    if validation_prompts:
-        logger.info("Running final validation with full prompt set...")
-        _set_layer_pattern(engine, shared_layers)
-        final_loss = _measure_loss(engine, validation_prompts, batch_size=batch_size)
-        _set_layer_pattern(engine, set())  # all Full
-        baseline_final = _measure_loss(engine, validation_prompts, batch_size=batch_size)
-        loss_increase = (final_loss - baseline_final) / baseline_final * 100
-        logger.info(
-            f"Final validation: baseline={baseline_final:.4f}, "
-            f"IndexCache={final_loss:.4f}, "
-            f"increase={loss_increase:+.2f}%"
-        )
+    # Final validation on ALL prompts
+    logger.info(f"Running final validation on all {len(all_prompts)} prompts...")
+    _set_layer_pattern(engine, shared_layers)
+    final_loss = _measure_loss(engine, all_prompts, batch_size=batch_size)
+    _set_layer_pattern(engine, set())  # all Full
+    baseline_final = _measure_loss(engine, all_prompts, batch_size=batch_size)
+    loss_increase = (final_loss - baseline_final) / baseline_final * 100
+    logger.info(
+        f"Final validation: baseline={baseline_final:.4f}, "
+        f"IndexCache={final_loss:.4f}, "
+        f"increase={loss_increase:+.2f}%"
+    )
 
     return full_layers
 
@@ -681,13 +707,13 @@ Examples:
         type=int,
         default=768,
         help="Number of calibration prompts (default: 768, matching THUDM paper). "
-        "eval-prompts used per greedy step, rest for final validation.",
+        "All samples are used per greedy step by default.",
     )
     parser.add_argument(
         "--eval-prompts",
         type=int,
-        default=8,
-        help="Number of prompts used per greedy step (default: 8). "
+        default=768,
+        help="Number of prompts used per greedy step (default: 768, matching paper). "
         "Set to a multiple of --dp for full utilization. "
         "Lower = faster but noisier. Must be <= calibration-samples.",
     )
@@ -802,21 +828,17 @@ Examples:
     engine = Engine(**engine_kwargs)
 
     try:
-        # Split prompts: eval for greedy steps, rest for final validation
-        n_eval = min(args.eval_prompts, len(calibration_prompts))
-        eval_prompts = calibration_prompts[:n_eval]
-        val_prompts = calibration_prompts[n_eval:] if len(calibration_prompts) > n_eval else None
-
         # With DP, batch prompts to utilize all workers in parallel
         batch_size = args.dp if args.dp > 1 else 1
+        n_eval = min(args.eval_prompts, len(calibration_prompts))
 
         full_layers = greedy_loss_calibration(
             engine=engine,
-            calibration_prompts=eval_prompts,
+            all_prompts=calibration_prompts,
             num_layers=num_layers,
             target_num_full=target_num_full,
             num_blocks=args.num_blocks,
-            validation_prompts=val_prompts,
+            eval_prompts=n_eval,
             batch_size=batch_size,
         )
     finally:
