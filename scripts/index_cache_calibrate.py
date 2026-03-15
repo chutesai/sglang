@@ -6,6 +6,11 @@ causes the least perplexity increase. Each candidate flip is tested by
 toggling `index_cache_is_shared` on the attention layer — no engine restart
 needed.
 
+Supports block-wise search (--num-blocks) matching the THUDM paper's pipeline
+parallelism acceleration: layers are divided into P blocks, each block's first
+layer is protected as Full, and the best candidate in each block is committed
+per step. This reduces forward passes by ~P times.
+
 Usage:
 
 1. **Uniform spacing** (no GPU needed):
@@ -15,6 +20,11 @@ Usage:
 2. **Greedy LM-loss calibration** (requires GPU, matches THUDM reference):
    python scripts/index_cache_calibrate.py \\
        --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 -o config.json
+
+3. **Fast calibration with block-wise search + DP attention** (~Nx faster with DP):
+   python scripts/index_cache_calibrate.py \\
+       --model deepseek-ai/DeepSeek-V3.2 --tp 8 --dp 8 --enable-dp-attention \\
+       --target-ratio 0.25 --num-blocks 8 --context-length 131072 -o config.json
 """
 
 from __future__ import annotations
@@ -23,7 +33,6 @@ import argparse
 import hashlib
 import json
 import logging
-import random
 import sys
 from pathlib import Path
 from typing import List, Optional, Set
@@ -32,19 +41,13 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Calibration datasets — only long-document sources needed since calibration
-# runs at max model context length (following THUDM reference: 200K context).
+# Calibration datasets — long-document sources for prefill loss measurement.
+# Only the input tokens matter (max_new_tokens=1), so raw text is fine.
 CALIBRATION_DATASETS = {
     "pg19": {
         "hf_path": "deepmind/pg19",
         "hf_name": None,
         "split": "test",
-        "text_column": "text",
-    },
-    "long_data": {
-        "hf_path": "emozilla/Long-Data-Collections-Fine-Tune",
-        "hf_name": None,
-        "split": "train",
         "text_column": "text",
     },
     "infinitebench": {
@@ -137,7 +140,7 @@ def load_calibration_prompts(
     tokenizer_name: Optional[str] = None,
     no_cache: bool = False,
 ) -> List[str]:
-    """Load calibration prompts at max context length.
+    """Load calibration prompts at target context length.
 
     Following THUDM reference: calibrate at max context because if indices
     are similar at max context, they're similar at shorter context too.
@@ -273,22 +276,50 @@ def get_max_context_length(model_path: str) -> Optional[int]:
 
 
 def _set_layer_pattern(engine, shared_layers: Set[int]):
-    """Toggle IndexCache layers between Full/Shared via Engine IPC."""
+    """Toggle IndexCache layers between Full/Shared via Engine IPC.
+
+    Also flushes the KV cache (RadixCache) to prevent stale prefix matches.
+    Without this, SGLang's prefix caching would reuse KV values computed
+    under a previous IndexCache pattern, giving incorrect loss measurements.
+    """
+    engine.flush_cache()
     result = engine.update_index_cache(sorted(shared_layers))
     if not result.success:
         raise RuntimeError("Failed to update IndexCache layer pattern via IPC")
     return result
 
 
+def _extract_logprob_nll(output) -> tuple:
+    """Extract NLL from a single generate output. Returns (nll, num_tokens)."""
+    meta = output.get("meta_info", {})
+    input_token_logprobs = meta.get("input_token_logprobs", None)
+    nll = 0.0
+    tokens = 0
+    if input_token_logprobs is not None and len(input_token_logprobs) > 0:
+        for entry in input_token_logprobs:
+            if entry is not None:
+                # Each entry is (logprob, token_id, token_text)
+                lp = entry[0] if isinstance(entry, (list, tuple)) else entry
+                if lp is not None:
+                    nll -= lp
+                    tokens += 1
+    return nll, tokens
+
+
 def _measure_loss(
     engine,
     prompts: List[str],
     max_new_tokens: int = 1,
+    batch_size: int = 1,
 ) -> float:
     """Measure average LM loss (negative log-likelihood) on prompts.
 
     Uses engine.generate with return_logprob to get per-token log probs,
     then averages across all tokens and prompts.
+
+    Args:
+        batch_size: Number of prompts to send per engine.generate call.
+            With --dp N, set to N to utilize all DP workers in parallel.
     """
     total_nll = 0.0
     total_tokens = 0
@@ -298,33 +329,39 @@ def _measure_loss(
         "temperature": 0,
     }
 
-    # Process one prompt at a time to avoid OOM at max context
-    for prompt in prompts:
-        outputs = engine.generate(
-            prompt,
-            sampling_params,
-            return_logprob=True,
-            logprob_start_len=0,  # Return logprobs for all input tokens
-            top_logprobs_num=0,
-        )
-        if isinstance(outputs, list):
-            output = outputs[0]
+    # Process prompts in batches for DP parallelism
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i : i + batch_size]
+
+        if len(batch) == 1:
+            # Single prompt — pass as string, not list
+            outputs = engine.generate(
+                batch[0],
+                sampling_params,
+                return_logprob=True,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+            )
+            if isinstance(outputs, list):
+                outputs = outputs[0]
+            nll, tokens = _extract_logprob_nll(outputs)
+            total_nll += nll
+            total_tokens += tokens
         else:
-            output = outputs
-
-        # Extract input token log probs (prefill)
-        # Format: list of (logprob, token_id, token_text) tuples
-        meta = output.get("meta_info", {})
-        input_token_logprobs = meta.get("input_token_logprobs", None)
-
-        if input_token_logprobs is not None and len(input_token_logprobs) > 0:
-            for entry in input_token_logprobs:
-                if entry is not None:
-                    # Each entry is (logprob, token_id, token_text)
-                    lp = entry[0] if isinstance(entry, (list, tuple)) else entry
-                    if lp is not None:
-                        total_nll -= lp
-                        total_tokens += 1
+            # Batch of prompts — engine distributes across DP workers
+            outputs = engine.generate(
+                batch,
+                [sampling_params] * len(batch),
+                return_logprob=[True] * len(batch),
+                logprob_start_len=[0] * len(batch),
+                top_logprobs_num=[0] * len(batch),
+            )
+            if not isinstance(outputs, list):
+                outputs = [outputs]
+            for output in outputs:
+                nll, tokens = _extract_logprob_nll(output)
+                total_nll += nll
+                total_tokens += tokens
 
     if total_tokens == 0:
         logger.warning("No log-probs returned. Is return_logprob supported?")
@@ -338,29 +375,64 @@ def _measure_loss(
     return avg_nll
 
 
+def _make_blocks(
+    num_layers: int, num_blocks: int, protected: Set[int]
+) -> tuple:
+    """Divide layers into blocks for block-wise greedy search.
+
+    Each block's first layer is added to the protected set (always Full).
+
+    Returns:
+        (blocks, all_protected) where blocks is a list of candidate layer
+        lists per block, and all_protected is the full set of protected layers.
+    """
+    block_size = max(1, num_layers // num_blocks)
+    blocks = []
+    all_protected = set(protected)
+
+    for b in range(num_blocks):
+        start = b * block_size
+        end = start + block_size if b < num_blocks - 1 else num_layers
+        if start >= num_layers:
+            break
+        # First layer of each block is protected
+        all_protected.add(start)
+        # Candidates are non-protected layers in this block
+        candidates = [l for l in range(start, end) if l not in all_protected]
+        if candidates:
+            blocks.append(candidates)
+
+    logger.info(
+        f"Block-wise search: {len(blocks)} blocks, "
+        f"protected layers: {sorted(all_protected)}"
+    )
+    return blocks, all_protected
+
+
 def greedy_loss_calibration(
     engine,
     calibration_prompts: List[str],
     num_layers: int,
     target_num_full: int,
+    num_blocks: int = 1,
     validation_prompts: Optional[List[str]] = None,
+    batch_size: int = 1,
 ) -> Set[int]:
     """Greedy calibration matching THUDM reference Algorithm 1.
 
-    1. Start with all layers Full
-    2. For each step: try flipping each candidate Full layer to Shared,
-       measure LM loss, pick the flip with lowest loss increase
-    3. Repeat until we reach target_num_full
-
-    All done within a single engine — just toggle boolean flags between
-    forward passes.
+    With num_blocks=1 (default): pure greedy, one layer committed per step.
+    With num_blocks=P: block-wise search matching THUDM paper's PP
+    acceleration. Layers divided into P blocks, best candidate in each
+    block committed per step. ~P times fewer forward passes.
 
     Args:
         engine: Running SGLang Engine instance.
-        calibration_prompts: Prompts for loss measurement (subset used per step).
+        calibration_prompts: Prompts for loss measurement.
         num_layers: Total number of model layers.
         target_num_full: Target number of Full layers to keep.
+        num_blocks: Number of blocks for block-wise search (1=pure greedy).
         validation_prompts: If provided, used for final validation loss.
+        batch_size: Number of prompts per generate call (set to dp_size).
 
     Returns:
         Set of layer IDs that should remain Full.
@@ -368,76 +440,138 @@ def greedy_loss_calibration(
     # Layers 0 and 1 are always Full (layer 0 = NextN/dense, layer 1 = first DSA)
     full_layers = set(range(num_layers))
     protected = {0, 1}
-    candidates = set(range(2, num_layers))
     shared_layers: Set[int] = set()
 
     layers_to_remove = len(full_layers) - target_num_full
-
-    # Use a subset of prompts for per-step evaluation (speed vs accuracy)
-    eval_prompts = calibration_prompts[:8]
 
     # Verify IPC works and measure baseline loss (all Full)
     result = _set_layer_pattern(engine, shared_layers)
     logger.info(f"IndexCache IPC ready (toggled {result.num_toggled} layers)")
     logger.info("Measuring baseline loss (all layers Full)...")
-    baseline_loss = _measure_loss(engine, eval_prompts)
+    baseline_loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
 
     try:
         from tqdm import tqdm
-
         has_tqdm = True
     except ImportError:
         has_tqdm = False
 
-    for step in range(layers_to_remove):
-        best_layer = None
-        best_loss = float("inf")
+    if num_blocks > 1:
+        # Block-wise greedy search (THUDM paper's PP acceleration)
+        blocks, all_protected = _make_blocks(num_layers, num_blocks, protected)
 
-        step_candidates = sorted(candidates & full_layers - protected)
-        if not step_candidates:
-            break
+        step = 0
+        while len(full_layers) > target_num_full:
+            step += 1
+            committed_this_step = []
 
-        desc = f"Step {step + 1}/{layers_to_remove}"
-        iter_candidates = (
-            tqdm(step_candidates, desc=desc, leave=False, unit="layer")
-            if has_tqdm
-            else step_candidates
-        )
+            for block_idx, block_candidates in enumerate(blocks):
+                if len(full_layers) <= target_num_full:
+                    break
 
-        for layer_id in iter_candidates:
-            # Tentatively flip this layer to Shared
-            trial_shared = shared_layers | {layer_id}
-            _set_layer_pattern(engine, trial_shared)
+                # Filter to layers still Full and not protected
+                available = [
+                    l for l in block_candidates
+                    if l in full_layers and l not in all_protected
+                ]
+                if not available:
+                    continue
 
-            loss = _measure_loss(engine, eval_prompts)
+                best_layer = None
+                best_loss = float("inf")
 
-            if loss < best_loss:
-                best_loss = loss
-                best_layer = layer_id
+                desc = f"Step {step} block {block_idx + 1}/{len(blocks)}"
+                iter_candidates = (
+                    tqdm(available, desc=desc, leave=False, unit="layer")
+                    if has_tqdm
+                    else available
+                )
 
-        if best_layer is None:
-            break
+                for layer_id in iter_candidates:
+                    trial_shared = shared_layers | {layer_id}
+                    _set_layer_pattern(engine, trial_shared)
+                    loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
 
-        # Commit the best flip
-        shared_layers.add(best_layer)
-        full_layers.remove(best_layer)
-        candidates.discard(best_layer)
-        _set_layer_pattern(engine, shared_layers)
+                    if loss < best_loss:
+                        best_loss = loss
+                        best_layer = layer_id
 
-        loss_delta = best_loss - baseline_loss
-        logger.info(
-            f"[{step + 1}/{layers_to_remove}] Layer {best_layer} -> Shared "
-            f"(loss={best_loss:.4f}, delta={loss_delta:+.4f}, "
-            f"remaining Full={len(full_layers)})"
-        )
+                if best_layer is not None:
+                    committed_this_step.append(best_layer)
+                    shared_layers.add(best_layer)
+                    full_layers.remove(best_layer)
+                    # Apply immediately so next block sees updated state
+                    # (matches paper: "best flip in each block is committed
+                    # before the next block is searched")
+                    _set_layer_pattern(engine, shared_layers)
+
+                    loss_delta = best_loss - baseline_loss
+                    logger.info(
+                        f"[Step {step}, block {block_idx + 1}] "
+                        f"Layer {best_layer} -> Shared "
+                        f"(loss={best_loss:.4f}, delta={loss_delta:+.4f}, "
+                        f"remaining Full={len(full_layers)})"
+                    )
+
+            if not committed_this_step:
+                logger.warning("No layers committed this step, stopping early.")
+                break
+
+            logger.info(
+                f"Step {step} complete: committed {len(committed_this_step)} layers "
+                f"({committed_this_step}), "
+                f"remaining Full={len(full_layers)}/{num_layers}"
+            )
+    else:
+        # Pure greedy search (original Algorithm 1)
+        candidates = set(range(2, num_layers))
+
+        for step in range(layers_to_remove):
+            best_layer = None
+            best_loss = float("inf")
+
+            step_candidates = sorted((candidates & full_layers) - protected)
+            if not step_candidates:
+                break
+
+            desc = f"Step {step + 1}/{layers_to_remove}"
+            iter_candidates = (
+                tqdm(step_candidates, desc=desc, leave=False, unit="layer")
+                if has_tqdm
+                else step_candidates
+            )
+
+            for layer_id in iter_candidates:
+                trial_shared = shared_layers | {layer_id}
+                _set_layer_pattern(engine, trial_shared)
+                loss = _measure_loss(engine, calibration_prompts, batch_size=batch_size)
+
+                if loss < best_loss:
+                    best_loss = loss
+                    best_layer = layer_id
+
+            if best_layer is None:
+                break
+
+            shared_layers.add(best_layer)
+            full_layers.remove(best_layer)
+            candidates.discard(best_layer)
+            _set_layer_pattern(engine, shared_layers)
+
+            loss_delta = best_loss - baseline_loss
+            logger.info(
+                f"[{step + 1}/{layers_to_remove}] Layer {best_layer} -> Shared "
+                f"(loss={best_loss:.4f}, delta={loss_delta:+.4f}, "
+                f"remaining Full={len(full_layers)})"
+            )
 
     # Final validation
     if validation_prompts:
         logger.info("Running final validation with full prompt set...")
         _set_layer_pattern(engine, shared_layers)
-        final_loss = _measure_loss(engine, validation_prompts)
+        final_loss = _measure_loss(engine, validation_prompts, batch_size=batch_size)
         _set_layer_pattern(engine, set())  # all Full
-        baseline_final = _measure_loss(engine, validation_prompts)
+        baseline_final = _measure_loss(engine, validation_prompts, batch_size=batch_size)
         loss_increase = (final_loss - baseline_final) / baseline_final * 100
         logger.info(
             f"Final validation: baseline={baseline_final:.4f}, "
@@ -486,10 +620,10 @@ Examples:
   python scripts/index_cache_calibrate.py \\
       --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 -o config.json
 
-  # With specific context length:
+  # Fast block-wise calibration with DP (~8x blocks + ~4x DP = ~32x faster):
   python scripts/index_cache_calibrate.py \\
-      --model deepseek-ai/DeepSeek-V3.2 --tp 8 --target-ratio 0.25 \\
-      --context-length 131072 -o config.json
+      --model deepseek-ai/DeepSeek-V3.2 --tp 8 --dp 8 --enable-dp-attention \\
+      --target-ratio 0.25 --num-blocks 8 --context-length 131072 -o config.json
 
   # Uniform config (no GPU needed):
   python scripts/index_cache_calibrate.py \\
@@ -501,6 +635,18 @@ Examples:
         "--model", type=str, required=True, help="Model path or HuggingFace ID"
     )
     parser.add_argument("--tp", type=int, default=8, help="Tensor parallel size")
+    parser.add_argument(
+        "--dp",
+        type=int,
+        default=1,
+        help="Data parallel size (default: 1). Set to N to process N prompts "
+        "in parallel per loss measurement, giving ~Nx speedup.",
+    )
+    parser.add_argument(
+        "--enable-dp-attention",
+        action="store_true",
+        help="Enable DP attention (required when using --dp with MLA models).",
+    )
     parser.add_argument(
         "--target-ratio",
         type=float,
@@ -527,21 +673,48 @@ Examples:
         "--context-length",
         type=int,
         default=None,
-        help="Context length for calibration (auto-detected from model)",
+        help="Context length for calibration (auto-detected from model). "
+        "Use your production context length (e.g. 131072) for best results.",
     )
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=16,
-        help="Number of calibration prompts (default: 16). "
-        "Each at full context length. 8 used per greedy step, "
-        "rest for final validation.",
+        default=8,
+        help="Number of calibration prompts (default: 8). "
+        "4 used per greedy step, rest for final validation.",
+    )
+    parser.add_argument(
+        "--eval-prompts",
+        type=int,
+        default=4,
+        help="Number of prompts used per greedy step (default: 4). "
+        "Lower = faster but noisier. Must be <= calibration-samples.",
+    )
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=1,
+        help="Number of blocks for block-wise greedy search (default: 1 = pure greedy). "
+        "Set to 8 for ~8x speedup matching THUDM paper's PP acceleration. "
+        "Each block's first layer is protected as Full.",
     )
     parser.add_argument(
         "--mem-fraction-static",
         type=float,
-        default=0.80,
-        help="GPU memory fraction (default: 0.80)",
+        default=0.85,
+        help="GPU memory fraction (default: 0.85)",
+    )
+    parser.add_argument(
+        "--chunked-prefill-size",
+        type=int,
+        default=None,
+        help="Chunked prefill size (larger = faster prefill, more memory). "
+        "Recommend matching your production config (e.g. 16384).",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code for model loading",
     )
     parser.add_argument(
         "--no-cache",
@@ -588,15 +761,25 @@ Examples:
     from sglang.srt.entrypoints.engine import Engine
 
     target_num_full = max(1, int(round(num_layers * args.target_ratio)))
+
+    # Estimate forward passes
+    layers_to_remove = num_layers - target_num_full
+    if args.num_blocks > 1:
+        avg_candidates_per_block = (num_layers - 2) // args.num_blocks
+        steps = max(1, layers_to_remove // args.num_blocks)
+        est_passes = steps * args.num_blocks * avg_candidates_per_block * args.eval_prompts
+    else:
+        est_passes = sum(range(num_layers - 2, num_layers - 2 - layers_to_remove, -1)) * args.eval_prompts
+    dp_info = f", dp={args.dp}" if args.dp > 1 else ""
     logger.info(
         f"Calibrating {args.model}: {num_layers} layers, "
         f"target {target_num_full} Full, context={context_length}, "
-        f"samples={len(calibration_prompts)}"
+        f"samples={len(calibration_prompts)}, eval_prompts={args.eval_prompts}, "
+        f"blocks={args.num_blocks}{dp_info}, ~{est_passes} forward passes"
     )
 
-    # Launch engine with IndexCache enabled (all Full initially via ratio=1.0)
-    # We need index_cache_enabled=True on all layers so we can toggle them.
-    engine = Engine(
+    # Build engine kwargs
+    engine_kwargs = dict(
         model_path=args.model,
         tp_size=args.tp,
         index_cache_ratio=1.0,  # Start all Full — we toggle manually
@@ -604,18 +787,36 @@ Examples:
         mem_fraction_static=args.mem_fraction_static,
         log_level="info",
     )
+    if args.dp > 1:
+        engine_kwargs["dp_size"] = args.dp
+    if args.enable_dp_attention:
+        engine_kwargs["enable_dp_attention"] = True
+    if args.chunked_prefill_size is not None:
+        engine_kwargs["chunked_prefill_size"] = args.chunked_prefill_size
+    if args.trust_remote_code:
+        engine_kwargs["trust_remote_code"] = True
+    if args.context_length is not None:
+        engine_kwargs["context_length"] = args.context_length
+
+    engine = Engine(**engine_kwargs)
 
     try:
-        # Split prompts: most for greedy steps, some for final validation
-        eval_prompts = calibration_prompts[:8]
-        val_prompts = calibration_prompts[8:] if len(calibration_prompts) > 8 else None
+        # Split prompts: eval for greedy steps, rest for final validation
+        n_eval = min(args.eval_prompts, len(calibration_prompts))
+        eval_prompts = calibration_prompts[:n_eval]
+        val_prompts = calibration_prompts[n_eval:] if len(calibration_prompts) > n_eval else None
+
+        # With DP, batch prompts to utilize all workers in parallel
+        batch_size = args.dp if args.dp > 1 else 1
 
         full_layers = greedy_loss_calibration(
             engine=engine,
             calibration_prompts=eval_prompts,
             num_layers=num_layers,
             target_num_full=target_num_full,
+            num_blocks=args.num_blocks,
             validation_prompts=val_prompts,
+            batch_size=batch_size,
         )
     finally:
         engine.shutdown()
@@ -625,9 +826,11 @@ Examples:
         "num_layers": num_layers,
         "target_ratio": args.target_ratio,
         "actual_ratio": len(full_layers) / num_layers,
-        "method": "greedy_lm_loss",
+        "method": "greedy_lm_loss" + (f"_blocks{args.num_blocks}" if args.num_blocks > 1 else ""),
         "calibration_context_length": context_length,
         "calibration_samples": len(calibration_prompts),
+        "eval_prompts": n_eval,
+        "num_blocks": args.num_blocks,
     }
 
     with open(args.output, "w") as f:
