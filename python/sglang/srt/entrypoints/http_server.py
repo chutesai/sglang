@@ -2130,7 +2130,7 @@ def _setup_and_run_http_server(
 
         # Delay listen() until uvicorn startup to avoid accepting probe traffic
         # while model/subprocess initialization is still in progress.
-        reserved_socket.listen(128)
+        reserved_socket.listen(1024)
 
         if server_args.ssl_certfile:
             logger.info(
