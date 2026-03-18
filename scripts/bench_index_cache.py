@@ -84,6 +84,10 @@ FLUSH_CACHE_ENDPOINT = "/flush_cache"
 # Task presets for common evaluation scenarios.
 # generate_until tasks work with both local-completions and local-chat-completions.
 # loglikelihood tasks (mmlu, hellaswag, arc, etc.) only work with local-completions.
+# Tasks that require loglikelihood (multiple_choice) — only work with local-completions.
+# These CANNOT be used with --chat-model (local-chat-completions).
+LOGLIKELIHOOD_TASKS = {"longbench2", "mmlu", "hellaswag", "arc_challenge", "winogrande", "truthfulqa_mc2"}
+
 TASK_PRESETS = {
     # Chat model presets (generate_until only — work with local-chat-completions)
     "chat-quality": [
@@ -98,8 +102,6 @@ TASK_PRESETS = {
         "ruler",
         # BABILong: reasoning-in-haystack (qa1-qa5, default context from dataset)
         "babilong_longctx",
-        # LongBench v2: 503 MC questions, 8K-2M context (real-world tasks)
-        "longbench2",
     ],
     "chat-long-context-ruler": [
         "ruler",
@@ -109,6 +111,8 @@ TASK_PRESETS = {
         "babilong_longctx",
     ],
     "chat-long-context-longbench2": [
+        # LongBench v2: 503 MC questions — uses loglikelihood, requires completions API.
+        # Run WITHOUT --chat-model, or use chat-full which auto-splits.
         "longbench2",
     ],
     "chat-full": [
@@ -455,16 +459,44 @@ def run_benchmark_config(
 
         # Quality benchmark via lm-eval
         if lm_eval_tasks:
-            result.lm_eval_results = run_lm_eval(
-                base_url=base_url,
-                model_name=model,
-                tasks=lm_eval_tasks,
-                chat_model=chat_model,
-                num_fewshot=lm_eval_num_fewshot,
-                limit=lm_eval_limit,
-                gen_kwargs=lm_eval_gen_kwargs,
-                metadata=lm_eval_metadata,
-            )
+            if chat_model:
+                # Split tasks: loglikelihood tasks can't use chat completions API.
+                chat_tasks = [t for t in lm_eval_tasks if t not in LOGLIKELIHOOD_TASKS]
+                ll_tasks = [t for t in lm_eval_tasks if t in LOGLIKELIHOOD_TASKS]
+            else:
+                chat_tasks = []
+                ll_tasks = lm_eval_tasks
+
+            # Run generate_until tasks via chat API
+            if chat_tasks:
+                chat_results = run_lm_eval(
+                    base_url=base_url,
+                    model_name=model,
+                    tasks=chat_tasks,
+                    chat_model=True,
+                    num_fewshot=lm_eval_num_fewshot,
+                    limit=lm_eval_limit,
+                    gen_kwargs=lm_eval_gen_kwargs,
+                    metadata=lm_eval_metadata,
+                )
+                result.lm_eval_results.update(chat_results)
+
+            # Run loglikelihood tasks via completions API
+            if ll_tasks:
+                logger.info(
+                    f"Running loglikelihood tasks via completions API: {ll_tasks}"
+                )
+                ll_results = run_lm_eval(
+                    base_url=base_url,
+                    model_name=model,
+                    tasks=ll_tasks,
+                    chat_model=False,
+                    num_fewshot=lm_eval_num_fewshot,
+                    limit=lm_eval_limit,
+                    gen_kwargs=None,  # No gen_kwargs for loglikelihood
+                    metadata=lm_eval_metadata,
+                )
+                result.lm_eval_results.update(ll_results)
 
         # Latency benchmark via bench_serving
         if run_latency:
