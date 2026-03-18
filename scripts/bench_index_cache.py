@@ -292,10 +292,26 @@ def run_lm_eval(
         kwargs["gen_kwargs"] = gen_kwargs
     if limit is not None:
         kwargs["limit"] = limit
+
+    # Build metadata dict
+    parsed_metadata = {}
     if metadata is not None:
         import json as _json
 
-        kwargs["metadata"] = _json.loads(metadata)
+        parsed_metadata = _json.loads(metadata)
+
+    # RULER tasks need the tokenizer/model name via metadata "pretrained" key.
+    # When using API models (local-chat-completions), lm-eval passes model_args
+    # as a dict which RULER can't use as a tokenizer name.
+    ruler_tasks = [t for t in tasks if t.startswith("ruler")]
+    if ruler_tasks and "pretrained" not in parsed_metadata:
+        parsed_metadata["pretrained"] = model_name
+        logger.info(
+            f"Auto-injecting pretrained={model_name} into metadata for RULER tasks"
+        )
+
+    if parsed_metadata:
+        kwargs["metadata"] = parsed_metadata
 
     logger.info(
         f"Running lm-eval: model_type={model_type}, tasks={tasks}, "
