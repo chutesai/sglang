@@ -420,6 +420,7 @@ def run_benchmark_config(
     lm_eval_num_fewshot: int,
     lm_eval_gen_kwargs: Optional[str],
     lm_eval_metadata: Optional[str],
+    num_concurrent: int,
     chat_model: bool,
     run_latency: bool,
     input_lens: List[int],
@@ -476,6 +477,7 @@ def run_benchmark_config(
                     chat_model=True,
                     num_fewshot=lm_eval_num_fewshot,
                     limit=lm_eval_limit,
+                    num_concurrent=num_concurrent,
                     gen_kwargs=lm_eval_gen_kwargs,
                     metadata=lm_eval_metadata,
                 )
@@ -493,6 +495,7 @@ def run_benchmark_config(
                     chat_model=False,
                     num_fewshot=lm_eval_num_fewshot,
                     limit=lm_eval_limit,
+                    num_concurrent=num_concurrent,
                     gen_kwargs=None,  # No gen_kwargs for loglikelihood
                     metadata=lm_eval_metadata,
                 )
@@ -682,6 +685,13 @@ Examples:
         help="Skip lm-eval quality benchmarks entirely",
     )
     parser.add_argument(
+        "--num-concurrent",
+        type=int,
+        default=24,
+        help="Number of concurrent requests for lm-eval (default: 24). "
+        "Lower for long-context tests to avoid OOM.",
+    )
+    parser.add_argument(
         "--gen-kwargs",
         type=str,
         default=None,
@@ -781,6 +791,7 @@ Examples:
             lm_eval_num_fewshot=args.lm_eval_num_fewshot,
             lm_eval_gen_kwargs=args.gen_kwargs,
             lm_eval_metadata=args.lm_eval_metadata,
+            num_concurrent=args.num_concurrent,
             chat_model=args.chat_model,
             run_latency=args.run_latency,
             input_lens=args.input_lens,
@@ -807,6 +818,7 @@ Examples:
         lm_eval_num_fewshot=args.lm_eval_num_fewshot,
         lm_eval_gen_kwargs=args.gen_kwargs,
         lm_eval_metadata=args.lm_eval_metadata,
+        num_concurrent=args.num_concurrent,
         chat_model=args.chat_model,
         run_latency=args.run_latency,
         input_lens=args.input_lens,
