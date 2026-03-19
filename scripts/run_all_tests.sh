@@ -141,7 +141,7 @@ run_test "ruler_32k" \
 run_test "ruler_131k" \
     "RULER needle-in-haystack at 131K context (generate_until)" \
     --lm-eval-tasks ruler --num-concurrent 2 \
-    --lm-eval-metadata '{"max_seq_lengths":[131072],"pretrained":"'"${MODEL}"'"}'
+    --lm-eval-metadata '{"max_seq_lengths":[128000],"pretrained":"'"${MODEL}"'"}'
 
 # =============================================================================
 # 7. BABILong — Reasoning-in-haystack (qa1-qa5)

@@ -97,8 +97,9 @@ TASK_PRESETS = {
     ],
     "chat-long-context": [
         # RULER: synthetic NIAH variants, default 4K context.
-        # For longer contexts pass --lm-eval-extra-args with:
-        #   --metadata='{"max_seq_lengths":[4096,8192,16384,32768,65536,131072]}'
+        # For longer contexts pass --lm-eval-metadata with max_seq_lengths.
+        # Use 128000 (not 131072) to leave headroom for generation tokens:
+        #   --lm-eval-metadata='{"max_seq_lengths":[4096,32768,128000]}'
         "ruler",
         # BABILong: reasoning-in-haystack (qa1-qa5, default context from dataset)
         "babilong_longctx",
@@ -261,6 +262,13 @@ def run_lm_eval(
     # Flush cache before evaluation
     requests.get(f"{base_url}{FLUSH_CACHE_ENDPOINT}")
 
+    # Query the server's context length so we can cap max_gen_toks.
+    try:
+        info = requests.get(f"{base_url}/get_model_info", timeout=5).json()
+        context_length = info.get("context_length", 131072)
+    except Exception:
+        context_length = 131072
+
     if chat_model:
         model_type = "local-chat-completions"
         model_args = {
@@ -269,12 +277,18 @@ def run_lm_eval(
             "num_concurrent": num_concurrent,
             "tokenized_requests": False,
             "max_retries": 25,
-            "max_length": 100000,
+            "max_length": context_length,
         }
-        # Default gen_kwargs for chat models — CoT tasks need large
-        # max_gen_toks or the response gets truncated before the answer.
+        # Default gen_kwargs for chat models.
+        # RULER / babilong have short answers but very long inputs — use a
+        # small max_gen_toks so input + output fits within context_length.
+        # CoT tasks (gsm8k, gpqa) need large max_gen_toks for reasoning.
         if gen_kwargs is None:
-            gen_kwargs = "max_gen_toks=100000,temperature=1.0,top_p=0.95"
+            long_ctx_tasks = any(
+                t.startswith("ruler") or t.startswith("babilong") for t in tasks
+            )
+            max_gen = 1024 if long_ctx_tasks else 100000
+            gen_kwargs = f"max_gen_toks={max_gen},temperature=1.0,top_p=0.95"
     else:
         model_type = "local-completions"
         model_args = {
