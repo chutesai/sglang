@@ -16,7 +16,7 @@
 # comparison, and saves results. If one test OOMs or fails, the next still runs.
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 # ---- Configuration ----
 MODEL="${MODEL:-deepseek-ai/DeepSeek-V3.2}"
@@ -60,12 +60,12 @@ run_test() {
         echo ""
         echo "  >> ${name}: PASSED (results in ${outfile})"
         results+=("PASS  ${name}")
-        ((passed++))
+        passed=$((passed + 1))
     else
         echo ""
         echo "  >> ${name}: FAILED (exit code $?)"
         results+=("FAIL  ${name}")
-        ((failed++))
+        failed=$((failed + 1))
     fi
 }
 
