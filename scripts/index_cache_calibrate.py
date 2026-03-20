@@ -7,9 +7,9 @@ toggling `index_cache_is_shared` on the attention layer — no engine restart
 needed.
 
 Supports block-wise search (--num-blocks) matching the THUDM paper's pipeline
-parallelism acceleration: layers are divided into P blocks, each block's first
-layer is protected as Full, and the best candidate in each block is committed
-per step. This reduces forward passes by ~P times.
+parallelism acceleration: layers are divided into P blocks and the best
+candidate in each block is committed per step. This reduces forward passes
+by ~P times. Only layers 0 and 1 are protected (runtime constraints).
 
 Usage:
 
@@ -25,6 +25,11 @@ Usage:
    python scripts/index_cache_calibrate.py \\
        --model deepseek-ai/DeepSeek-V3.2 --tp 8 --dp 8 --enable-dp-attention \\
        --target-ratio 0.25 --num-blocks 8 --context-length 131072 -o config.json
+
+4. **Use raw text instead of SFT data** (legacy, not recommended):
+   python scripts/index_cache_calibrate.py \\
+       --model deepseek-ai/DeepSeek-V3.2 --tp 8 --calibration-data raw \\
+       --target-ratio 0.25 -o config.json
 """
 
 from __future__ import annotations
@@ -42,22 +47,46 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Calibration datasets — long-document sources for prefill loss measurement.
-# Only the input tokens matter (max_new_tokens=1), so raw text is fine.
-CALIBRATION_DATASETS = {
-    "pg19": {
-        "hf_path": "deepmind/pg19",
-        "hf_name": None,
-        "split": "test",
-        "text_column": "text",
+# Calibration dataset presets.
+# "sft" — SFT/instruction data, recommended (matches THUDM paper methodology).
+# "raw" — raw text (novels, QA contexts), legacy fallback.
+CALIBRATION_DATASET_PRESETS = {
+    "sft": {
+        "chatqa_narrative_131k": {
+            "hf_path": "nvidia/ChatQA2-Long-SFT-data",
+            "hf_name": "NarrativeQA_131072",
+            "split": "train",
+            "text_column": "sub-paragraphs",
+            # QA pairs built on NarrativeQA, padded to ~131K tokens.
+            # 14K+ samples — more than enough for calibration.
+        },
+        "longcite": {
+            "hf_path": "THUDM/LongCite-45k",
+            "hf_name": None,
+            "split": "train",
+            "text_column": "prompt",
+            # From the same THUDM group that wrote IndexCache.
+            # Up to 128K words (691K chars). Filter to long samples only.
+        },
     },
-    "infinitebench": {
-        "hf_path": "xinrongzhang2022/InfiniteBench",
-        "hf_name": None,
-        "split": "longbook_qa_eng",
-        "text_column": "context",
+    "raw": {
+        "pg19": {
+            "hf_path": "deepmind/pg19",
+            "hf_name": None,
+            "split": "test",
+            "text_column": "text",
+        },
+        "infinitebench": {
+            "hf_path": "xinrongzhang2022/InfiniteBench",
+            "hf_name": None,
+            "split": "longbook_qa_eng",
+            "text_column": "context",
+        },
     },
 }
+
+# Default preset — SFT is recommended per the THUDM paper.
+DEFAULT_CALIBRATION_DATA = "sft"
 
 
 # ---------------------------------------------------------------------------
@@ -65,11 +94,21 @@ CALIBRATION_DATASETS = {
 # ---------------------------------------------------------------------------
 
 
-def _load_single_dataset(ds_name: str):
+def _get_datasets(preset: str) -> dict:
+    """Get dataset configs for the given preset name."""
+    if preset in CALIBRATION_DATASET_PRESETS:
+        return CALIBRATION_DATASET_PRESETS[preset]
+    raise ValueError(
+        f"Unknown calibration data preset: {preset}. "
+        f"Choose from: {list(CALIBRATION_DATASET_PRESETS.keys())}"
+    )
+
+
+def _load_single_dataset(ds_name: str, datasets: dict):
     from datasets import load_dataset
 
-    if ds_name in CALIBRATION_DATASETS:
-        cfg = CALIBRATION_DATASETS[ds_name]
+    if ds_name in datasets:
+        cfg = datasets[ds_name]
         ds = load_dataset(
             cfg["hf_path"],
             cfg["hf_name"],
@@ -84,14 +123,17 @@ def _load_single_dataset(ds_name: str):
 
 
 def _cache_key(
-    num_samples: int, context_length: int, tokenizer_name: Optional[str]
+    num_samples: int, context_length: int, tokenizer_name: Optional[str],
+    preset: str,
 ) -> str:
+    datasets = _get_datasets(preset)
     key_data = json.dumps(
         {
             "num_samples": num_samples,
             "context_length": context_length,
-            "datasets": {k: v["hf_path"] for k, v in CALIBRATION_DATASETS.items()},
+            "datasets": {k: v["hf_path"] for k, v in datasets.items()},
             "tokenizer": tokenizer_name or "char_approx",
+            "preset": preset,
         },
         sort_keys=True,
     )
@@ -140,13 +182,19 @@ def load_calibration_prompts(
     context_length: int,
     tokenizer_name: Optional[str] = None,
     no_cache: bool = False,
+    preset: str = DEFAULT_CALIBRATION_DATA,
 ) -> List[str]:
     """Load calibration prompts at target context length.
 
     Following THUDM reference: calibrate at max context because if indices
     are similar at max context, they're similar at shorter context too.
+
+    Args:
+        preset: Dataset preset to use. "sft" (default, recommended) uses
+            SFT/instruction data matching the THUDM paper. "raw" uses
+            raw text (pg19, infinitebench) as a fallback.
     """
-    key = _cache_key(num_samples, context_length, tokenizer_name)
+    key = _cache_key(num_samples, context_length, tokenizer_name, preset)
     cached = _cache_path(key)
     if not no_cache and cached.exists():
         logger.info(f"Loading cached calibration prompts from {cached}")
@@ -154,6 +202,7 @@ def load_calibration_prompts(
         logger.info(f"Loaded {len(prompts)} cached prompts")
         return prompts
 
+    datasets = _get_datasets(preset)
     tokenizer = _get_tokenizer(tokenizer_name)
     prompts = []
 
@@ -164,19 +213,19 @@ def load_calibration_prompts(
     except ImportError:
         has_tqdm = False
 
-    dataset_names = list(CALIBRATION_DATASETS.keys())
+    dataset_names = list(datasets.keys())
     per_dataset = max(1, num_samples // len(dataset_names))
 
     logger.info(
         f"Loading {num_samples} prompts at {context_length} tokens "
-        f"from: {dataset_names}"
+        f"from {preset} preset: {dataset_names}"
     )
 
     for ds_name in dataset_names:
         if len(prompts) >= num_samples:
             break
         try:
-            ds, text_column = _load_single_dataset(ds_name)
+            ds, text_column = _load_single_dataset(ds_name, datasets)
         except Exception as e:
             logger.warning(f"  Skipping {ds_name}: {e}")
             continue
@@ -381,7 +430,10 @@ def _make_blocks(
 ) -> tuple:
     """Divide layers into blocks for block-wise greedy search.
 
-    Each block's first layer is added to the protected set (always Full).
+    Only layers 0 and 1 are protected (runtime constraint: layer 0 is
+    dense/NextN, layer 1 is the first DSA layer with no predecessor).
+    Block-first layers are NOT force-protected — the greedy search can
+    evaluate them like any other candidate, giving it maximum freedom.
 
     Returns:
         (blocks, all_protected) where blocks is a list of candidate layer
@@ -396,8 +448,6 @@ def _make_blocks(
         end = start + block_size if b < num_blocks - 1 else num_layers
         if start >= num_layers:
             break
-        # First layer of each block is protected
-        all_protected.add(start)
         # Candidates are non-protected layers in this block
         candidates = [l for l in range(start, end) if l not in all_protected]
         if candidates:
@@ -722,8 +772,8 @@ Examples:
         type=int,
         default=1,
         help="Number of blocks for block-wise greedy search (default: 1 = pure greedy). "
-        "Set to 8 for ~8x speedup matching THUDM paper's PP acceleration. "
-        "Each block's first layer is protected as Full.",
+        "Set to 4-8 for ~Nx speedup (commits one layer per block per step). "
+        "Only layers 0 and 1 are force-protected regardless of block count.",
     )
     parser.add_argument(
         "--mem-fraction-static",
@@ -747,6 +797,15 @@ Examples:
         "--no-cache",
         action="store_true",
         help="Force regeneration of calibration prompts",
+    )
+    parser.add_argument(
+        "--calibration-data",
+        type=str,
+        default=DEFAULT_CALIBRATION_DATA,
+        choices=list(CALIBRATION_DATASET_PRESETS.keys()),
+        help=f"Calibration data preset (default: {DEFAULT_CALIBRATION_DATA}). "
+        "'sft' uses SFT/instruction data (recommended, matches THUDM paper). "
+        "'raw' uses raw text (pg19, infinitebench).",
     )
 
     args = parser.parse_args()
@@ -782,6 +841,7 @@ Examples:
         context_length=prompt_length,
         tokenizer_name=args.model,
         no_cache=args.no_cache,
+        preset=args.calibration_data,
     )
 
     # --- Greedy LM-loss calibration ---
@@ -851,6 +911,7 @@ Examples:
         "actual_ratio": len(full_layers) / num_layers,
         "method": "greedy_lm_loss" + (f"_blocks{args.num_blocks}" if args.num_blocks > 1 else ""),
         "calibration_context_length": context_length,
+        "calibration_data": args.calibration_data,
         "calibration_samples": len(calibration_prompts),
         "eval_prompts": n_eval,
         "num_blocks": args.num_blocks,
