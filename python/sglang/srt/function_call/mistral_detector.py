@@ -259,7 +259,9 @@ class MistralDetector(BaseFormatDetector):
             calls = self.parse_base_json(function_call_arr, tools)
         except json.JSONDecodeError as e:
             logger.warning(
-                f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}"
+                "Failed to parse tool call JSON (%d chars), JSON parse error: %s",
+                len(json_array_str) if json_array_str else 0,
+                type(e).__name__,
             )
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)

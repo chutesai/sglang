@@ -133,11 +133,15 @@ class KimiK2Detector(BaseFormatDetector):
                             )
                         else:
                             logger.error(
-                                f"Invalid JSON in tool call {function_name=}: {function_args=} and failed to repair"
+                                "Invalid JSON in tool call '%s' (%d chars) and failed to repair",
+                                function_name,
+                                len(function_args),
                             )
                     except Exception:
                         logger.error(
-                            f"Invalid JSON in tool call {function_name}: {function_args}, repaired JSON invalid"
+                            "Invalid JSON in tool call '%s' (%d chars), repaired JSON also invalid",
+                            function_name,
+                            len(function_args),
                         )
 
             content = text[: text.find(self.bot_token)]
