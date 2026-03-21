@@ -126,7 +126,7 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int, server_args: ServerArgs
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()

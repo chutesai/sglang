@@ -308,6 +308,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs
             else None
         )
+        if self.is_gpt_oss and reasoning_effort == "none":
+            raise ValueError(
+                f"Harmony does not support reasoning effort {reasoning_effort}"
+            )
+
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
@@ -355,6 +360,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
@@ -376,7 +386,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=request.routed_dp_rank,
+            routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
@@ -414,6 +424,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.chat_template_kwargs.setdefault(
                 "spaces_between_special_tokens", False
             )
+
+        self._patch_mistral_skip_special_tokens(request)
 
         tool_call_constraint = None
 
@@ -551,19 +563,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
+            extra_template_kwargs = {}
+            if request.reasoning_effort is not None:
+                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.chat_template_kwargs:
+                extra_template_kwargs.update(request.chat_template_kwargs)
+
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
                     return_dict=False,
+                    **extra_template_kwargs,
                 )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
@@ -579,13 +592,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
-                        reasoning_effort=request.reasoning_effort,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
                         return_dict=False,
+                        **extra_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1512,8 +1520,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
+    def _patch_mistral_skip_special_tokens(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
+        which get stripped when skip_special_tokens=True."""
+        if (
+            self.reasoning_parser in ["mistral"]
+            and request.reasoning_effort is not None
+            and request.reasoning_effort != "none"
+        ):
+            request.skip_special_tokens = False
+
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Judge whether the request needs reasoning"""
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
         if not self.reasoning_parser:
             return False
 
@@ -1547,16 +1569,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 not chat_template_kwargs
                 or chat_template_kwargs.get("enable_thinking") is not False
             )
-        if self.reasoning_parser in ["glm45"]:
-            # GLM-4.5/4.6 templates emit thinking tags by default, so honor that unless
-            # the user explicitly disables it via enable_thinking=False
-            default_enable_thinking = True
-            if chat_template_kwargs:
-                return chat_template_kwargs.get(
-                    "enable_thinking", default_enable_thinking
-                )
-            return default_enable_thinking
-
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning_effort is not None
+                and request.reasoning_effort != "none"
+            )
         return True  # default
 
     async def _process_tool_call_stream(

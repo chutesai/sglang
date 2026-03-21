@@ -46,7 +46,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 
 import numpy as np
-import orjson
 import requests
 import uvicorn
 import uvloop
@@ -177,6 +176,11 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.json_response import (
+    SGLangORJSONResponse,
+    dumps_json,
+    orjson_response,
+)
 from sglang.utils import _prebind_listening_socket, get_exception_traceback
 from sglang.version import __version__
 
@@ -670,7 +674,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
-@app.api_route("/generate", methods=["POST", "PUT"])
+@app.api_route(
+    "/generate",
+    methods=["POST", "PUT"],
+    response_class=SGLangORJSONResponse,
+)
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if obj.stream:
@@ -680,15 +688,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                    ) + b"\n\n"
+                    yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                ) + b"\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -701,12 +705,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return Response(
-                content=orjson.dumps(
-                    ret, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
-                ),
-                media_type="application/json",
-            )
+            return orjson_response(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
@@ -1621,12 +1620,22 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
 
 ##### Ollama-compatible API endpoints #####
 
+_ollama_root_route = os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE")
+if _ollama_root_route is not None:
 
-@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
-async def ollama_root():
-    """Ollama-compatible root endpoint for health check."""
-    return "Ollama is running"
+    @app.get(_ollama_root_route)
+    @app.head(_ollama_root_route)
+    async def ollama_root():
+        """Ollama-compatible root endpoint."""
+        return "Ollama is running"
+
+else:
+
+    @app.get("/")
+    @app.head("/")
+    async def sglang_root():
+        """Default root endpoint."""
+        return "SGLang is running"
 
 
 @app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
@@ -2062,69 +2071,67 @@ def _setup_and_run_http_server(
     reserved_socket = _prebind_listening_socket(server_args.host, server_args.port)
     multi_tokenizer_args_shm = None
 
+    # Parse info got from the schedulers
+    remote_instance_transfer_engine_info = (
+        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
+    )
+
+    # Set global states
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_infos[0],
+            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+        )
+    )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if server_args.tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            launch_callback=launch_callback,
+            execute_warmup_func=execute_warmup_func,
+        )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        #
+        # Backward compatibility:
+        # - api_key only: behavior matches legacy (all endpoints require api_key)
+        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+        #   admin_api_key is not configured.
+        if (
+            server_args.api_key
+            or server_args.admin_api_key
+            or app_has_admin_force_endpoints(app)
+        ):
+            from sglang.srt.utils.auth import add_api_key_middleware
+
+            add_api_key_middleware(
+                app,
+                api_key=server_args.api_key,
+                admin_api_key=server_args.admin_api_key,
+            )
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_infos[0]
+        )
+
     # Materialize any PEM content from env vars temp files.
     ssl_tmpfiles = _materialize_ssl_pem_env_vars(server_args)
 
     try:
-        # Parse info got from the schedulers
-        remote_instance_transfer_engine_info = (
-            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_infos
-            )
-        )
-
-        # Set global states
-        set_global_state(
-            _GlobalState(
-                tokenizer_manager=tokenizer_manager,
-                template_manager=template_manager,
-                scheduler_info=scheduler_infos[0],
-                remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-            )
-        )
-
-        if server_args.enable_metrics:
-            add_prometheus_track_response_middleware(app)
-
-        # Pass additional arguments to the lifespan function.
-        # They will be used for additional initialization setups.
-        if server_args.tokenizer_worker_num == 1:
-            # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-            app.is_single_tokenizer_mode = True
-            app.server_args = server_args
-            app.warmup_thread_kwargs = dict(
-                server_args=server_args,
-                launch_callback=launch_callback,
-                execute_warmup_func=execute_warmup_func,
-            )
-
-            # Add api key authorization
-            # This is only supported in single tokenizer mode.
-            #
-            # Backward compatibility:
-            # - api_key only: behavior matches legacy (all endpoints require api_key)
-            # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-            #   admin_api_key is not configured.
-            if (
-                server_args.api_key
-                or server_args.admin_api_key
-                or app_has_admin_force_endpoints(app)
-            ):
-                from sglang.srt.utils.auth import add_api_key_middleware
-
-                add_api_key_middleware(
-                    app,
-                    api_key=server_args.api_key,
-                    admin_api_key=server_args.admin_api_key,
-                )
-        else:
-            # If it is multi-tokenizer mode, we need to write the arguments to shared memory
-            # for other worker processes to read.
-            app.is_single_tokenizer_mode = False
-            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-                port_args, server_args, scheduler_infos[0]
-            )
-
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
