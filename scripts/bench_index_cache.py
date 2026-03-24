@@ -86,7 +86,14 @@ FLUSH_CACHE_ENDPOINT = "/flush_cache"
 # loglikelihood tasks (mmlu, hellaswag, arc, etc.) only work with local-completions.
 # Tasks that require loglikelihood (multiple_choice) — only work with local-completions.
 # These CANNOT be used with --chat-model (local-chat-completions).
-LOGLIKELIHOOD_TASKS = {"longbench2", "mmlu", "hellaswag", "arc_challenge", "winogrande", "truthfulqa_mc2"}
+LOGLIKELIHOOD_TASKS = {
+    "longbench2",
+    "mmlu",
+    "hellaswag",
+    "arc_challenge",
+    "winogrande",
+    "truthfulqa_mc2",
+}
 
 TASK_PRESETS = {
     # Chat model presets (generate_until only — work with local-chat-completions)

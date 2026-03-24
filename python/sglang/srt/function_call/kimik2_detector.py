@@ -78,8 +78,6 @@ class KimiK2Detector(BaseFormatDetector):
 
         self._last_arguments = ""
 
-
-
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
         return self.bot_token in text

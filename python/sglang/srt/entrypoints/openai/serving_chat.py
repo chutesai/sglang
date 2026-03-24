@@ -796,13 +796,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 if finish_reason_type:
                     # If the abort is from scheduler.
                     if finish_reason_type == "abort":
-                        code = finish_reason.get(
-                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        code = (
+                            finish_reason.get("status_code")
+                            or HTTPStatus.INTERNAL_SERVER_ERROR
                         )
+                        err_name = getattr(code, "name", "INTERNAL_SERVER_ERROR")
+                        err_value = getattr(code, "value", 500)
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            err_name,
+                            err_value,
                         )
                         yield f"data: {error}\n\n"
                         break

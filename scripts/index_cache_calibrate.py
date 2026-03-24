@@ -123,7 +123,9 @@ def _load_single_dataset(ds_name: str, datasets: dict):
 
 
 def _cache_key(
-    num_samples: int, context_length: int, tokenizer_name: Optional[str],
+    num_samples: int,
+    context_length: int,
+    tokenizer_name: Optional[str],
     preset: str,
 ) -> str:
     datasets = _get_datasets(preset)
@@ -425,9 +427,7 @@ def _measure_loss(
     return avg_nll
 
 
-def _make_blocks(
-    num_layers: int, num_blocks: int, protected: Set[int]
-) -> tuple:
+def _make_blocks(num_layers: int, num_blocks: int, protected: Set[int]) -> tuple:
     """Divide layers into blocks for block-wise greedy search.
 
     Only layers 0 and 1 are protected (runtime constraint: layer 0 is
@@ -466,7 +466,9 @@ def _checkpoint_path(output_path: str) -> Path:
     return p.parent / f".{p.stem}_checkpoint.json"
 
 
-def _save_checkpoint(output_path: str, shared_layers: Set[int], step: int, block_idx: int):
+def _save_checkpoint(
+    output_path: str, shared_layers: Set[int], step: int, block_idx: int
+):
     """Save calibration progress for crash recovery."""
     ckpt = {
         "shared_layers": sorted(shared_layers),
@@ -569,6 +571,7 @@ def greedy_loss_calibration(
 
     try:
         from tqdm import tqdm
+
         has_tqdm = True
     except ImportError:
         has_tqdm = False
@@ -592,7 +595,8 @@ def greedy_loss_calibration(
 
                 # Filter to layers still Full and not protected
                 available = [
-                    l for l in block_candidates
+                    l
+                    for l in block_candidates
                     if l in full_layers and l not in all_protected
                 ]
                 if not available:
@@ -729,7 +733,11 @@ def generate_uniform_config(num_layers: int, target_ratio: float, output_path: s
     target_count = max(2, int(round(num_layers * target_ratio)))
     # Place target_count layers as evenly as possible across [0, num_layers)
     full_layers = sorted(
-        {0, 1} | {int(round(i * (num_layers - 1) / (target_count - 1))) for i in range(target_count)}
+        {0, 1}
+        | {
+            int(round(i * (num_layers - 1) / (target_count - 1)))
+            for i in range(target_count)
+        }
     )
     config = {
         "full_layers": full_layers,
@@ -917,9 +925,14 @@ Examples:
     if args.num_blocks > 1:
         avg_candidates_per_block = (num_layers - 2) // args.num_blocks
         steps = max(1, layers_to_remove // args.num_blocks)
-        est_passes = steps * args.num_blocks * avg_candidates_per_block * args.eval_prompts
+        est_passes = (
+            steps * args.num_blocks * avg_candidates_per_block * args.eval_prompts
+        )
     else:
-        est_passes = sum(range(num_layers - 2, num_layers - 2 - layers_to_remove, -1)) * args.eval_prompts
+        est_passes = (
+            sum(range(num_layers - 2, num_layers - 2 - layers_to_remove, -1))
+            * args.eval_prompts
+        )
     dp_info = f", dp={args.dp}" if args.dp > 1 else ""
     logger.info(
         f"Calibrating {args.model}: {num_layers} layers, "
@@ -973,7 +986,8 @@ Examples:
         "num_layers": num_layers,
         "target_ratio": args.target_ratio,
         "actual_ratio": len(full_layers) / num_layers,
-        "method": "greedy_lm_loss" + (f"_blocks{args.num_blocks}" if args.num_blocks > 1 else ""),
+        "method": "greedy_lm_loss"
+        + (f"_blocks{args.num_blocks}" if args.num_blocks > 1 else ""),
         "calibration_context_length": context_length,
         "calibration_data": args.calibration_data,
         "calibration_samples": len(calibration_prompts),
