@@ -460,6 +460,40 @@ def _make_blocks(
     return blocks, all_protected
 
 
+def _checkpoint_path(output_path: str) -> Path:
+    """Derive checkpoint path from output path."""
+    p = Path(output_path)
+    return p.parent / f".{p.stem}_checkpoint.json"
+
+
+def _save_checkpoint(output_path: str, shared_layers: Set[int], step: int, block_idx: int):
+    """Save calibration progress for crash recovery."""
+    ckpt = {
+        "shared_layers": sorted(shared_layers),
+        "step": step,
+        "block_idx": block_idx,
+    }
+    ckpt_path = _checkpoint_path(output_path)
+    with open(ckpt_path, "w") as f:
+        json.dump(ckpt, f)
+    logger.info(f"Checkpoint saved: {len(shared_layers)} shared layers -> {ckpt_path}")
+
+
+def _load_checkpoint(output_path: str) -> Optional[Set[int]]:
+    """Load checkpoint if it exists. Returns shared_layers or None."""
+    ckpt_path = _checkpoint_path(output_path)
+    if not ckpt_path.exists():
+        return None
+    with open(ckpt_path) as f:
+        ckpt = json.load(f)
+    shared = set(ckpt["shared_layers"])
+    logger.info(
+        f"Resuming from checkpoint: {len(shared)} shared layers "
+        f"(step {ckpt['step']}, block {ckpt['block_idx']})"
+    )
+    return shared
+
+
 def greedy_loss_calibration(
     engine,
     all_prompts: List[str],
@@ -468,6 +502,7 @@ def greedy_loss_calibration(
     num_blocks: int = 1,
     eval_prompts: int = 128,
     batch_size: int = 1,
+    output_path: Optional[str] = None,
 ) -> Set[int]:
     """Greedy calibration matching THUDM reference Algorithm 1.
 
@@ -476,9 +511,8 @@ def greedy_loss_calibration(
     acceleration. Layers divided into P blocks, best candidate in each
     block committed per step. ~P times fewer forward passes.
 
-    Each candidate evaluation uses a random subset of eval_prompts from the
-    full calibration pool, reducing overfitting to a fixed subset while
-    keeping per-step cost manageable.
+    Automatically checkpoints after each layer commit. If the process
+    crashes, re-run with the same --output path to resume.
 
     Args:
         engine: Running SGLang Engine instance.
@@ -488,6 +522,7 @@ def greedy_loss_calibration(
         num_blocks: Number of blocks for block-wise search (1=pure greedy).
         eval_prompts: Number of prompts to sample per candidate evaluation.
         batch_size: Number of prompts per generate call (set to dp_size).
+        output_path: Output config path (used for checkpoint file location).
 
     Returns:
         Set of layer IDs that should remain Full.
@@ -496,6 +531,18 @@ def greedy_loss_calibration(
     full_layers = set(range(num_layers))
     protected = {0, 1}
     shared_layers: Set[int] = set()
+
+    # Try to resume from checkpoint
+    if output_path:
+        resumed = _load_checkpoint(output_path)
+        if resumed is not None:
+            shared_layers = resumed
+            full_layers -= shared_layers
+            logger.info(
+                f"Resumed: {len(full_layers)} Full, {len(shared_layers)} Shared, "
+                f"target {target_num_full} Full "
+                f"({len(full_layers) - target_num_full} more to remove)"
+            )
 
     layers_to_remove = len(full_layers) - target_num_full
 
@@ -575,8 +622,6 @@ def greedy_loss_calibration(
                     shared_layers.add(best_layer)
                     full_layers.remove(best_layer)
                     # Apply immediately so next block sees updated state
-                    # (matches paper: "best flip in each block is committed
-                    # before the next block is searched")
                     _set_layer_pattern(engine, shared_layers)
 
                     loss_delta = best_loss - baseline_loss
@@ -586,6 +631,10 @@ def greedy_loss_calibration(
                         f"(loss={best_loss:.4f}, delta={loss_delta:+.4f}, "
                         f"remaining Full={len(full_layers)})"
                     )
+
+                    # Checkpoint after each commit for crash recovery
+                    if output_path:
+                        _save_checkpoint(output_path, shared_layers, step, block_idx)
 
             if not committed_this_step:
                 logger.warning("No layers committed this step, stopping early.")
@@ -642,6 +691,10 @@ def greedy_loss_calibration(
                 f"remaining Full={len(full_layers)})"
             )
 
+            # Checkpoint for crash recovery
+            if output_path:
+                _save_checkpoint(output_path, shared_layers, step, 0)
+
     # Final validation on ALL prompts
     logger.info(f"Running final validation on all {len(all_prompts)} prompts...")
     _set_layer_pattern(engine, shared_layers)
@@ -655,6 +708,13 @@ def greedy_loss_calibration(
         f"increase={loss_increase:+.2f}%"
     )
 
+    # Clean up checkpoint on successful completion
+    if output_path:
+        ckpt_path = _checkpoint_path(output_path)
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+            logger.info(f"Checkpoint removed: {ckpt_path}")
+
     return full_layers
 
 
@@ -664,10 +724,13 @@ def greedy_loss_calibration(
 
 
 def generate_uniform_config(num_layers: int, target_ratio: float, output_path: str):
-    # Match THUDM reference formula: layers 0,1 always Full, then
-    # every step-th layer starting from layer 1: {0, 1, 1+step, 1+2*step, ...}
-    step = max(1, int(round(1.0 / target_ratio)))
-    full_layers = sorted({0, 1} | set(range(1, num_layers, step)))
+    # Evenly space Full layers to hit the target ratio.
+    # Layers 0 and 1 are always Full (runtime constraint).
+    target_count = max(2, int(round(num_layers * target_ratio)))
+    # Place target_count layers as evenly as possible across [0, num_layers)
+    full_layers = sorted(
+        {0, 1} | {int(round(i * (num_layers - 1) / (target_count - 1))) for i in range(target_count)}
+    )
     config = {
         "full_layers": full_layers,
         "num_layers": num_layers,
@@ -900,6 +963,7 @@ Examples:
             num_blocks=args.num_blocks,
             eval_prompts=n_eval,
             batch_size=batch_size,
+            output_path=args.output,
         )
     finally:
         engine.shutdown()

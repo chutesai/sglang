@@ -40,7 +40,7 @@ from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.base_grammar_backend import INVALID_GRAMMAR_OBJ
+from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -1913,7 +1913,7 @@ class Scheduler(
         ):
             initial_flag = custom_params.get("reasoning_initial_in_reasoning")
         grammar = getattr(req, "grammar", None)
-        if grammar is None or grammar is INVALID_GRAMMAR_OBJ:
+        if grammar is None or isinstance(grammar, InvalidGrammarObject):
             return
         setter = getattr(grammar, "set_initial_reasoning_state", None)
         if setter is not None:
