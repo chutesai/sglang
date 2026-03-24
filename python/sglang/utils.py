@@ -438,7 +438,7 @@ def _prebind_listening_socket(host: str, port: int) -> socket.socket:
     """
     import errno
 
-    from sglang.srt.utils.common import is_valid_ipv6_address
+    from sglang.srt.utils.network import is_valid_ipv6_address
 
     # Determine socket family based on address type
     if host and is_valid_ipv6_address(host):
