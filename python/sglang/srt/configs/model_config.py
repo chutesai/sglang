@@ -880,7 +880,25 @@ class ModelConfig:
         ):
             return True
 
-        # Check for HuggingFace quantization config
+        # For composite/multimodal configs (e.g. KimiK25Config), the custom config
+        # class may not propagate quantization_config to the top level. Check the
+        # nested text_config as well.
+        text_config = getattr(self.hf_config, "text_config", None)
+        if text_config and (
+            getattr(text_config, "quantization_config", None)
+            or getattr(text_config, "compression_config", None)
+        ):
+            return True
+
+        # Check for standalone hf_quant_config.json (used by ModelOpt models).
+        # Use local_or_cached_path which works in offline mode, unlike
+        # has_hf_quant_config which may fail when HF Hub is unreachable.
+        if local_or_cached_path(
+            "hf_quant_config.json", self.model_path, self.revision
+        ):
+            return True
+
+        # Check for HuggingFace quantization config (includes online HF Hub check)
         from sglang.srt.utils import has_hf_quant_config
 
         return has_hf_quant_config(self.model_path)
