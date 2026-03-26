@@ -112,16 +112,12 @@ class InternlmDetector(BaseFormatDetector):
                     if not parameters:
                         parameters = {}
 
-                    logger.info(
-                        f"[InternLM Tool Call] Parsed tool call #{idx+1}: name={name}, "
-                        f"parameters={json.dumps(parameters, ensure_ascii=False)}"
-                    )
+                    logger.info(f"[InternLM Tool Call] Parsed tool call #{idx+1}")
 
                     # Validate tool name
                     if not (name and name in tool_indices):
                         logger.warning(
-                            f"[InternLM Tool Call] Model attempted to call undefined function: {name}, "
-                            f"available_tools={list(tool_indices.keys())}"
+                            "[InternLM Tool Call] Model attempted to call undefined function"
                         )
                         if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                             continue  # Skip this tool call

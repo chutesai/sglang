@@ -75,7 +75,7 @@ class GigaChat3Detector(BaseFormatDetector):
                 elif not isinstance(function_call["arguments"], dict):
                     function_call = None
             except json.JSONDecodeError as e:
-                logger.warning(f"[GigaChat3] JSON decode error: {e}")
+                logger.warning("[GigaChat3] JSON decode error")
                 return StreamingParseResult(
                     normal_text=model_output,
                     calls=[],
@@ -151,7 +151,7 @@ class GigaChat3Detector(BaseFormatDetector):
                 return StreamingParseResult()
             self.tool_name_sent = True
             self.prev_tool_call_arr[0]["name"] = func_name
-            logger.debug(f"[GigaChat3] Sending tool name: {func_name}")
+            logger.debug("[GigaChat3] Sending tool name")
             calls.append(
                 ToolCallItem(
                     tool_index=0,
@@ -168,10 +168,7 @@ class GigaChat3Detector(BaseFormatDetector):
         elif cur_args.startswith(prev_args):
             delta_args = cur_args[len(prev_args) :]
         else:
-            logger.warning(
-                f"[GigaChat3] Arguments overlap mismatch. "
-                f"prev='{prev_args[:50]}...' cur='{cur_args[:50]}...'"
-            )
+            logger.warning("[GigaChat3] Arguments overlap mismatch.")
             return StreamingParseResult()
         if not delta_args:
             return StreamingParseResult()
@@ -181,7 +178,7 @@ class GigaChat3Detector(BaseFormatDetector):
             self.prev_tool_call_arr[0]["arguments"] = args_dict
         except json.JSONDecodeError:
             self.prev_tool_call_arr[0]["arguments"] = {}
-        logger.debug(f"[GigaChat3] Sending args delta: '{delta_args[:100]}...'")
+        logger.debug(f"[GigaChat3] Sending args delta: {len(delta_args)} chars")
         calls.append(
             ToolCallItem(
                 tool_index=0,

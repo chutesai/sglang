@@ -304,7 +304,7 @@ class Step3Detector(BaseFormatDetector):
                     )
                 else:
                     # Invalid function name
-                    logger.warning(f"Invalid function name: {func_name}")
+                    logger.warning("Invalid function name")
                     self._reset_streaming_state()
                     return StreamingParseResult(calls=calls)
             else:

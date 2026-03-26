@@ -66,9 +66,7 @@ class Qwen25Detector(BaseFormatDetector):
                 parsed_call = json.loads(match_result.strip())
                 calls.extend(self.parse_base_json(parsed_call, tools))
             except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
-                )
+                logger.warning("Failed to parse JSON part")
                 continue
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 

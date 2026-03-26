@@ -691,7 +691,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"[http_server] Error: {e}")
+                logger.error("[http_server] Error in streaming generation")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -707,7 +707,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return orjson_response(ret)
         except ValueError as e:
-            logger.error(f"[http_server] Error: {e}")
+            logger.error("[http_server] Error in generation")
             return _create_error_response(e)
 
 

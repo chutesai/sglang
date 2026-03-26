@@ -1218,7 +1218,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
-                    logger.error(f"Reasoning parsing error: {e}")
+                    logger.error("Reasoning parsing error")
                     return self.create_error_response(
                         "Failed to parse reasoning content",
                         err_type="InternalServerError",
@@ -1430,8 +1430,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
-            except json.JSONDecodeError as e:
-                logger.error(f"Tool call parsing error: {e}")
+            except json.JSONDecodeError:
+                logger.error("Tool call parsing error (JSON decode)")
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         # Use parser since output is not constrained by JSON schema
@@ -1457,8 +1457,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, text, finish_reason)
-            except Exception as e:
-                logger.error(f"Tool call parsing error: {e}")
+            except Exception:
+                logger.error("Tool call parsing error")
                 # Return error but don't fail the whole request
                 return ToolCallProcessingResult(None, text, finish_reason)
 

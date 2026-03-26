@@ -137,14 +137,14 @@ class OpenAIServingBase(ABC):
                 status_code=400,
             )
         except DS32EncodingError as e:
-            logger.info(f"DS32EncodingError: {e}")
+            logger.info("DS32EncodingError")
             return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
         except Exception as e:
-            logger.exception(f"Error in request: {e}")
+            logger.error("Error in request")
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
@@ -276,8 +276,8 @@ class OpenAIServingBase(ABC):
                 if raw_request and raw_request.headers.get(header)
                 else None
             )
-        except json.JSONDecodeError as e:
-            logger.exception(f"Error in request: {e}")
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse custom labels header")
             raw_labels = None
 
         if isinstance(raw_labels, dict):

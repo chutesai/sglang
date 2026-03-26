@@ -140,9 +140,7 @@ class MistralDetector(BaseFormatDetector):
 
             if function_name:
                 if function_name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {function_name}"
-                    )
+                    logger.warning("Model attempted to call undefined function")
                 else:
                     calls.append(
                         ToolCallItem(
@@ -447,9 +445,7 @@ class MistralDetector(BaseFormatDetector):
                 return result
             elif function_name and function_name not in tool_indices:
                 # Unknown function, consume and ignore
-                logger.warning(
-                    f"Model attempted to call undefined function: {function_name}"
-                )
+                logger.warning("Model attempted to call undefined function")
                 self._buffer = ""
                 self._devstral_tool_calls_emitted = True
                 return (

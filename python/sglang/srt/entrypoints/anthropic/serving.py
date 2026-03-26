@@ -482,7 +482,7 @@ class AnthropicServing:
             try:
                 chunk = ChatCompletionStreamResponse.model_validate_json(data_str)
             except Exception:
-                logger.debug("Failed to parse stream chunk: %s", data_str)
+                logger.debug("Failed to parse stream chunk")
                 error_event = AnthropicStreamEvent(
                     type="error",
                     error=AnthropicError(

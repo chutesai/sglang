@@ -893,9 +893,7 @@ class ModelConfig:
         # Check for standalone hf_quant_config.json (used by ModelOpt models).
         # Use local_or_cached_path which works in offline mode, unlike
         # has_hf_quant_config which may fail when HF Hub is unreachable.
-        if local_or_cached_path(
-            "hf_quant_config.json", self.model_path, self.revision
-        ):
+        if local_or_cached_path("hf_quant_config.json", self.model_path, self.revision):
             return True
 
         # Check for HuggingFace quantization config (includes online HF Hub check)

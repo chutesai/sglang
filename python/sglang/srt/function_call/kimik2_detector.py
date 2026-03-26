@@ -102,8 +102,7 @@ class KimiK2Detector(BaseFormatDetector):
 
                 if function_name not in tool_indices:
                     logger.warning(
-                        "Model attempted to call undefined function: %s",
-                        function_name,
+                        "Model attempted to call undefined function",
                     )
                     continue
 
@@ -131,14 +130,12 @@ class KimiK2Detector(BaseFormatDetector):
                             )
                         else:
                             logger.error(
-                                "Invalid JSON in tool call '%s' (%d chars) and failed to repair",
-                                function_name,
+                                "Invalid JSON in tool call (%d chars) and failed to repair",
                                 len(function_args),
                             )
                     except Exception:
                         logger.error(
-                            "Invalid JSON in tool call '%s' (%d chars), repaired JSON also invalid",
-                            function_name,
+                            "Invalid JSON in tool call (%d chars), repaired JSON also invalid",
                             len(function_args),
                         )
 
@@ -180,8 +177,7 @@ class KimiK2Detector(BaseFormatDetector):
                 function_name = match.group("function_name")
                 if function_name not in self._tool_indices:
                     logger.warning(
-                        "Model attempted to call undefined function: %s",
-                        function_name,
+                        "Model attempted to call undefined function",
                     )
                     self._buffer = ""
                     self.current_tool_id = -1

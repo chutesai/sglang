@@ -124,9 +124,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                 is_tool_end = partial_match.group(3)
 
                 if func_name not in self._tool_indices:
-                    logger.warning(
-                        "Model attempted to call undefined function: %s", func_name
-                    )
+                    logger.warning("Model attempted to call undefined function")
                     self._buffer = ""
                     self.current_tool_id = -1
                     self.prev_tool_call_arr = []

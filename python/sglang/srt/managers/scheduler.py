@@ -3043,9 +3043,7 @@ class Scheduler(
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
-        logger.info(
-            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
-        )
+        logger.info(f"handle_rpc_request: {recv_req.method}")
 
         success = True
         exec = None
@@ -3058,7 +3056,7 @@ class Scheduler(
         except Exception as e:
             success = False
             exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+            logger.error(f"Failed to call rpc {recv_req.method}")
 
         barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))

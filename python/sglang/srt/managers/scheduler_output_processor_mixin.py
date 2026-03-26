@@ -224,7 +224,7 @@ class SchedulerOutputProcessorMixin:
                             # Grammar accept_token can raise ValueError if the token is not in the grammar.
                             # This can happen if the grammar is not set correctly or the token is invalid.
                             logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                                f"Grammar accept_token failed for req {req.rid}"
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
@@ -506,9 +506,7 @@ class SchedulerOutputProcessorMixin:
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
+                    logger.error(f"Grammar accept_token failed for req {req.rid}")
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 

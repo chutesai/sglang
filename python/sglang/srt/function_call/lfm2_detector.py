@@ -130,9 +130,7 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Validate that the function exists in the tools
         if function_name not in tool_indices:
-            logger.warning(
-                f"Model attempted to call undefined function: {function_name}"
-            )
+            logger.warning("Model attempted to call undefined function")
             if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return None  # Skip unknown tools (default legacy behavior)
 
@@ -146,7 +144,7 @@ class Lfm2Detector(BaseFormatDetector):
             try:
                 arguments[keyword.arg] = self._get_parameter_value(keyword.value)
             except ValueError as e:
-                logger.warning(f"Failed to parse argument {keyword.arg}: {e}")
+                logger.warning("Failed to parse argument")
                 return None
 
         return ToolCallItem(
@@ -251,7 +249,7 @@ class Lfm2Detector(BaseFormatDetector):
                 return calls
             # If JSON parsing failed but it looked like JSON, log the error
             if error:
-                logger.debug(f"JSON parsing failed: {error}, trying Pythonic format")
+                logger.debug("JSON parsing failed, trying Pythonic format")
 
         # Try Pythonic format
         calls, error = self._parse_pythonic_content(content, tools)
@@ -259,7 +257,7 @@ class Lfm2Detector(BaseFormatDetector):
             return calls
 
         if error:
-            logger.warning(f"Failed to parse tool calls: {error}")
+            logger.warning("Failed to parse tool calls")
 
         return []
 

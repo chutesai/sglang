@@ -88,9 +88,7 @@ class PythonicDetector(BaseFormatDetector):
                 function_name = call.func.id
                 # Validate that the function exists in the tools
                 if function_name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {function_name}"
-                    )
+                    logger.warning("Model attempted to call undefined function")
                     if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                         continue  # Skip unknown tools (default legacy behavior)
 

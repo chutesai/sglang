@@ -83,7 +83,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     return params
                 else:
                     return {}
-        logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
+        logger.warning("Tool is not defined in the tools list.")
         return {}
 
     def _convert_param_value(
@@ -97,8 +97,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         if param_name not in param_config:
             if param_config != {}:
                 logger.warning(
-                    f"Parsed parameter '{param_name}' is not defined in the tool "
-                    f"parameters for tool '{func_name}', directly returning the string value."
+                    "Parsed parameter is not defined in the tool parameters, directly returning the string value."
                 )
             return param_value
 
@@ -122,8 +121,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 param_value = int(param_value)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
-                    f"'{func_name}', degenerating to string."
+                    "Parsed value is not an integer, degenerating to string."
                 )
             return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
@@ -135,17 +133,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if maybe_convert and param_value.is_integer():
                     param_value = int(param_value)
             except Exception:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
-                    f"'{func_name}', degenerating to string."
-                )
+                logger.warning("Parsed value is not a float, degenerating to string.")
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
             if param_value not in ["true", "false"]:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
-                )
+                logger.warning("Parsed value is not a boolean, degenerating to false.")
             return param_value == "true"
         else:
             if (
@@ -158,14 +151,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     return param_value
                 except Exception:
                     logger.warning(
-                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
-                        f"'{func_name}', will try other methods to parse it."
+                        "Parsed value cannot be parsed with json.loads, will try other methods to parse it."
                     )
             try:
                 param_value = ast.literal_eval(param_value)  # safer
             except Exception:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                    "Parsed value cannot be converted via Python `ast.literal_eval()`, degenerating to string."
                 )
             return param_value
 

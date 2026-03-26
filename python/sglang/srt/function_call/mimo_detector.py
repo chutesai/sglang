@@ -180,7 +180,7 @@ class MiMoDetector(BaseFormatDetector):
                 func_name = parsed.get("name")
                 if func_name not in tool_indices:
                     # Unknown function
-                    logger.warning(f"Unknown function: {func_name}")
+                    logger.warning("Unknown function")
                     if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                         # Return tool call block as normal text
                         normal_text += text[last_end : match.end()]

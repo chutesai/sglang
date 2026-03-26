@@ -304,7 +304,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                         continue
                     else:
                         # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
+                        logger.warning("Invalid function name")
                         self._reset_streaming_state()
                         normal += self._buf
                         self._buf = ""
