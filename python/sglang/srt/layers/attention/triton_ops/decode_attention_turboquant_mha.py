@@ -316,7 +316,7 @@ def decode_attention_fwd_tq_mha(
     kv_group_num = q_head_num // kv_head_num
 
     BLOCK_N = 32
-    BLOCK_H = min(16, kv_group_num)
+    BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
     BLOCK_DV = triton.next_power_of_2(v_head_dim)
 
     MAX_KV_SPLITS = max_kv_splits
