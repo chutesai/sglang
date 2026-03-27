@@ -666,7 +666,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         # TurboQuant fused dequant-attention path (4-bit MSE only)
         _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
-            layer, "_has_tq_rotated_wvc", False
+            layer, "_tq_fused_ready", False
         )
         if _tq_fused:
             from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant import (

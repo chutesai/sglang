@@ -155,12 +155,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         # multiply by the per-token norm (no additional 1/sqrt(d) factor).
         if self.can_use_fused_kernel:
             raw_centroids = _get_centroids_tensor(self.mse_bits, torch_device)
-            self.nope_centroids_scaled = (
-                raw_centroids / math.sqrt(self.nope_padded_dim)
-            )
-            self.rope_centroids_scaled = (
-                raw_centroids / math.sqrt(self.rope_padded_dim)
-            )
+            self.nope_centroids_scaled = raw_centroids / math.sqrt(self.nope_padded_dim)
+            self.rope_centroids_scaled = raw_centroids / math.sqrt(self.rope_padded_dim)
         else:
             self.nope_centroids_scaled = None
             self.rope_centroids_scaled = None
@@ -172,7 +168,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         m = self.size + self.page_size
         # For "prod" mode, the MSE stage uses bits-1 (remaining bit goes to QJL).
         # Buffer allocation must match what turboquant_quantize actually packs.
-        alloc_bits = self.mse_bits if (self.mode == "prod" and not self.is_mixed) else self.bits
+        alloc_bits = (
+            self.mse_bits if (self.mode == "prod" and not self.is_mixed) else self.bits
+        )
         nope_packed_dim = compute_packed_dim_mixed(self.kv_lora_rank, alloc_bits)
         rope_packed_dim = compute_packed_dim_mixed(self.qk_rope_head_dim, alloc_bits)
 
@@ -343,9 +341,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                 if self.mode == "prod" and qjl_buf is not None:
                     c_qjl = qjl_buf[start:end]
                     quantized["qjl_signs"] = c_qjl.reshape(-1, c_qjl.shape[-1])
-                    quantized["residual_norms"] = residual_norms_buf[
-                        start:end
-                    ].reshape(-1)
+                    quantized["residual_norms"] = residual_norms_buf[start:end].reshape(
+                        -1
+                    )
                 result = turboquant_dequantize(
                     quantized, hadamard, int(self.bits), self.mode, self.dtype
                 )
@@ -360,9 +358,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         # Dequant nope into workspace[:, :, :kv_lora_rank]
         nope_ws = self._kv_workspace[:, :, : self.kv_lora_rank]
         nope_qjl = self.nope_qjl_buffer[idx] if self.mode == "prod" else None
-        nope_res = (
-            self.nope_residual_norms_buffer[idx] if self.mode == "prod" else None
-        )
+        nope_res = self.nope_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_component_chunked(
             self.nope_packed_buffer[idx],
             self.nope_norms_buffer[idx],
@@ -380,9 +376,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         # Dequant rope into workspace[:, :, kv_lora_rank:]
         rope_ws = self._kv_workspace[:, :, self.kv_lora_rank :]
         rope_qjl = self.rope_qjl_buffer[idx] if self.mode == "prod" else None
-        rope_res = (
-            self.rope_residual_norms_buffer[idx] if self.mode == "prod" else None
-        )
+        rope_res = self.rope_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_component_chunked(
             self.rope_packed_buffer[idx],
             self.rope_norms_buffer[idx],
@@ -412,9 +406,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         idx = layer_id - self.start_layer
         nope_ws = self._kv_workspace[:, :, : self.kv_lora_rank]
         nope_qjl = self.nope_qjl_buffer[idx] if self.mode == "prod" else None
-        nope_res = (
-            self.nope_residual_norms_buffer[idx] if self.mode == "prod" else None
-        )
+        nope_res = self.nope_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_component_chunked(
             self.nope_packed_buffer[idx],
             self.nope_norms_buffer[idx],
@@ -454,20 +446,31 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         """Float32 rope norms for a layer."""
         return self.rope_norms_buffer[layer_id - self.start_layer]
 
-    def _quantize_component(self, data_flat, hadamard, hadamard_hi=None, hadamard_lo=None, split_dim=0):
+    def _quantize_component(
+        self, data_flat, hadamard, hadamard_hi=None, hadamard_lo=None, split_dim=0
+    ):
         """Quantize a flat tensor using TurboQuant."""
         if self.is_mixed:
             return turboquant_quantize_mixed(
-                data_flat, hadamard_hi, hadamard_lo,
-                self.bits_hi, self.bits_lo, split_dim,
+                data_flat,
+                hadamard_hi,
+                hadamard_lo,
+                self.bits_hi,
+                self.bits_lo,
+                split_dim,
             )
         else:
-            return turboquant_quantize(
-                data_flat, hadamard, int(self.bits), self.mode
-            )
+            return turboquant_quantize(data_flat, hadamard, int(self.bits), self.mode)
 
-    def _store_quantized(self, q_result, packed_buf, norms_buf, num_tokens,
-                         qjl_buf=None, residual_norms_buf=None):
+    def _store_quantized(
+        self,
+        q_result,
+        packed_buf,
+        norms_buf,
+        num_tokens,
+        qjl_buf=None,
+        residual_norms_buf=None,
+    ):
         """Store quantized result into the appropriate buffers at loc."""
         if self.is_mixed:
             packed = torch.cat([q_result["packed_hi"], q_result["packed_lo"]], dim=-1)
@@ -494,7 +497,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         # Split into nope and rope
         cache_k_nope = cache_k[:, :, : self.kv_lora_rank].reshape(-1, self.kv_lora_rank)
-        cache_k_rope = cache_k[:, :, self.kv_lora_rank :].reshape(-1, self.qk_rope_head_dim)
+        cache_k_rope = cache_k[:, :, self.kv_lora_rank :].reshape(
+            -1, self.qk_rope_head_dim
+        )
 
         self._quantize_and_store(idx, loc, cache_k_nope, cache_k_rope, num_tokens)
 
@@ -519,7 +524,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         """Core quantization + storage for both set_kv_buffer and set_mla_kv_buffer."""
         # Quantize nope
         nope_q = self._quantize_component(
-            nope_flat, self.nope_hadamard,
+            nope_flat,
+            self.nope_hadamard,
             hadamard_hi=getattr(self, "nope_hadamard_hi", None),
             hadamard_lo=getattr(self, "nope_hadamard_lo", None),
             split_dim=getattr(self, "_nope_split_dim", 0),
@@ -527,7 +533,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         # Quantize rope
         rope_q = self._quantize_component(
-            rope_flat, self.rope_hadamard,
+            rope_flat,
+            self.rope_hadamard,
             hadamard_hi=getattr(self, "rope_hadamard_hi", None),
             hadamard_lo=getattr(self, "rope_hadamard_lo", None),
             split_dim=getattr(self, "_rope_split_dim", 0),
@@ -535,9 +542,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         # Store nope
         if self.is_mixed:
-            packed_nope = torch.cat(
-                [nope_q["packed_hi"], nope_q["packed_lo"]], dim=-1
-            )
+            packed_nope = torch.cat([nope_q["packed_hi"], nope_q["packed_lo"]], dim=-1)
             self.nope_packed_buffer[idx][loc] = packed_nope.reshape(num_tokens, 1, -1)
             nope_norms = torch.stack(
                 [nope_q["norms_hi"], nope_q["norms_lo"]], dim=-1
@@ -551,9 +556,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         # Store rope
         if self.is_mixed:
-            packed_rope = torch.cat(
-                [rope_q["packed_hi"], rope_q["packed_lo"]], dim=-1
-            )
+            packed_rope = torch.cat([rope_q["packed_hi"], rope_q["packed_lo"]], dim=-1)
             self.rope_packed_buffer[idx][loc] = packed_rope.reshape(num_tokens, 1, -1)
             rope_norms = torch.stack(
                 [rope_q["norms_hi"], rope_q["norms_lo"]], dim=-1

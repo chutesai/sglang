@@ -817,11 +817,14 @@ class ModelRunnerKVCacheMixin:
                 )
 
     def _setup_turboquant_fused_decode(self: ModelRunner):
-        """Set up rotated w_vc for TurboQuant fused decode kernel.
+        """Set up TurboQuant fused decode kernel for MLA attention modules.
 
-        After pool init, iterate over attention modules and compute
-        w_vc_tq_rotated = R @ w_vc using the pool's Hadamard transform.
-        Also sets _has_tq_rotated_wvc on RadixAttention layers.
+        For non-deep_gemm modules: compute w_vc_tq_rotated = R @ w_vc.
+        For deep_gemm modules: store Hadamard transform for inverse rotation,
+        allowing the fused kernel output to be unrotated then fed into the
+        existing FP8 deep_gemm path with original weights.
+
+        Sets _tq_fused_ready on RadixAttention layers.
         """
         pool = self.token_to_kv_pool
         if not getattr(pool, "can_use_fused_kernel", False):
@@ -841,26 +844,29 @@ class ModelRunnerKVCacheMixin:
             w_vc = module.w_vc
             if w_vc is None:
                 continue
-            # Skip deep_gemm modules — fused TQ produces bf16 output incompatible with FP8 grouped GEMM
+
             if getattr(module, "use_deep_gemm_bmm", False):
+                # Deep_gemm path: inverse-rotate fused output, use original FP8 weights
+                module._tq_nope_hadamard = hadamard
+                if hasattr(module, "attn_mqa"):
+                    module.attn_mqa._tq_fused_ready = True
+                count += 1
                 continue
 
+            # Non-deep_gemm: compute rotated bf16 weights
             w_scale = getattr(module, "w_scale", None)
             w_vc_rot = compute_rotated_wvc(w_vc, hadamard, w_scale=w_scale)
 
             if w_vc_rot is not None:
                 module.w_vc_tq_rotated = w_vc_rot
-                # Set flag on the RadixAttention wrapper (attn_mqa)
                 if hasattr(module, "attn_mqa"):
-                    module.attn_mqa._has_tq_rotated_wvc = True
+                    module.attn_mqa._tq_fused_ready = True
                 count += 1
             else:
                 module.w_vc_tq_rotated = None
 
         if count > 0:
-            logger.info(
-                f"TurboQuant fused decode: computed rotated w_vc for {count} layers"
-            )
+            logger.info(f"TurboQuant fused decode: set up {count} layers")
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,

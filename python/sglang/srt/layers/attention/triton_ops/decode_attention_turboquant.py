@@ -20,8 +20,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    _fwd_kernel_stage2,
     _MIN_BLOCK_KV,
+    _fwd_kernel_stage2,
     tanh,
 )
 
@@ -123,9 +123,9 @@ def _fwd_grouped_kernel_stage1_tq(
         q_nope_even = tl.load(
             Q_Nope + offs_qn_even, mask=mask_h[:, None], other=0.0
         ).to(tl.bfloat16)
-        q_nope_odd = tl.load(
-            Q_Nope + offs_qn_odd, mask=mask_h[:, None], other=0.0
-        ).to(tl.bfloat16)
+        q_nope_odd = tl.load(Q_Nope + offs_qn_odd, mask=mask_h[:, None], other=0.0).to(
+            tl.bfloat16
+        )
 
         # Load Q rope (even/odd)
         offs_rope_even = tl.arange(0, ROPE_PACKED_DIM) * 2
@@ -144,9 +144,9 @@ def _fwd_grouped_kernel_stage1_tq(
         q_rope_even = tl.load(
             Q_Rope + offs_qr_even, mask=mask_h[:, None], other=0.0
         ).to(tl.bfloat16)
-        q_rope_odd = tl.load(
-            Q_Rope + offs_qr_odd, mask=mask_h[:, None], other=0.0
-        ).to(tl.bfloat16)
+        q_rope_odd = tl.load(Q_Rope + offs_qr_odd, mask=mask_h[:, None], other=0.0).to(
+            tl.bfloat16
+        )
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -161,8 +161,7 @@ def _fwd_grouped_kernel_stage1_tq(
             # ----------------------------------------------------------
             offs_nope_packed = tl.arange(0, NOPE_PACKED_DIM)
             offs_buf_nope = (
-                kv_loc[:, None] * stride_nope_p_bs
-                + offs_nope_packed[None, :]
+                kv_loc[:, None] * stride_nope_p_bs + offs_nope_packed[None, :]
             )
             nope_bytes = tl.load(
                 Nope_Packed + offs_buf_nope,
@@ -199,8 +198,7 @@ def _fwd_grouped_kernel_stage1_tq(
             # ----------------------------------------------------------
             offs_rope_packed = tl.arange(0, ROPE_PACKED_DIM)
             offs_buf_rope = (
-                kv_loc[:, None] * stride_rope_p_bs
-                + offs_rope_packed[None, :]
+                kv_loc[:, None] * stride_rope_p_bs + offs_rope_packed[None, :]
             )
             rope_bytes = tl.load(
                 Rope_Packed + offs_buf_rope,

@@ -12,8 +12,6 @@ where R^T @ R = I (orthogonal).
 This module computes w_vc_rot = R @ w_vc once at model load time.
 """
 
-import math
-
 import torch
 
 
@@ -60,6 +58,8 @@ def compute_rotated_wvc(
     # Transpose → apply → transpose back.
     w_vc_t = w_vc_f.transpose(1, 2)  # (heads, v_head_dim, kv_lora_rank)
     w_vc_t_rot = hadamard_transform.forward(w_vc_t)  # R applied along last dim
-    w_vc_rot = w_vc_t_rot.transpose(1, 2).contiguous()  # (heads, kv_lora_rank, v_head_dim)
+    w_vc_rot = w_vc_t_rot.transpose(
+        1, 2
+    ).contiguous()  # (heads, kv_lora_rank, v_head_dim)
 
     return w_vc_rot.to(torch.bfloat16)

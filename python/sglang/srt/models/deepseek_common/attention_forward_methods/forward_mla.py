@@ -406,22 +406,31 @@ class DeepseekMLAForwardMixin:
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         # TurboQuant fused decode: output is in Hadamard-rotated space.
-        # Use the pre-rotated w_vc to cancel the rotation:
-        #   o_rot @ w_vc_rot = (o @ R^T) @ (R @ w_vc) = o @ w_vc
-        _use_rotated_wvc = getattr(forward_batch, "_tq_rotated_output", False)
-        if _use_rotated_wvc:
-            forward_batch._tq_rotated_output = False  # consume flag
-            # w_vc_tq_rotated is always bf16
-            attn_bmm_output = (
-                torch.bmm(
-                    attn_output.to(torch.bfloat16).transpose(0, 1),
-                    self.w_vc_tq_rotated,
+        _use_tq_fused = getattr(forward_batch, "_tq_rotated_output", False)
+        if _use_tq_fused:
+            forward_batch._tq_rotated_output = False  # always consume
+
+            if self.use_deep_gemm_bmm:
+                # Inverse-rotate fused output back to original latent space,
+                # then fall through to existing deep_gemm projection below.
+                # The fused kernel produces o_rot = R @ o_true; inverse gives o_true.
+                attn_output = self._tq_nope_hadamard.inverse(attn_output.float()).to(
+                    attn_output.dtype
                 )
-                .transpose(0, 1)
-                .flatten(1, 2)
-            )
-            output, _ = self.o_proj(attn_bmm_output)
-            return output
+                # (don't return — fall through to deep_gemm path)
+            else:
+                # Non-deep_gemm: bf16 BMM with pre-rotated w_vc
+                #   o_rot @ w_vc_rot = (o @ R^T) @ (R @ w_vc) = o @ w_vc
+                attn_bmm_output = (
+                    torch.bmm(
+                        attn_output.to(torch.bfloat16).transpose(0, 1),
+                        self.w_vc_tq_rotated,
+                    )
+                    .transpose(0, 1)
+                    .flatten(1, 2)
+                )
+                output, _ = self.o_proj(attn_bmm_output)
+                return output
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
