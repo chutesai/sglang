@@ -73,8 +73,12 @@ class TurboQuantConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "TurboQuantConfig":
-        bits = cls.get_from_keys_or(config, ["bits", "turboquant_bits"], TURBOQUANT_DEFAULT_BITS)
-        mode = cls.get_from_keys_or(config, ["mode", "turboquant_mode"], TURBOQUANT_DEFAULT_MODE)
+        bits = cls.get_from_keys_or(
+            config, ["bits", "turboquant_bits"], TURBOQUANT_DEFAULT_BITS
+        )
+        mode = cls.get_from_keys_or(
+            config, ["mode", "turboquant_mode"], TURBOQUANT_DEFAULT_MODE
+        )
         return cls(bits=bits, mode=mode)
 
     def get_quant_method(

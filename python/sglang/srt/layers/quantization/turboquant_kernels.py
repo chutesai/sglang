@@ -186,7 +186,9 @@ def compute_packed_dim(padded_dim: int, bits: int) -> int:
     if bits == 4:
         return padded_dim // 2
     elif bits == 3:
-        assert padded_dim % 8 == 0, "padded_dim must be divisible by 8 for 3-bit packing"
+        assert (
+            padded_dim % 8 == 0
+        ), "padded_dim must be divisible by 8 for 3-bit packing"
         return (padded_dim * 3) // 8
     elif bits == 2:
         return padded_dim // 4
@@ -258,7 +260,9 @@ def unpack_indices(packed: torch.Tensor, bits: int, padded_dim: int) -> torch.Te
         i1 = ((p >> 2) & 0x03).to(torch.uint8)
         i2 = ((p >> 4) & 0x03).to(torch.uint8)
         i3 = ((p >> 6) & 0x03).to(torch.uint8)
-        return torch.stack([i0, i1, i2, i3], dim=-1).reshape(*packed.shape[:-1], padded_dim)
+        return torch.stack([i0, i1, i2, i3], dim=-1).reshape(
+            *packed.shape[:-1], padded_dim
+        )
     elif bits == 1:
         p = packed.to(torch.int32)
         parts = [((p >> i) & 1).to(torch.uint8) for i in range(8)]
@@ -287,9 +291,9 @@ def unpack_indices(packed: torch.Tensor, bits: int, padded_dim: int) -> torch.Te
 @triton.jit
 def _turboquant_quantize_kernel(
     # Pointers
-    rotated_ptr,       # [num_tokens, dim] float32 input (already rotated)
-    indices_ptr,       # [num_tokens, padded_dim] uint8 output (unpacked)
-    centroids_ptr,     # [num_centroids] float32
+    rotated_ptr,  # [num_tokens, dim] float32 input (already rotated)
+    indices_ptr,  # [num_tokens, padded_dim] uint8 output (unpacked)
+    centroids_ptr,  # [num_centroids] float32
     # Strides
     rotated_stride_0: tl.constexpr,
     indices_stride_0: tl.constexpr,
@@ -305,7 +309,9 @@ def _turboquant_quantize_kernel(
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < DIM
 
-    vals = tl.load(rotated_ptr + token_id * rotated_stride_0 + offs, mask=mask, other=0.0)
+    vals = tl.load(
+        rotated_ptr + token_id * rotated_stride_0 + offs, mask=mask, other=0.0
+    )
 
     best_idx = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     best_dist = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
@@ -317,14 +323,18 @@ def _turboquant_quantize_kernel(
         best_idx = tl.where(closer, c, best_idx)
         best_dist = tl.where(closer, dist, best_dist)
 
-    tl.store(indices_ptr + token_id * indices_stride_0 + offs, best_idx.to(tl.uint8), mask=mask)
+    tl.store(
+        indices_ptr + token_id * indices_stride_0 + offs,
+        best_idx.to(tl.uint8),
+        mask=mask,
+    )
 
 
 @triton.jit
 def _turboquant_dequantize_packed_4bit_kernel(
-    packed_ptr,        # [num_tokens, packed_dim] uint8 input (nibble-packed)
-    output_ptr,        # [num_tokens, padded_dim] float32 output
-    centroids_ptr,     # [num_centroids] float32
+    packed_ptr,  # [num_tokens, packed_dim] uint8 input (nibble-packed)
+    output_ptr,  # [num_tokens, padded_dim] float32 output
+    centroids_ptr,  # [num_centroids] float32
     packed_stride_0: tl.constexpr,
     output_stride_0: tl.constexpr,
     PADDED_DIM: tl.constexpr,
@@ -339,7 +349,9 @@ def _turboquant_dequantize_packed_4bit_kernel(
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < PACKED_DIM
 
-    packed = tl.load(packed_ptr + token_id * packed_stride_0 + offs, mask=mask, other=0).to(tl.int32)
+    packed = tl.load(
+        packed_ptr + token_id * packed_stride_0 + offs, mask=mask, other=0
+    ).to(tl.int32)
 
     idx_even = packed & 0x0F
     idx_odd = (packed >> 4) & 0x0F
@@ -349,17 +361,23 @@ def _turboquant_dequantize_packed_4bit_kernel(
 
     coord_even = offs * 2
     coord_odd = offs * 2 + 1
-    tl.store(output_ptr + token_id * output_stride_0 + coord_even, val_even,
-             mask=mask & (coord_even < PADDED_DIM))
-    tl.store(output_ptr + token_id * output_stride_0 + coord_odd, val_odd,
-             mask=mask & (coord_odd < PADDED_DIM))
+    tl.store(
+        output_ptr + token_id * output_stride_0 + coord_even,
+        val_even,
+        mask=mask & (coord_even < PADDED_DIM),
+    )
+    tl.store(
+        output_ptr + token_id * output_stride_0 + coord_odd,
+        val_odd,
+        mask=mask & (coord_odd < PADDED_DIM),
+    )
 
 
 @triton.jit
 def _turboquant_dequantize_kernel(
-    indices_ptr,       # [num_tokens, padded_dim] uint8 input (unpacked)
-    output_ptr,        # [num_tokens, padded_dim] float32 output
-    centroids_ptr,     # [num_centroids] float32
+    indices_ptr,  # [num_tokens, padded_dim] uint8 input (unpacked)
+    output_ptr,  # [num_tokens, padded_dim] float32 output
+    centroids_ptr,  # [num_centroids] float32
     indices_stride_0: tl.constexpr,
     output_stride_0: tl.constexpr,
     DIM: tl.constexpr,
@@ -372,7 +390,9 @@ def _turboquant_dequantize_kernel(
     offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < DIM
 
-    idx = tl.load(indices_ptr + token_id * indices_stride_0 + offs, mask=mask, other=0).to(tl.int32)
+    idx = tl.load(
+        indices_ptr + token_id * indices_stride_0 + offs, mask=mask, other=0
+    ).to(tl.int32)
     vals = tl.load(centroids_ptr + idx, mask=mask, other=0.0)
     tl.store(output_ptr + token_id * output_stride_0 + offs, vals, mask=mask)
 
@@ -602,7 +622,9 @@ def compute_packed_dim_mixed(head_dim: int, bits) -> int:
     split = head_dim // 2
     hi_padded = _next_power_of_2(split)
     lo_padded = _next_power_of_2(head_dim - split)
-    return compute_packed_dim(hi_padded, bits_hi) + compute_packed_dim(lo_padded, bits_lo)
+    return compute_packed_dim(hi_padded, bits_hi) + compute_packed_dim(
+        lo_padded, bits_lo
+    )
 
 
 def turboquant_quantize_mixed(
@@ -763,7 +785,9 @@ def turboquant_dequantize_kv_cache(
 # ---------------------------------------------------------------------------
 
 
-def compute_compression_ratio(head_dim: int, bits, mode: str = "mse", dtype_bytes: int = 2) -> float:
+def compute_compression_ratio(
+    head_dim: int, bits, mode: str = "mse", dtype_bytes: int = 2
+) -> float:
     """Compute the theoretical compression ratio vs baseline dtype.
 
     Args:

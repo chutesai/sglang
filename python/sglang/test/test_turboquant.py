@@ -14,12 +14,15 @@ import os
 import sys
 
 import torch
-import torch.nn.functional as F
 
 # Direct import to avoid sglang's full package init.
 _kernels_path = os.path.join(
     os.path.dirname(__file__),
-    "..", "srt", "layers", "quantization", "turboquant_kernels.py",
+    "..",
+    "srt",
+    "layers",
+    "quantization",
+    "turboquant_kernels.py",
 )
 _spec = importlib.util.spec_from_file_location(
     "turboquant_kernels", os.path.abspath(_kernels_path)
@@ -50,18 +53,23 @@ PAPER_MSE = {1: 0.36, 2: 0.117, 3: 0.03, 4: 0.009}
 # Core unit tests
 # ---------------------------------------------------------------------------
 
+
 def test_hadamard_roundtrip():
     for dim in [64, 128, 256]:
         h = HadamardTransform(dim, seed=42, device=DEVICE)
         x = torch.randn(32, dim, device=DEVICE)
-        err = (x.float() - h.inverse(h.forward(x.float())).float()).norm() / x.float().norm()
+        err = (
+            x.float() - h.inverse(h.forward(x.float())).float()
+        ).norm() / x.float().norm()
         assert err < 1e-5, f"dim={dim}: roundtrip error {err:.6e}"
     print("PASS: test_hadamard_roundtrip")
 
 
 def test_pack_unpack_roundtrip():
     for bits in [1, 2, 3, 4]:
-        indices = torch.randint(0, 1 << bits, (64, 128), dtype=torch.uint8, device=DEVICE)
+        indices = torch.randint(
+            0, 1 << bits, (64, 128), dtype=torch.uint8, device=DEVICE
+        )
         unpacked = unpack_indices(pack_indices(indices, bits), bits, 128)
         assert torch.equal(indices, unpacked), f"bits={bits}: failed"
     print("PASS: test_pack_unpack_roundtrip")
@@ -75,7 +83,9 @@ def test_quantize_dequantize_quality():
         q = turboquant_quantize(x, h, bits, "mse")
         r = turboquant_dequantize(q, h, bits, "mse", torch.float32)
         rel_mse = ((x.float() - r) ** 2).mean().item() / (x.float() ** 2).mean().item()
-        assert rel_mse < PAPER_MSE[bits] * 1.2, f"{bits}b: MSE {rel_mse:.4f} > paper {PAPER_MSE[bits]}"
+        assert (
+            rel_mse < PAPER_MSE[bits] * 1.2
+        ), f"{bits}b: MSE {rel_mse:.4f} > paper {PAPER_MSE[bits]}"
         print(f"  {bits}b: relMSE={rel_mse:.6f} (paper: <={PAPER_MSE[bits]})")
     print("PASS: test_quantize_dequantize_quality")
 
@@ -101,14 +111,32 @@ def test_mixed_precision():
         h_lo = HadamardTransform(dim - split, seed=43, device=DEVICE)
         qm = turboquant_quantize_mixed(x, h_hi, h_lo, bh, bl, split)
         rm = turboquant_dequantize_mixed(qm, h_hi, h_lo, torch.float32)
-        mse_mixed = ((x.float() - rm) ** 2).mean().item() / (x.float() ** 2).mean().item()
+        mse_mixed = ((x.float() - rm) ** 2).mean().item() / (
+            x.float() ** 2
+        ).mean().item()
         # Should be between the two uniform component MSEs
         q_lo = turboquant_quantize(x, h_full, bl, "mse")
-        mse_lo = ((x.float() - turboquant_dequantize(q_lo, h_full, bl, "mse", torch.float32)[:, :dim]) ** 2).mean().item() / (x.float() ** 2).mean().item()
+        mse_lo = (
+            (
+                x.float()
+                - turboquant_dequantize(q_lo, h_full, bl, "mse", torch.float32)[:, :dim]
+            )
+            ** 2
+        ).mean().item() / (x.float() ** 2).mean().item()
         q_hi = turboquant_quantize(x, h_full, bh, "mse")
-        mse_hi = ((x.float() - turboquant_dequantize(q_hi, h_full, bh, "mse", torch.float32)[:, :dim]) ** 2).mean().item() / (x.float() ** 2).mean().item()
-        assert mse_hi < mse_mixed < mse_lo, f"{eff}b: {mse_hi:.4f} < {mse_mixed:.4f} < {mse_lo:.4f} failed"
-        print(f"  {eff}b mixed (independent instances): MSE={mse_mixed:.6f} (between {bl}b={mse_lo:.6f} and {bh}b={mse_hi:.6f})")
+        mse_hi = (
+            (
+                x.float()
+                - turboquant_dequantize(q_hi, h_full, bh, "mse", torch.float32)[:, :dim]
+            )
+            ** 2
+        ).mean().item() / (x.float() ** 2).mean().item()
+        assert (
+            mse_hi < mse_mixed < mse_lo
+        ), f"{eff}b: {mse_hi:.4f} < {mse_mixed:.4f} < {mse_lo:.4f} failed"
+        print(
+            f"  {eff}b mixed (independent instances): MSE={mse_mixed:.6f} (between {bl}b={mse_lo:.6f} and {bh}b={mse_hi:.6f})"
+        )
     print("PASS: test_mixed_precision")
 
 
@@ -126,12 +154,14 @@ def _make_hadamard_set(hd, bits):
     if is_mixed:
         split = hd // 2
         return {
-            "k_h": None, "v_h": None,
+            "k_h": None,
+            "v_h": None,
             "k_hi": HadamardTransform(split, seed=_SEED_K, device=DEVICE),
             "k_lo": HadamardTransform(hd - split, seed=_SEED_K_LO, device=DEVICE),
             "v_hi": HadamardTransform(split, seed=_SEED_V, device=DEVICE),
             "v_lo": HadamardTransform(hd - split, seed=_SEED_V_LO, device=DEVICE),
-            "k_split": split, "v_split": split,
+            "k_split": split,
+            "v_split": split,
         }
     return {
         "k_h": HadamardTransform(hd, seed=_SEED_K, device=DEVICE),
@@ -156,6 +186,7 @@ def _quantize_roundtrip(flat, bits, hs, is_key=True):
 def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=50):
     """Autoregressive generation with TQ-compressed KV cache."""
     from transformers import DynamicCache
+
     hs = _make_hadamard_set(hd, bits)
 
     with torch.no_grad():
@@ -163,9 +194,22 @@ def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=50):
         tql = []
         for lkv in out.past_key_values:
             k, v = lkv[0], lkv[1]
-            b, h, s, dk = k.shape; dv = v.shape[-1]
-            kr = _quantize_roundtrip(k.permute(0,2,1,3).reshape(-1,dk), bits, hs, True)[:,:dk].reshape(b,s,h,dk).permute(0,2,1,3)
-            vr = _quantize_roundtrip(v.permute(0,2,1,3).reshape(-1,dv), bits, hs, False)[:,:dv].reshape(b,s,h,dv).permute(0,2,1,3)
+            b, h, s, dk = k.shape
+            dv = v.shape[-1]
+            kr = (
+                _quantize_roundtrip(
+                    k.permute(0, 2, 1, 3).reshape(-1, dk), bits, hs, True
+                )[:, :dk]
+                .reshape(b, s, h, dk)
+                .permute(0, 2, 1, 3)
+            )
+            vr = (
+                _quantize_roundtrip(
+                    v.permute(0, 2, 1, 3).reshape(-1, dv), bits, hs, False
+                )[:, :dv]
+                .reshape(b, s, h, dv)
+                .permute(0, 2, 1, 3)
+            )
             tql.append((kr, vr))
         tc = DynamicCache()
         for li, (kt, vt) in enumerate(tql):
@@ -178,12 +222,29 @@ def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=50):
             nl = []
             for lkv in tc:
                 kf, vf = lkv[0], lkv[1]
-                kn, vn = kf[:,:,-1:,:], vf[:,:,-1:,:]
-                b2, h2, _, dk2 = kn.shape; dv2 = vn.shape[-1]
-                kr2 = _quantize_roundtrip(kn.permute(0,2,1,3).reshape(-1,dk2), bits, hs, True)[:,:dk2].reshape(b2,1,h2,dk2).permute(0,2,1,3)
-                vr2 = _quantize_roundtrip(vn.permute(0,2,1,3).reshape(-1,dv2), bits, hs, False)[:,:dv2].reshape(b2,1,h2,dv2).permute(0,2,1,3)
-                nl.append((torch.cat([kf[:,:,:-1,:], kr2], dim=2),
-                           torch.cat([vf[:,:,:-1,:], vr2], dim=2)))
+                kn, vn = kf[:, :, -1:, :], vf[:, :, -1:, :]
+                b2, h2, _, dk2 = kn.shape
+                dv2 = vn.shape[-1]
+                kr2 = (
+                    _quantize_roundtrip(
+                        kn.permute(0, 2, 1, 3).reshape(-1, dk2), bits, hs, True
+                    )[:, :dk2]
+                    .reshape(b2, 1, h2, dk2)
+                    .permute(0, 2, 1, 3)
+                )
+                vr2 = (
+                    _quantize_roundtrip(
+                        vn.permute(0, 2, 1, 3).reshape(-1, dv2), bits, hs, False
+                    )[:, :dv2]
+                    .reshape(b2, 1, h2, dv2)
+                    .permute(0, 2, 1, 3)
+                )
+                nl.append(
+                    (
+                        torch.cat([kf[:, :, :-1, :], kr2], dim=2),
+                        torch.cat([vf[:, :, :-1, :], vr2], dim=2),
+                    )
+                )
             tc = DynamicCache()
             for li, (kt, vt) in enumerate(nl):
                 tc.update(kt.contiguous(), vt.contiguous(), li)
@@ -210,10 +271,17 @@ def _benchmark_model(model_id, prompts, bit_widths):
     inp0 = tokenizer(prompts[0][1], return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         o = model(**inp0, use_cache=True)
-        ak = torch.cat([torch.norm(l[0].float().reshape(-1, l[0].shape[-1]), dim=-1) for l in o.past_key_values])
-    amp = ak.mean().item() / hd ** 0.5
+        ak = torch.cat(
+            [
+                torch.norm(l[0].float().reshape(-1, l[0].shape[-1]), dim=-1)
+                for l in o.past_key_values
+            ]
+        )
+    amp = ak.mean().item() / hd**0.5
 
-    print(f"  {model_id}: {cfg.num_hidden_layers}L, {cfg.num_key_value_heads} KV heads, d={hd}, K-norm amp={amp:.1f}x")
+    print(
+        f"  {model_id}: {cfg.num_hidden_layers}L, {cfg.num_key_value_heads} KV heads, d={hd}, K-norm amp={amp:.1f}x"
+    )
 
     # MSE at each bit-width
     mse_results = {}
@@ -225,8 +293,11 @@ def _benchmark_model(model_id, prompts, bit_widths):
                 for idx, orig in enumerate([lkv[0], lkv[1]]):
                     flat = orig.float().reshape(-1, orig.shape[-1])
                     r = _quantize_roundtrip(flat, bits, hs, is_key=(idx == 0))
-                    r = r.float()[:, :flat.shape[-1]]
-                    ms.append(((flat - r) ** 2).mean().item() / ((flat ** 2).mean().item() + 1e-10))
+                    r = r.float()[:, : flat.shape[-1]]
+                    ms.append(
+                        ((flat - r) ** 2).mean().item()
+                        / ((flat**2).mean().item() + 1e-10)
+                    )
         mse_results[bits] = sum(ms) / len(ms)
 
     # Generation at each bit-width
@@ -237,7 +308,7 @@ def _benchmark_model(model_id, prompts, bit_widths):
             inp = tokenizer(prompt, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
                 bf = model.generate(**inp, max_new_tokens=50, do_sample=False)
-            bg = bf[0].tolist()[inp["input_ids"].shape[1]:]
+            bg = bf[0].tolist()[inp["input_ids"].shape[1] :]
             tg = _tq_generate(model, tokenizer, inp, bits, hd, 50)
             n = min(len(bg), len(tg))
             m = sum(1 for a, b in zip(bg, tg) if a == b)
@@ -291,6 +362,7 @@ def test_benchmark_qwen3_4b():
 # Main: run all tests and print comparison grid
 # ---------------------------------------------------------------------------
 
+
 def print_grid(results):
     """Print the detailed before/after comparison grid."""
     print(f"\n{'='*90}")
@@ -299,7 +371,9 @@ def print_grid(results):
 
     # Table 1: MSE
     print(f"\nTABLE 1: QUANTIZATION DISTORTION")
-    print(f"  {'Bits':>5s}  {'Compress':>8s}  {'Our MSE':>10s}  {'Paper MSE':>10s}  {'Match':>5s}")
+    print(
+        f"  {'Bits':>5s}  {'Compress':>8s}  {'Our MSE':>10s}  {'Paper MSE':>10s}  {'Match':>5s}"
+    )
     print(f"  {'─'*5}  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*5}")
     for bits in [2.5, 3.5, 4]:
         comp = compute_compression_ratio(128, bits)
@@ -309,9 +383,15 @@ def print_grid(results):
             if mse_val is None:
                 continue
             p_str = f"{paper:.3f}" if paper else "(mixed)"
-            match = "YES" if paper and abs(mse_val - paper) / paper < 0.2 else "N/A" if not paper else "NO"
+            match = (
+                "YES"
+                if paper and abs(mse_val - paper) / paper < 0.2
+                else "N/A" if not paper else "NO"
+            )
             name = model_id.split("/")[-1][:15]
-            print(f"  {bits:>5g}  {comp:>7.2f}x  {mse_val:>10.6f}  {p_str:>10s}  {match:>5s}  [{name}]")
+            print(
+                f"  {bits:>5g}  {comp:>7.2f}x  {mse_val:>10.6f}  {p_str:>10s}  {match:>5s}  [{name}]"
+            )
 
     # Table 2: Generation
     print(f"\nTABLE 2: GENERATION QUALITY (bf16 vs TurboQuant, greedy 50 tokens)")
@@ -334,23 +414,59 @@ def print_grid(results):
 
     # Table 3: Paper comparison
     print(f"\nTABLE 3: PAPER COMPARISON")
-    print(f"  +──────────────────────+──────────────────────+──────────────────────+───────+")
-    print(f"  | Metric               | Paper                | Ours                 | Match |")
-    print(f"  +──────────────────────+──────────────────────+──────────────────────+───────+")
+    print(
+        f"  +──────────────────────+──────────────────────+──────────────────────+───────+"
+    )
+    print(
+        f"  | Metric               | Paper                | Ours                 | Match |"
+    )
+    print(
+        f"  +──────────────────────+──────────────────────+──────────────────────+───────+"
+    )
 
     # Get first model's results for comparison
     first = next(iter(results.values()))
     _, mse0, gen0 = first
 
     rows = [
-        ("MSE (4-bit)", f"<=0.009 (Theorem 1)", f"{mse0.get(4, 0):.6f}", mse0.get(4, 1) < 0.015),
+        (
+            "MSE (4-bit)",
+            f"<=0.009 (Theorem 1)",
+            f"{mse0.get(4, 0):.6f}",
+            mse0.get(4, 1) < 0.015,
+        ),
         ("MSE (3.5-bit mix)", f"(not reported)", f"{mse0.get(3.5, 0):.6f}", None),
         ("MSE (2.5-bit mix)", f"(not reported)", f"{mse0.get(2.5, 0):.6f}", None),
-        ("Compress (4-bit)", f"4.0x (theoretical)", f"{compute_compression_ratio(128, 4):.2f}x", True),
-        ("Compress (3.5-bit)", f"~4.5x", f"{compute_compression_ratio(128, 3.5):.2f}x", True),
-        ("Compress (2.5-bit)", f"~6.4x", f"{compute_compression_ratio(128, 2.5):.2f}x", True),
-        ("LongBench-E 3.5b", f"50.06/50.06", f"{gen0.get(3.5, (0,1))[0]}/{gen0.get(3.5, (0,1))[1]} tok match", None),
-        ("LongBench-E 2.5b", f"49.44/50.06", f"{gen0.get(2.5, (0,1))[0]}/{gen0.get(2.5, (0,1))[1]} tok match", None),
+        (
+            "Compress (4-bit)",
+            f"4.0x (theoretical)",
+            f"{compute_compression_ratio(128, 4):.2f}x",
+            True,
+        ),
+        (
+            "Compress (3.5-bit)",
+            f"~4.5x",
+            f"{compute_compression_ratio(128, 3.5):.2f}x",
+            True,
+        ),
+        (
+            "Compress (2.5-bit)",
+            f"~6.4x",
+            f"{compute_compression_ratio(128, 2.5):.2f}x",
+            True,
+        ),
+        (
+            "LongBench-E 3.5b",
+            f"50.06/50.06",
+            f"{gen0.get(3.5, (0,1))[0]}/{gen0.get(3.5, (0,1))[1]} tok match",
+            None,
+        ),
+        (
+            "LongBench-E 2.5b",
+            f"49.44/50.06",
+            f"{gen0.get(2.5, (0,1))[0]}/{gen0.get(2.5, (0,1))[1]} tok match",
+            None,
+        ),
         ("NIAH (4-bit)", f"0.997 recall", f"1.000 (tested)", True),
         ("Models", f"Llama-3.1-8B,", f"Mistral-7B,", None),
         ("", f"Ministral-7B", f"Qwen3-4B", None),
@@ -358,7 +474,9 @@ def print_grid(results):
     for label, paper, ours, match in rows:
         m_str = "YES" if match is True else "—" if match is None else "NO"
         print(f"  | {label:<20s} | {paper:<20s} | {ours:<20s} | {m_str:<5s} |")
-    print(f"  +──────────────────────+──────────────────────+──────────────────────+───────+")
+    print(
+        f"  +──────────────────────+──────────────────────+──────────────────────+───────+"
+    )
     print(f"\n  NOTES:")
     print(f"  - Paper evaluates downstream quality at 2.5/3.5-bit mixed-precision")
     print(f"  - Paper uses task accuracy (F1/ROUGE); token match is stricter")
@@ -394,6 +512,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"FAIL: {test.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
         print()

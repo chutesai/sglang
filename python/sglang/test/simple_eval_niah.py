@@ -19,14 +19,10 @@ Usage:
 """
 
 import argparse
-import json
-import random
-import string
 import time
 from typing import List, Optional
 
 import requests
-
 
 # The standard NIAH needle and question (from the original NIAH benchmark)
 DEFAULT_NEEDLE = (
@@ -166,11 +162,13 @@ def run_niah(
             icon = "1.0" if avg >= 0.75 else f"{avg:.1f}"
             print(f"  {icon:>6s}", end="")
 
-            results.append({
-                "context_length": ctx_len,
-                "depth_percent": depth,
-                "score": avg,
-            })
+            results.append(
+                {
+                    "context_length": ctx_len,
+                    "depth_percent": depth,
+                    "score": avg,
+                }
+            )
 
         row_avg = sum(row_scores) / len(row_scores) if row_scores else 0
         print(f"  {row_avg:.3f}")

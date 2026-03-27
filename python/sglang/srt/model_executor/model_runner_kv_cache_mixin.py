@@ -24,8 +24,10 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.turboquant_memory_pool import MHATokenToKVPoolTurboQuant
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.turboquant_memory_pool import MHATokenToKVPoolTurboQuant
+from sglang.srt.mem_cache.turboquant_mla_memory_pool import MLATokenToKVPoolTurboQuant
+from sglang.srt.mem_cache.turboquant_nsa_memory_pool import NSATokenToKVPoolTurboQuant
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -67,20 +69,56 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        # TurboQuant: bit-packed indices + float32 norm per K and V head,
+        # TurboQuant MLA: bit-packed indices + norms for nope/rope independently,
+        # plus a shared workspace buffer reused across layers.
+        if getattr(self, "_turboquant_enabled", False) and self.use_mla_backend:
+            from sglang.srt.layers.quantization.turboquant_kernels import (
+                compute_packed_dim_mixed as _cpd_mla,
+            )
+            from sglang.srt.layers.quantization.turboquant_kernels import (
+                parse_bits as _pb_mla,
+            )
+
+            kv_lora_rank = self.model_config.kv_lora_rank
+            qk_rope_head_dim = self.model_config.qk_rope_head_dim
+            bits = getattr(self, "_turboquant_bits", 4.0)
+            is_mixed = _pb_mla(bits)[0]
+            norm_bytes = 8 if is_mixed else 4  # float32 per norm
+
+            # Per-layer: packed indices + norms for nope and rope (1 head)
+            nope_per_layer = _cpd_mla(kv_lora_rank, bits) + norm_bytes
+            rope_per_layer = _cpd_mla(qk_rope_head_dim, bits) + norm_bytes
+            cell_size = (nope_per_layer + rope_per_layer) * num_layers
+
+            # Shared workspace (one buffer, NOT per-layer)
+            dtype_size = torch._utils._element_size(self.dtype)
+            cell_size += (kv_lora_rank + qk_rope_head_dim) * dtype_size  # 1 head
+
+            # Add indexer KV cache overhead for NSA models
+            if is_deepseek_nsa(self.model_config.hf_config):
+                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * num_layers * element_size
+
+            return cell_size
+
+        # TurboQuant MHA: bit-packed indices + float32 norm per K and V head,
         # plus a pair of shared workspace buffers (one K, one V) that are
         # reused across layers for dequantized data.
         if getattr(self, "_turboquant_enabled", False):
             from sglang.srt.layers.quantization.turboquant_kernels import (
-                _next_power_of_2,
                 compute_packed_dim_mixed,
                 parse_bits,
             )
 
             head_dim = self.model_config.head_dim
-            num_kv_heads = self.model_config.get_num_kv_heads(
-                get_attention_tp_size()
-            )
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
             bits = getattr(self, "_turboquant_bits", 4.0)
             is_mixed = parse_bits(bits)[0]
             # packed indices + norms (2 norms per head for mixed, 1 for uniform)
@@ -508,23 +546,55 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            self.token_to_kv_pool = NSATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
-            )
+            if getattr(self, "_turboquant_enabled", False):
+                self.token_to_kv_pool = NSATokenToKVPoolTurboQuant(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.dtype,  # working dtype, not storage dtype
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    bits=getattr(self, "_turboquant_bits", 4.0),
+                    mode=getattr(self, "_turboquant_mode", "mse"),
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            else:
+                self.token_to_kv_pool = NSATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if getattr(self, "_turboquant_enabled", False):
+                self.token_to_kv_pool = MLATokenToKVPoolTurboQuant(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.dtype,  # working dtype, not storage dtype
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    bits=getattr(self, "_turboquant_bits", 4.0),
+                    mode=getattr(self, "_turboquant_mode", "mse"),
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -746,6 +816,52 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
+    def _setup_turboquant_fused_decode(self: ModelRunner):
+        """Set up rotated w_vc for TurboQuant fused decode kernel.
+
+        After pool init, iterate over attention modules and compute
+        w_vc_tq_rotated = R @ w_vc using the pool's Hadamard transform.
+        Also sets _has_tq_rotated_wvc on RadixAttention layers.
+        """
+        pool = self.token_to_kv_pool
+        if not getattr(pool, "can_use_fused_kernel", False):
+            return
+
+        from sglang.srt.layers.attention.triton_ops.wvc_rotation import (
+            compute_rotated_wvc,
+        )
+
+        hadamard = pool.nope_hadamard
+        count = 0
+
+        # Find all MLA attention modules with w_vc
+        for module in self.model.modules():
+            if not hasattr(module, "w_vc"):
+                continue
+            w_vc = module.w_vc
+            if w_vc is None:
+                continue
+            # Skip deep_gemm modules — fused TQ produces bf16 output incompatible with FP8 grouped GEMM
+            if getattr(module, "use_deep_gemm_bmm", False):
+                continue
+
+            w_scale = getattr(module, "w_scale", None)
+            w_vc_rot = compute_rotated_wvc(w_vc, hadamard, w_scale=w_scale)
+
+            if w_vc_rot is not None:
+                module.w_vc_tq_rotated = w_vc_rot
+                # Set flag on the RadixAttention wrapper (attn_mqa)
+                if hasattr(module, "attn_mqa"):
+                    module.attn_mqa._has_tq_rotated_wvc = True
+                count += 1
+            else:
+                module.w_vc_tq_rotated = None
+
+        if count > 0:
+            logger.info(
+                f"TurboQuant fused decode: computed rotated w_vc for {count} layers"
+            )
+
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,
         applying user cap, page alignment, and PP sync"""
@@ -842,6 +958,9 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._apply_memory_pool_config(self.memory_pool_config)
+
+        # Set up TurboQuant fused decode (rotated w_vc) if applicable
+        self._setup_turboquant_fused_decode()
 
         logger.info(
             f"Memory pool end. "

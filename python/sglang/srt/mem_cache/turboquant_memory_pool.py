@@ -89,7 +89,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         self.bits = bits
         self.mode = mode
         self.is_mixed, self.bits_hi, self.bits_lo = parse_bits(bits)
-        self.mse_bits = int(bits) - 1 if mode == "prod" and not self.is_mixed else int(bits)
+        self.mse_bits = (
+            int(bits) - 1 if mode == "prod" and not self.is_mixed else int(bits)
+        )
 
         # Cache padded dimensions
         self.padded_head_dim = _next_power_of_2(head_dim)
@@ -102,18 +104,30 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         if self.is_mixed:
             k_split = head_dim // 2
             v_split = effective_v // 2
-            self.k_hadamard_hi = HadamardTransform(k_split, seed=_HADAMARD_SEED_K, device=torch_device)
-            self.k_hadamard_lo = HadamardTransform(head_dim - k_split, seed=_HADAMARD_SEED_K_LO, device=torch_device)
-            self.v_hadamard_hi = HadamardTransform(v_split, seed=_HADAMARD_SEED_V, device=torch_device)
-            self.v_hadamard_lo = HadamardTransform(effective_v - v_split, seed=_HADAMARD_SEED_V_LO, device=torch_device)
+            self.k_hadamard_hi = HadamardTransform(
+                k_split, seed=_HADAMARD_SEED_K, device=torch_device
+            )
+            self.k_hadamard_lo = HadamardTransform(
+                head_dim - k_split, seed=_HADAMARD_SEED_K_LO, device=torch_device
+            )
+            self.v_hadamard_hi = HadamardTransform(
+                v_split, seed=_HADAMARD_SEED_V, device=torch_device
+            )
+            self.v_hadamard_lo = HadamardTransform(
+                effective_v - v_split, seed=_HADAMARD_SEED_V_LO, device=torch_device
+            )
             self._k_split_dim = k_split
             self._v_split_dim = v_split
             # Also create single transforms for compatibility with _get methods
             self.k_hadamard = self.k_hadamard_hi  # unused in mixed path
             self.v_hadamard = self.v_hadamard_hi
         else:
-            self.k_hadamard = HadamardTransform(head_dim, seed=_HADAMARD_SEED_K, device=torch_device)
-            self.v_hadamard = HadamardTransform(effective_v, seed=_HADAMARD_SEED_V, device=torch_device)
+            self.k_hadamard = HadamardTransform(
+                head_dim, seed=_HADAMARD_SEED_K, device=torch_device
+            )
+            self.v_hadamard = HadamardTransform(
+                effective_v, seed=_HADAMARD_SEED_V, device=torch_device
+            )
 
         # Compute chunk size for dequantization based on memory budget.
         # float32 temporaries: chunk_tokens * head_num * max_padded_dim * 4 bytes
@@ -176,7 +190,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 # L2 norms per token per head — per layer.
                 # For mixed-precision, shape is (m, head_num, 2) to store
                 # norms for each independent TurboQuant instance.
-                norm_shape = (m, self.head_num, 2) if self.is_mixed else (m, self.head_num)
+                norm_shape = (
+                    (m, self.head_num, 2) if self.is_mixed else (m, self.head_num)
+                )
                 self.k_norms_buffer = [
                     torch.zeros(norm_shape, dtype=torch.float32, device=self.device)
                     for _ in range(self.layer_num)
@@ -327,12 +343,10 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 }
                 if self.mode == "prod" and qjl_buf is not None:
                     c_qjl = qjl_buf[start:end]
-                    quantized["qjl_signs"] = c_qjl.reshape(
-                        -1, c_qjl.shape[-1]
+                    quantized["qjl_signs"] = c_qjl.reshape(-1, c_qjl.shape[-1])
+                    quantized["residual_norms"] = residual_norms_buf[start:end].reshape(
+                        -1
                     )
-                    quantized["residual_norms"] = residual_norms_buf[
-                        start:end
-                    ].reshape(-1)
                 result = turboquant_dequantize(
                     quantized, hadamard, int(self.bits), self.mode, self.dtype
                 )
@@ -345,9 +359,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         """Dequantize and return full key buffer for a layer."""
         idx = layer_id - self.start_layer
         qjl_buf = self.k_qjl_buffer[idx] if self.mode == "prod" else None
-        res_buf = (
-            self.k_residual_norms_buffer[idx] if self.mode == "prod" else None
-        )
+        res_buf = self.k_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_layer_chunked(
             self.k_buffer[idx],
             self.k_norms_buffer[idx],
@@ -367,9 +379,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         """Dequantize and return full value buffer for a layer."""
         idx = layer_id - self.start_layer
         qjl_buf = self.v_qjl_buffer[idx] if self.mode == "prod" else None
-        res_buf = (
-            self.v_residual_norms_buffer[idx] if self.mode == "prod" else None
-        )
+        res_buf = self.v_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_layer_chunked(
             self.v_buffer[idx],
             self.v_norms_buffer[idx],
@@ -409,12 +419,20 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
 
         if self.is_mixed:
             k_q = turboquant_quantize_mixed(
-                k_flat, self.k_hadamard_hi, self.k_hadamard_lo,
-                self.bits_hi, self.bits_lo, self._k_split_dim,
+                k_flat,
+                self.k_hadamard_hi,
+                self.k_hadamard_lo,
+                self.bits_hi,
+                self.bits_lo,
+                self._k_split_dim,
             )
             v_q = turboquant_quantize_mixed(
-                v_flat, self.v_hadamard_hi, self.v_hadamard_lo,
-                self.bits_hi, self.bits_lo, self._v_split_dim,
+                v_flat,
+                self.v_hadamard_hi,
+                self.v_hadamard_lo,
+                self.bits_hi,
+                self.bits_lo,
+                self._v_split_dim,
             )
         else:
             k_q = turboquant_quantize(
@@ -460,12 +478,12 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_qjl_buffer[idx][loc] = v_q["qjl_signs"].reshape(
                 num_tokens, self.head_num, -1
             )
-            self.k_residual_norms_buffer[idx][loc] = k_q[
-                "residual_norms"
-            ].reshape(num_tokens, self.head_num)
-            self.v_residual_norms_buffer[idx][loc] = v_q[
-                "residual_norms"
-            ].reshape(num_tokens, self.head_num)
+            self.k_residual_norms_buffer[idx][loc] = k_q["residual_norms"].reshape(
+                num_tokens, self.head_num
+            )
+            self.v_residual_norms_buffer[idx][loc] = v_q["residual_norms"].reshape(
+                num_tokens, self.head_num
+            )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Copy KV cache entries between locations."""
@@ -479,9 +497,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             if self.mode == "prod":
                 self.k_qjl_buffer[i][tgt_loc] = self.k_qjl_buffer[i][src_loc]
                 self.v_qjl_buffer[i][tgt_loc] = self.v_qjl_buffer[i][src_loc]
-                self.k_residual_norms_buffer[i][tgt_loc] = (
-                    self.k_residual_norms_buffer[i][src_loc]
-                )
-                self.v_residual_norms_buffer[i][tgt_loc] = (
-                    self.v_residual_norms_buffer[i][src_loc]
-                )
+                self.k_residual_norms_buffer[i][tgt_loc] = self.k_residual_norms_buffer[
+                    i
+                ][src_loc]
+                self.v_residual_norms_buffer[i][tgt_loc] = self.v_residual_norms_buffer[
+                    i
+                ][src_loc]

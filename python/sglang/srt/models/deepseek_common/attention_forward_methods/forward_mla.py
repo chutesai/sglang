@@ -405,6 +405,24 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        # TurboQuant fused decode: output is in Hadamard-rotated space.
+        # Use the pre-rotated w_vc to cancel the rotation:
+        #   o_rot @ w_vc_rot = (o @ R^T) @ (R @ w_vc) = o @ w_vc
+        _use_rotated_wvc = getattr(forward_batch, "_tq_rotated_output", False)
+        if _use_rotated_wvc:
+            forward_batch._tq_rotated_output = False  # consume flag
+            # w_vc_tq_rotated is always bf16
+            attn_bmm_output = (
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc_tq_rotated,
+                )
+                .transpose(0, 1)
+                .flatten(1, 2)
+            )
+            output, _ = self.o_proj(attn_bmm_output)
+            return output
+
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
