@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# TurboQuant Benchmark — DeepSeek-V3.2 / DS 3.2 (NSA + MLA, multi-GPU)
+# TurboQuant + IndexCache Benchmark — DeepSeek-V3.2 (NSA + MLA, multi-GPU)
 #
-# Compares bf16 baseline vs TurboQuant 4-bit KV cache compression.
-# DS 3.2 uses NSA (Native Sparse Attention) which has a fused TQ kernel path.
+# Compares bf16 baseline vs TurboQuant 4-bit + IndexCache r=0.6.
+# DS 3.2 uses NSA (Native Sparse Attention).
 # Requires 8 GPUs (e.g. 8xH100/A100). Uses dp-attention for throughput.
 #
 # Tests:
@@ -30,9 +30,7 @@ PORT="${PORT:-30000}"
 MEM="${MEM:-0.75}"
 OUTDIR="${OUTDIR:-/tmp/bench_tq_ds32}"
 CONTEXT="${CONTEXT:-131072}"
-
-# Common server args — NSA models need higher mem headroom
-BASE_SERVER_ARGS="--dp ${DP} --enable-dp-attention --context-length ${CONTEXT} --chunked-prefill-size 65536 --mem-fraction-static ${MEM} --trust-remote-code --attention-backend triton"
+INDEX_CACHE="${INDEX_CACHE:-/cache/index_cache_dsv3.2_r0.6_uniform.json}"
 
 mkdir -p "${OUTDIR}"
 
@@ -57,18 +55,50 @@ wait_for_server() {
     done
 }
 
-launch_server() {
+launch_baseline() {
     local tag="$1"
-    shift
-    local logfile="${OUTDIR}/server_${tag}.log"
-    echo "  Launching server [${tag}]..."
+    local logfile="${OUTDIR}/server_baseline_${tag}.log"
+    echo "  Launching baseline server [${tag}]..."
     python -m sglang.launch_server \
         --model-path "${MODEL}" \
         --tp "${TP}" \
         --port "${PORT}" \
         --host 127.0.0.1 \
-        ${BASE_SERVER_ARGS} \
-        "$@" \
+        --dp "${DP}" --enable-dp-attention \
+        --context-length "${CONTEXT}" \
+        --mem-fraction-static "${MEM}" \
+        --trust-remote-code \
+        > "${logfile}" 2>&1 &
+    SERVER_PID=$!
+    echo "  PID=${SERVER_PID}, log=${logfile}"
+
+    if ! wait_for_server "http://127.0.0.1:${PORT}" 900; then
+        echo "  ERROR: Server failed to start. Last 30 lines:"
+        tail -30 "${logfile}"
+        kill "${SERVER_PID}" 2>/dev/null; wait "${SERVER_PID}" 2>/dev/null
+        return 1
+    fi
+    echo "  Server ready."
+    return 0
+}
+
+launch_tq_ic() {
+    local tag="$1"
+    local logfile="${OUTDIR}/server_tqic_${tag}.log"
+    echo "  Launching TQ+IC server [${tag}]..."
+    python -m sglang.launch_server \
+        --model-path "${MODEL}" \
+        --tp "${TP}" \
+        --port "${PORT}" \
+        --host 127.0.0.1 \
+        --dp "${DP}" --enable-dp-attention \
+        --context-length "${CONTEXT}" \
+        --chunked-prefill-size 16384 \
+        --mem-fraction-static "${MEM}" \
+        --trust-remote-code \
+        --attention-backend triton \
+        --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse \
+        --index-cache-config "${INDEX_CACHE}" \
         > "${logfile}" 2>&1 &
     SERVER_PID=$!
     echo "  PID=${SERVER_PID}, log=${logfile}"
@@ -138,12 +168,12 @@ run_comparison() {
     echo "================================================================"
 
     local baseline_out="${OUTDIR}/${name}_baseline"
-    local tq_out="${OUTDIR}/${name}_turboquant"
+    local tqic_out="${OUTDIR}/${name}_tqic"
     local ok=true
 
     # --- Baseline ---
-    echo "  >> Baseline (bf16 KV cache)..."
-    if launch_server "baseline_${name}"; then
+    echo "  >> Baseline (bf16, no index cache)..."
+    if launch_baseline "${name}"; then
         if "$@" "${baseline_out}"; then
             echo "  >> Baseline: done"
         else
@@ -155,13 +185,13 @@ run_comparison() {
         ok=false
     fi
 
-    # --- TurboQuant ---
-    echo "  >> TurboQuant 4-bit..."
-    if launch_server "tq_${name}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse; then
-        if "$@" "${tq_out}"; then
-            echo "  >> TurboQuant: done"
+    # --- TurboQuant + IndexCache ---
+    echo "  >> TQ 4-bit + IndexCache r=0.6..."
+    if launch_tq_ic "${name}"; then
+        if "$@" "${tqic_out}"; then
+            echo "  >> TQ+IC: done"
         else
-            echo "  >> TurboQuant: eval FAILED"
+            echo "  >> TQ+IC: eval FAILED"
             ok=false
         fi
         kill_server
@@ -233,7 +263,7 @@ _ruler_128k() {
         --metadata "{\"max_seq_lengths\":[128000],\"pretrained\":\"${MODEL}\"}"
 }
 run_comparison "ruler_128k" \
-    "RULER needle-in-haystack at 128K context (NSA + TQ stress test)" \
+    "RULER needle-in-haystack at 128K context (NSA + TQ + IC stress test)" \
     _ruler_128k
 
 _babilong() {
@@ -262,16 +292,16 @@ echo "================================================================"
 latency_ok=true
 for input_len in 1024 4096 16384 65536 131072; do
     echo "  >> Baseline input_len=${input_len}..."
-    if launch_server "baseline_lat_${input_len}"; then
+    if launch_baseline "lat_${input_len}"; then
         run_bench_serving "baseline_${input_len}" "${input_len}"
         kill_server
     else
         latency_ok=false
     fi
 
-    echo "  >> TurboQuant input_len=${input_len}..."
-    if launch_server "tq_lat_${input_len}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse; then
-        run_bench_serving "tq_${input_len}" "${input_len}"
+    echo "  >> TQ+IC input_len=${input_len}..."
+    if launch_tq_ic "lat_${input_len}"; then
+        run_bench_serving "tqic_${input_len}" "${input_len}"
         kill_server
     else
         latency_ok=false
@@ -291,8 +321,12 @@ fi
 # =============================================================================
 echo ""
 echo "================================================================"
-echo "  SUMMARY — DeepSeek-V3.2 (NSA) TurboQuant Benchmark"
+echo "  SUMMARY — DeepSeek-V3.2 (NSA) Baseline vs TQ+IndexCache"
 echo "================================================================"
+echo ""
+echo "  Configs:"
+echo "    Baseline : bf16 KV, no index cache, default attention backend"
+echo "    TQ+IC    : TurboQuant 4-bit MSE + IndexCache r=0.6, triton backend"
 echo ""
 for r in "${results[@]}"; do
     echo "  ${r}"
@@ -300,9 +334,4 @@ done
 echo ""
 echo "  Passed: ${passed}  Failed: ${failed}"
 echo "  Results saved to: ${OUTDIR}/"
-echo ""
-echo "  Notes:"
-echo "  - DS 3.2 uses NSA (Native Sparse Attention) with fused TQ decode"
-echo "  - RULER 128K tests NSA sparse indexer + TQ interaction"
-echo "  - Compare latency at 131K to see fused kernel bandwidth savings"
 echo "================================================================"
