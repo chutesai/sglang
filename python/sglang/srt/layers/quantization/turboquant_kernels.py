@@ -73,12 +73,18 @@ CENTROIDS_4BIT = [
 ]
 
 
+_centroids_cache: dict = {}
+
+
 def _get_centroids_tensor(bits: int, device: torch.device) -> torch.Tensor:
-    """Return the centroid tensor for the given bit-width."""
-    table = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
-    if bits not in table:
-        raise ValueError(f"TurboQuant supports 1-4 bits, got {bits}")
-    return torch.tensor(table[bits], dtype=torch.float32, device=device)
+    """Return the centroid tensor for the given bit-width (cached per device)."""
+    key = (bits, device)
+    if key not in _centroids_cache:
+        table = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
+        if bits not in table:
+            raise ValueError(f"TurboQuant supports 1-4 bits, got {bits}")
+        _centroids_cache[key] = torch.tensor(table[bits], dtype=torch.float32, device=device)
+    return _centroids_cache[key]
 
 
 # ---------------------------------------------------------------------------
