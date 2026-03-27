@@ -334,6 +334,13 @@ class NativeSparseAttnBackend(
                 device=self.device,
             )
 
+        # TurboQuant fused decode buffers (lazy-init on first use)
+        self._tq_kv_indptr: Optional[torch.Tensor] = None
+        self._tq_kv_indices: Optional[torch.Tensor] = None
+        self._tq_attn_logits: Optional[torch.Tensor] = None
+        self._tq_attn_lse: Optional[torch.Tensor] = None
+        self._tq_max_kv_splits = 128
+
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -1529,6 +1536,46 @@ class NativeSparseAttnBackend(
                     k_rope,
                 )
 
+        # TurboQuant fused dequant-attention path (skips full-cache dequant)
+        pool = forward_batch.token_to_kv_pool
+        _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
+            layer, "_tq_fused_ready", False
+        )
+        if _tq_fused:
+            # Split Q into nope/rope before dispatch
+            if q_rope is not None:
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+            else:
+                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_nope = q_all[:, :, : layer.v_head_dim]
+                q_rope = q_all[:, :, layer.v_head_dim :]
+
+            # Align topk_indices
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+            if envs.SGLANG_NSA_FUSE_TOPK.get():
+                page_table_1 = topk_indices
+            else:
+                page_table_1 = transform_index_page_table_decode(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices,
+                    page_size=1,
+                )
+
+            return self._forward_turboquant_fused(
+                q_nope,
+                q_rope,
+                page_table_1,
+                pool,
+                layer,
+                forward_batch,
+            )
+
+        # Standard path: dequant full cache (only reached when TQ fused is disabled)
         # Do absorbed multi-latent attention
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
@@ -1870,6 +1917,104 @@ class NativeSparseAttnBackend(
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
+
+    def _forward_turboquant_fused(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        page_table_1: torch.Tensor,
+        pool,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """TurboQuant fused dequant+sparse attention for NSA decode.
+
+        Converts NSA's sparse page_table_1 into kv_indptr/kv_indices and runs
+        the fused TQ kernel that only dequants+attends to the selected topk tokens.
+        """
+        from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
+        from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant import (
+            decode_attention_fwd_tq,
+        )
+
+        bs = q_nope.shape[0]
+        head_num = q_nope.shape[1]
+        kv_lora_rank = q_nope.shape[2]
+
+        # Lazy-allocate buffers (upper bound: max_bs * topk entries)
+        if self._tq_kv_indptr is None:
+            max_bs = self.req_to_token.shape[0]
+            self._tq_kv_indptr = torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            self._tq_kv_indices = torch.zeros(
+                max_bs * self.nsa_index_topk, dtype=torch.int32, device=self.device
+            )
+
+        # Convert page_table_1 → kv_indptr + kv_indices (same pattern as _forward_aiter)
+        kv_indptr = self._tq_kv_indptr
+        non_minus1_counts = (page_table_1 != -1).sum(dim=1)
+        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        get_valid_kv_indices(page_table_1, kv_indptr, self._tq_kv_indices, bs)
+
+        # Rotate Q
+        q_nope_rot = pool.nope_hadamard.forward(q_nope)
+        q_rope_rot = pool.rope_hadamard.forward(q_rope)
+
+        # Get raw compressed buffers
+        lid = layer.layer_id
+        nope_packed = pool.get_nope_packed_buffer(lid)
+        rope_packed = pool.get_rope_packed_buffer(lid)
+        nope_norms = pool.get_nope_norms_buffer(lid)
+        rope_norms = pool.get_rope_norms_buffer(lid)
+
+        # Compute num_kv_splits
+        BLOCK_N = 32
+        max_kv_splits = self._tq_max_kv_splits
+        num_kv_splits = torch.clamp(
+            (non_minus1_counts + BLOCK_N * 4 - 1) // (BLOCK_N * 4),
+            min=1,
+            max=max_kv_splits,
+        ).to(torch.int32)
+
+        # Lazy-allocate split buffers
+        if self._tq_attn_logits is None or self._tq_attn_logits.shape[1] < head_num:
+            max_bs = self.req_to_token.shape[0]
+            self._tq_attn_logits = torch.zeros(
+                (max_bs, head_num, max_kv_splits, kv_lora_rank),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._tq_attn_lse = torch.zeros(
+                (max_bs, head_num, max_kv_splits),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        # Run fused kernel
+        o = q_nope.new_empty(bs, head_num, kv_lora_rank)
+        decode_attention_fwd_tq(
+            q_nope_rot,
+            q_rope_rot,
+            nope_packed,
+            rope_packed,
+            nope_norms,
+            rope_norms,
+            pool.nope_centroids_scaled,
+            pool.rope_centroids_scaled,
+            o,
+            kv_indptr[: bs + 1],
+            self._tq_kv_indices,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            attn_logits=self._tq_attn_logits,
+            attn_lse=self._tq_attn_lse,
+        )
+
+        forward_batch._tq_rotated_output = True
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_aiter_extend(
         self,

@@ -38,10 +38,10 @@ class NSATokenToKVPoolTurboQuant(MLATokenToKVPoolTurboQuant):
     cache since it's only 128-dim FP8 with negligible memory footprint.
     """
 
-    @property
-    def can_use_fused_kernel(self):
-        """NSA decode uses dynamic sparse selection — incompatible with fused TQ kernel."""
-        return False
+    # Inherits can_use_fused_kernel from MLATokenToKVPoolTurboQuant:
+    # True for 4-bit MSE uniform mode, False otherwise.
+    # NSA's sparse topk indices are converted to kv_indptr/kv_indices format
+    # that the fused TQ kernel already accepts.
 
     # Match NSATokenToKVPool class-level constants
     quant_block_size = NSATokenToKVPool.quant_block_size  # 128

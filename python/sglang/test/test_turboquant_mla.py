@@ -703,33 +703,249 @@ def test_fused_kernel_vs_workspace():
     print("PASS: test_fused_kernel_vs_workspace")
 
 
-def test_nsa_pool_disables_fused():
-    """Verify NSATokenToKVPoolTurboQuant.can_use_fused_kernel is always False."""
+def test_nsa_pool_fused_kernel_flag():
+    """Verify NSATokenToKVPoolTurboQuant inherits can_use_fused_kernel from parent."""
     from sglang.srt.mem_cache.turboquant_nsa_memory_pool import (
         NSATokenToKVPoolTurboQuant,
     )
 
+    def _make_nsa_pool(bits=4.0, mode="mse"):
+        return NSATokenToKVPoolTurboQuant(
+            size=1024,
+            page_size=64,
+            dtype=torch.bfloat16,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            layer_num=2,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            bits=bits,
+            mode=mode,
+            start_layer=0,
+            end_layer=2,
+        )
+
+    # 4-bit MSE NSA pool: should inherit True from parent
+    pool_4b = _make_nsa_pool(bits=4.0, mode="mse")
+    assert pool_4b.can_use_fused_kernel, "4-bit MSE NSA pool should enable fused kernel"
+
+    # 3-bit NSA pool: should be False
+    pool_3b = _make_nsa_pool(bits=3.0, mode="mse")
+    assert (
+        not pool_3b.can_use_fused_kernel
+    ), "3-bit NSA pool should not use fused kernel"
+
+    # prod mode NSA pool: should be False
+    pool_prod = _make_nsa_pool(bits=4.0, mode="prod")
+    assert (
+        not pool_prod.can_use_fused_kernel
+    ), "prod mode NSA pool should not use fused kernel"
+
+    print("PASS: test_nsa_pool_fused_kernel_flag")
+
+
+def test_fused_decode_nsa_sparse_path():
+    """Integration test: exercises _forward_turboquant_fused() with NSA pool.
+
+    Instantiates NSATokenToKVPoolTurboQuant (verifying can_use_fused_kernel=True),
+    calls NativeSparseAttnBackend._forward_turboquant_fused() via a minimal mock
+    backend, and compares output against workspace-dequant + manual sparse attention.
+
+    Uses non-contiguous token positions with -1 padding (the real NSA case).
+    """
+    from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
+    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+    from sglang.srt.mem_cache.turboquant_nsa_memory_pool import (
+        NSATokenToKVPoolTurboQuant,
+    )
+
+    N_tokens = 128
+    batch = 4
+    heads = 16
+    kv_lora_rank = KV_LORA_RANK
+    qk_rope_head_dim = QK_ROPE_HEAD_DIM
+    topk = 32
+    max_bs = 64
+
+    # --- Create NSA TQ pool (page_size=1 for unit test simplicity) ---
     pool = NSATokenToKVPoolTurboQuant(
-        size=1024,
+        size=512,
         page_size=64,
         dtype=torch.bfloat16,
-        kv_lora_rank=KV_LORA_RANK,
-        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-        layer_num=2,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        layer_num=1,
         device="cuda",
         index_head_dim=128,
         enable_memory_saver=False,
         bits=4.0,
         mode="mse",
         start_layer=0,
-        end_layer=2,
+        end_layer=1,
     )
 
-    # Even though MLA base would return True for 4-bit MSE, NSA overrides to False
+    # Verify the pool change: NSA pool now inherits fused kernel support
     assert (
-        not pool.can_use_fused_kernel
-    ), "NSA pool should disable fused kernel (sparse attention incompatible)"
-    print("PASS: test_nsa_pool_disables_fused")
+        pool.can_use_fused_kernel
+    ), "NSATokenToKVPoolTurboQuant should inherit can_use_fused_kernel=True for 4-bit MSE"
+
+    # --- Populate KV cache ---
+    layer = _FakeLayer(0)
+    layer.tp_q_head_num = heads
+    layer.v_head_dim = kv_lora_rank
+    layer.head_dim = kv_lora_rank + qk_rope_head_dim
+    layer.scaling = 1.0
+    layer.logit_cap = 0.0
+    layer._tq_fused_ready = True
+
+    loc = torch.arange(N_tokens, device=DEVICE)
+    nope_data = torch.randn(
+        N_tokens, 1, kv_lora_rank, device=DEVICE, dtype=torch.bfloat16
+    )
+    rope_data = torch.randn(
+        N_tokens, 1, qk_rope_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    pool.set_mla_kv_buffer(layer, loc, nope_data, rope_data)
+
+    # --- Create sparse topk_indices (non-contiguous + -1 padding) ---
+    page_table_1 = torch.full((batch, topk), -1, dtype=torch.int32, device=DEVICE)
+    actual_counts = [20, 15, 25, 10]
+    for b in range(batch):
+        count = actual_counts[b]
+        selected = torch.arange(b * 3, b * 3 + count * 2, 2, device=DEVICE)[:count]
+        selected = selected.clamp(max=N_tokens - 1)
+        page_table_1[b, :count] = selected.to(torch.int32)
+
+    # --- Build mock backend with attributes _forward_turboquant_fused needs ---
+    class _MockBackend:
+        pass
+
+    backend = _MockBackend()
+    backend.device = DEVICE
+    backend.req_to_token = torch.zeros(max_bs, 1, dtype=torch.int32, device=DEVICE)
+    backend.nsa_index_topk = topk
+    # Init lazy buffers to None (method will allocate them)
+    backend._tq_kv_indptr = None
+    backend._tq_kv_indices = None
+    backend._tq_attn_logits = None
+    backend._tq_attn_lse = None
+    backend._tq_max_kv_splits = 128
+
+    # --- Build mock forward_batch ---
+    class _MockForwardBatch:
+        pass
+
+    forward_batch = _MockForwardBatch()
+
+    # --- Prepare Q ---
+    q_nope = torch.randn(
+        batch, heads, kv_lora_rank, device=DEVICE, dtype=torch.bfloat16
+    )
+    q_rope = torch.randn(
+        batch, heads, qk_rope_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+
+    # --- Call the actual _forward_turboquant_fused method ---
+    o_flat = NativeSparseAttnBackend._forward_turboquant_fused(
+        backend,
+        q_nope,
+        q_rope,
+        page_table_1,
+        pool,
+        layer,
+        forward_batch,
+    )
+
+    # Verify flag was set on forward_batch
+    assert getattr(
+        forward_batch, "_tq_rotated_output", False
+    ), "_tq_rotated_output flag should be set by _forward_turboquant_fused"
+
+    # Verify lazy buffers were allocated
+    assert backend._tq_kv_indptr is not None, "Lazy kv_indptr should be allocated"
+    assert backend._tq_kv_indices is not None, "Lazy kv_indices should be allocated"
+    assert backend._tq_attn_logits is not None, "Lazy attn_logits should be allocated"
+
+    # Reshape output
+    o_fused = o_flat.view(batch, heads, kv_lora_rank)
+
+    # --- Workspace-dequant reference: manual sparse attention ---
+    # Build kv_indptr/kv_indices for reference path
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    non_minus1_counts = (page_table_1 != -1).sum(dim=1)
+    kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+    total_indices = kv_indptr[-1].item()
+    kv_indices = torch.zeros(total_indices + 256, dtype=torch.int32, device=DEVICE)
+    get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, batch)
+
+    key_buf = pool.get_key_buffer(0).to(torch.bfloat16)
+    val_buf = pool.get_value_buffer(0).to(torch.bfloat16)
+
+    ref_latents = []
+    for b in range(batch):
+        start = kv_indptr[b].item()
+        end = kv_indptr[b + 1].item()
+        token_ids = kv_indices[start:end].long()
+
+        k_nope = key_buf[token_ids, 0, :kv_lora_rank].float()
+        k_rope_slice = key_buf[token_ids, 0, kv_lora_rank:].float()
+        v = val_buf[token_ids, 0, :].float()
+
+        scores = q_nope[b].float() @ k_nope.T + q_rope[b].float() @ k_rope_slice.T
+        probs = torch.softmax(scores, dim=-1)
+        ref_latents.append(probs @ v)
+
+    o_workspace = torch.stack(ref_latents, dim=0)
+
+    # Inverse-rotate fused output to compare
+    o_unrotated = pool.nope_hadamard.inverse(o_fused.float())[:, :, :kv_lora_rank]
+
+    cos_latent = (
+        F.cosine_similarity(o_workspace.flatten(1), o_unrotated.flatten(1), dim=-1)
+        .mean()
+        .item()
+    )
+    print(f"  NSA integration: latent cosine sim: {cos_latent:.6f}")
+    assert (
+        cos_latent > 0.99
+    ), f"NSA integration latent cosine sim {cos_latent:.4f} too low"
+
+    # Projected comparison through w_vc
+    v_head_dim = 128
+    w_vc = torch.randn(
+        heads, kv_lora_rank, v_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    proj_ref = torch.bmm(
+        o_workspace.reshape(batch * heads, 1, kv_lora_rank),
+        w_vc.float()
+        .unsqueeze(0)
+        .expand(batch, -1, -1, -1)
+        .reshape(batch * heads, kv_lora_rank, v_head_dim),
+    ).reshape(batch, heads, v_head_dim)
+    proj_fused = torch.bmm(
+        o_unrotated.reshape(batch * heads, 1, kv_lora_rank),
+        w_vc.float()
+        .unsqueeze(0)
+        .expand(batch, -1, -1, -1)
+        .reshape(batch * heads, kv_lora_rank, v_head_dim),
+    ).reshape(batch, heads, v_head_dim)
+
+    cos_proj = (
+        F.cosine_similarity(proj_ref.flatten(1), proj_fused.flatten(1), dim=-1)
+        .mean()
+        .item()
+    )
+    print(f"  NSA integration: projected cosine sim: {cos_proj:.6f}")
+    assert (
+        cos_proj > 0.99
+    ), f"NSA integration projected cosine sim {cos_proj:.4f} too low"
+
+    # Consume flag (as forward_mla would)
+    forward_batch._tq_rotated_output = False
+    assert not forward_batch._tq_rotated_output
+
+    print("PASS: test_fused_decode_nsa_sparse_path")
 
 
 def test_fused_decode_end_to_end():
@@ -1181,7 +1397,8 @@ if __name__ == "__main__":
         test_separate_centroid_scaling,
         test_fallback_to_workspace,
         test_fused_kernel_vs_workspace,
-        test_nsa_pool_disables_fused,
+        test_nsa_pool_fused_kernel_flag,
+        test_fused_decode_nsa_sparse_path,
         test_fused_decode_end_to_end,
         test_fused_decode_deep_gemm_path,
         test_forward_batch_flag_lifecycle,
