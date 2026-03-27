@@ -820,8 +820,22 @@ class ModelRunnerKVCacheMixin:
         """Set up TurboQuant fused decode kernel for attention modules.
 
         Dispatches to MHA or MLA setup based on the pool type.
+        Also initializes quantize workspace for CUDA-graph-safe quantization.
         """
         pool = self.token_to_kv_pool
+
+        # Initialize quantize workspace for all TQ MHA pools (needed for
+        # zero-allocation quantization during CUDA graph capture).
+        if isinstance(pool, MHATokenToKVPoolTurboQuant) and hasattr(
+            pool, "init_quantize_workspace"
+        ):
+            max_tokens = getattr(
+                self.server_args, "piecewise_cuda_graph_max_tokens", None
+            )
+            if max_tokens is None:
+                max_tokens = getattr(self.server_args, "cuda_graph_max_bs", 256)
+            pool.init_quantize_workspace(max_tokens)
+
         if not getattr(pool, "can_use_fused_kernel", False):
             return
 
@@ -891,9 +905,7 @@ class ModelRunnerKVCacheMixin:
             count += 1
 
         if count > 0:
-            logger.info(
-                f"TurboQuant fused decode (MHA): set up {count} layers"
-            )
+            logger.info(f"TurboQuant fused decode (MHA): set up {count} layers")
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,

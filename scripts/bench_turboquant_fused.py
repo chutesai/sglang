@@ -55,8 +55,12 @@ def bench_config(batch_size, ctx_len):
 
     # Populate KV cache
     loc = torch.arange(total_tokens, device=DEVICE)
-    nope = torch.randn(total_tokens, 1, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16)
-    rope = torch.randn(total_tokens, 1, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    nope = torch.randn(
+        total_tokens, 1, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16
+    )
+    rope = torch.randn(
+        total_tokens, 1, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
+    )
     pool.set_mla_kv_buffer(layer, loc, nope, rope)
 
     # Setup attention metadata
@@ -65,8 +69,12 @@ def bench_config(batch_size, ctx_len):
     kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
     kv_indices = torch.arange(total_tokens, dtype=torch.int32, device=DEVICE)
 
-    q_nope = torch.randn(batch_size, HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16)
-    q_rope = torch.randn(batch_size, HEADS, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    q_nope = torch.randn(
+        batch_size, HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16
+    )
+    q_rope = torch.randn(
+        batch_size, HEADS, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
+    )
 
     # --- Workspace path ---
     def workspace_step():
@@ -100,7 +108,9 @@ def bench_config(batch_size, ctx_len):
         min=1,
         max=max_kv_splits,
     ).to(torch.int32)
-    o_fused = torch.zeros(batch_size, HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16)
+    o_fused = torch.zeros(
+        batch_size, HEADS, KV_LORA_RANK, device=DEVICE, dtype=torch.bfloat16
+    )
 
     def fused_step():
         decode_attention_fwd_tq(
@@ -144,7 +154,9 @@ def main():
     ctx_lengths = [1024, 4096, 16384, 65536]
     batch_sizes = [1, 8, 32]
 
-    print(f"{'Batch':>6} {'CtxLen':>8} {'Workspace(ms)':>14} {'Fused(ms)':>12} {'Speedup':>9}")
+    print(
+        f"{'Batch':>6} {'CtxLen':>8} {'Workspace(ms)':>14} {'Fused(ms)':>12} {'Speedup':>9}"
+    )
     print("-" * 55)
 
     for bs in batch_sizes:

@@ -112,6 +112,21 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
 
+        # Cache TQ MHA pool dims for pre-allocating CUDA graph buffers
+        pool = model_runner.token_to_kv_pool
+        from sglang.srt.mem_cache.turboquant_memory_pool import (
+            MHATokenToKVPoolTurboQuant,
+        )
+
+        if isinstance(pool, MHATokenToKVPoolTurboQuant) and getattr(
+            pool, "can_use_fused_kernel", False
+        ):
+            self._tq_mha_k_padded_dim = pool.padded_head_dim
+            self._tq_mha_v_padded_dim = pool.v_padded_head_dim
+        else:
+            self._tq_mha_k_padded_dim = None
+            self._tq_mha_v_padded_dim = None
+
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
             and (model_runner.server_args.chunked_prefill_size == -1)
@@ -474,6 +489,40 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+
+        # Pre-allocate TQ MHA fused decode buffers so nothing is freshly
+        # allocated during CUDA graph capture.
+        if self._tq_mha_k_padded_dim is not None:
+            max_decode_rows = max_bs * self.num_head  # q_heads
+            max_pd = max(self._tq_mha_k_padded_dim, self._tq_mha_v_padded_dim)
+            self.cuda_graph_tq_o_rot = torch.zeros(
+                (max_bs, self.num_head, self._tq_mha_v_padded_dim),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            # Float32 buffer for K-Hadamard forward (bf16 Q → float32)
+            self.cuda_graph_tq_q_float = torch.empty(
+                (max_decode_rows, self._tq_mha_k_padded_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            # Float32 buffer for V-Hadamard inverse (bf16 o_rot → float32)
+            self.cuda_graph_tq_v_float = torch.empty(
+                (max_decode_rows, self._tq_mha_v_padded_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            # FWHT butterfly scratch (shared between forward and inverse)
+            self.cuda_graph_tq_fwht_tmp = torch.empty(
+                (max_decode_rows, max_pd // 2),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            self.cuda_graph_tq_o_rot = None
+            self.cuda_graph_tq_q_float = None
+            self.cuda_graph_tq_v_float = None
+            self.cuda_graph_tq_fwht_tmp = None
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
@@ -1142,19 +1191,33 @@ class TritonAttnBackend(AttentionBackend):
         batch = q.shape[0]
         q_3d = q.view(batch, layer.tp_q_head_num, layer.qk_head_dim)
 
-        # Rotate Q into K-Hadamard space
-        q_rot = pool.k_hadamard.forward(q_3d)
+        # Rotate Q into K-Hadamard space using pre-allocated float32 buffers
+        # to avoid allocations during CUDA graph capture.
+        if self.cuda_graph_tq_q_float is not None:
+            n_rows = batch * layer.tp_q_head_num
+            q_float = self.cuda_graph_tq_q_float[:n_rows].view(
+                batch, layer.tp_q_head_num, -1
+            )
+            q_rot = pool.k_hadamard.forward(
+                q_3d, out=q_float, fwht_tmp=self.cuda_graph_tq_fwht_tmp
+            )
+        else:
+            q_rot = pool.k_hadamard.forward(q_3d)
 
         # Output in V-rotated space (padded to v_padded_head_dim for kernel)
         v_head_dim = layer.v_head_dim
         v_padded = pool.v_padded_head_dim
-        o_rot = torch.zeros(
-            batch,
-            layer.tp_q_head_num,
-            v_padded,
-            device=q.device,
-            dtype=q.dtype,
-        )
+        if self.cuda_graph_tq_o_rot is not None:
+            o_rot = self.cuda_graph_tq_o_rot[:batch]
+            o_rot.zero_()
+        else:
+            o_rot = torch.zeros(
+                batch,
+                layer.tp_q_head_num,
+                v_padded,
+                device=q.device,
+                dtype=q.dtype,
+            )
 
         decode_attention_fwd_tq_mha(
             q_rot,
@@ -1175,8 +1238,17 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse=self.forward_metadata.attn_lse,
         )
 
-        # Inverse-rotate from V-Hadamard space and trim to v_head_dim
-        o_unrot = pool.v_hadamard.inverse(o_rot)
+        # Inverse-rotate from V-Hadamard space using pre-allocated buffers
+        if self.cuda_graph_tq_v_float is not None:
+            n_rows = batch * layer.tp_q_head_num
+            v_float = self.cuda_graph_tq_v_float[:n_rows].view(
+                batch, layer.tp_q_head_num, -1
+            )
+            o_unrot = pool.v_hadamard.inverse(
+                o_rot, out=v_float, fwht_tmp=self.cuda_graph_tq_fwht_tmp
+            )
+        else:
+            o_unrot = pool.v_hadamard.inverse(o_rot)
         o_final = o_unrot[:, :, :v_head_dim]
 
         o.copy_(o_final.reshape_as(o))

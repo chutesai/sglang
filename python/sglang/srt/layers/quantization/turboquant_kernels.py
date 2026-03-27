@@ -74,16 +74,83 @@ CENTROIDS_4BIT = [
 
 
 _centroids_cache: dict = {}
+_scaled_centroids_cache: dict = {}
+
+
+class QuantizeWorkspace:
+    """Pre-allocated scratch buffers for zero-allocation quantization.
+
+    Used during CUDA graph capture to avoid temporary tensor allocations
+    that would inflate graph memory pools.  A single workspace is reused
+    across all layers since they execute sequentially.
+    """
+
+    def __init__(self, max_rows: int, padded_dim: int, device: torch.device):
+        self.max_rows = max_rows
+        self.padded_dim = padded_dim
+        packed_dim = padded_dim // 2  # 4-bit nibble packing
+
+        # Norms buffer
+        self.norms = torch.empty(max_rows, dtype=torch.float32, device=device)
+        # Hadamard rotation input/output (float32, written then transformed in-place)
+        self.rotated = torch.empty(
+            max_rows, padded_dim, dtype=torch.float32, device=device
+        )
+        # Normalized rotated coordinates
+        self.rotated_normalized = torch.empty(
+            max_rows, padded_dim, dtype=torch.float32, device=device
+        )
+        # Quantization indices (unpacked uint8)
+        self.indices = torch.empty(
+            max_rows, padded_dim, dtype=torch.uint8, device=device
+        )
+        # FWHT butterfly temporary
+        self.fwht_tmp = torch.empty(
+            max_rows, padded_dim // 2, dtype=torch.float32, device=device
+        )
+        # 4-bit pack intermediates
+        self.pack_even = torch.empty(
+            max_rows, packed_dim, dtype=torch.int32, device=device
+        )
+        self.pack_odd = torch.empty(
+            max_rows, packed_dim, dtype=torch.int32, device=device
+        )
+        self.packed = torch.empty(
+            max_rows, packed_dim, dtype=torch.uint8, device=device
+        )
+
+    def memory_bytes(self) -> int:
+        total = 0
+        for attr in (
+            "norms",
+            "rotated",
+            "rotated_normalized",
+            "indices",
+            "fwht_tmp",
+            "pack_even",
+            "pack_odd",
+            "packed",
+        ):
+            t = getattr(self, attr)
+            total += t.numel() * t.element_size()
+        return total
 
 
 def _get_centroids_tensor(bits: int, device: torch.device) -> torch.Tensor:
     """Return the centroid tensor for the given bit-width (cached per device)."""
     key = (bits, device)
     if key not in _centroids_cache:
-        table = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
+        table = {
+            1: CENTROIDS_1BIT,
+            2: CENTROIDS_2BIT,
+            3: CENTROIDS_3BIT,
+            4: CENTROIDS_4BIT,
+        }
         if bits not in table:
             raise ValueError(f"TurboQuant supports 1-4 bits, got {bits}")
-        _centroids_cache[key] = torch.tensor(table[bits], dtype=torch.float32, device=device)
+        _centroids_cache[key] = torch.tensor(
+            table[bits], dtype=torch.float32, device=device
+        )
     return _centroids_cache[key]
 
 
@@ -124,11 +191,20 @@ class HadamardTransform:
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor = None,
+        fwht_tmp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply randomized Hadamard: y = scale * H * diag(signs) * x.
 
         Args:
             x: (..., dim) tensor
+            out: optional pre-allocated output tensor (..., padded_dim).
+                 When provided, x is copied into out and transformed in-place.
+            fwht_tmp: optional pre-allocated FWHT scratch buffer.
+                      Pass to avoid allocations during CUDA graph capture.
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
@@ -137,41 +213,81 @@ class HadamardTransform:
 
         # Pad to power-of-2 if needed
         if d < self.padded_dim:
-            x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
+            if out is not None:
+                out[..., :d] = x
+                out[..., d:] = 0
+                x = out
+            else:
+                x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
+        elif out is not None:
+            out.copy_(x)
+            x = out
 
         # Apply random signs
-        x = x * self.signs
+        x.mul_(self.signs)
 
         # In-place Fast Walsh-Hadamard Transform
-        x = self._fwht(x)
+        x = self._fwht_inplace(x, tmp=fwht_tmp)
 
-        return x * self.scale
+        x.mul_(self.scale)
+        return x
 
-    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+    def inverse(
+        self,
+        y: torch.Tensor,
+        out: torch.Tensor = None,
+        fwht_tmp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
 
         Since H is symmetric and orthogonal: H^{-1} = H / d.
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = self._fwht(y) * self.scale
-        x = x * self.signs
+        if out is not None:
+            out.copy_(y)
+            x = self._fwht_inplace(out, tmp=fwht_tmp)
+        else:
+            x = self._fwht_inplace(y, tmp=fwht_tmp)
+        x.mul_(self.scale)
+        x.mul_(self.signs)
         return x[..., : self.dim]
 
     @staticmethod
     def _fwht(x: torch.Tensor) -> torch.Tensor:
         """Fast Walsh-Hadamard Transform along the last dimension."""
+        return HadamardTransform._fwht_inplace(x)
+
+    @staticmethod
+    def _fwht_inplace(
+        x: torch.Tensor, tmp: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Fast Walsh-Hadamard Transform — in-place butterfly, minimal allocs.
+
+        Args:
+            x: input tensor (last dim must be power-of-2), modified in-place.
+            tmp: optional pre-allocated (max_rows, n//2) float32 buffer.
+                 When provided, no memory is allocated (CUDA-graph safe).
+        """
         orig_shape = x.shape
         n = orig_shape[-1]
         x = x.reshape(-1, n).float()
+        rows = x.shape[0]
+        # Single temp buffer reused across all butterfly stages
+        if tmp is None:
+            tmp = torch.empty(rows, n // 2, dtype=x.dtype, device=x.device)
+        else:
+            tmp = tmp[:rows, : n // 2]
         h = 1
         while h < n:
-            # Split into pairs and butterfly
-            x = x.view(-1, n // (2 * h), 2, h)
-            a = x[:, :, 0, :]
-            b = x[:, :, 1, :]
-            x = torch.stack([a + b, a - b], dim=2)
-            x = x.view(-1, n)
+            x_view = x.view(rows, n // (2 * h), 2, h)
+            a = x_view[:, :, 0, :]
+            b = x_view[:, :, 1, :]
+            tmp_view = tmp.view(rows, n // (2 * h), h)
+            # Save b, compute a+b and a-b in-place
+            tmp_view.copy_(b)
+            b.copy_(a).sub_(tmp_view)  # b = a - b_orig
+            a.add_(tmp_view)  # a = a_orig + b_orig
             h *= 2
         return x.view(orig_shape)
 
@@ -243,6 +359,30 @@ def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
         return torch.stack([b0, b1, b2], dim=-1).reshape(*batch_shape, num_groups * 3)
     else:
         raise ValueError(f"Unsupported bits: {bits}")
+
+
+def _pack_4bit_inplace(
+    indices: torch.Tensor,
+    even_buf: torch.Tensor,
+    odd_buf: torch.Tensor,
+    packed_buf: torch.Tensor,
+) -> torch.Tensor:
+    """Pack 4-bit indices using pre-allocated int32 buffers.  Zero allocation.
+
+    Args:
+        indices: (n, padded_dim) uint8, values in [0, 15]
+        even_buf: (n, padded_dim//2) int32, scratch
+        odd_buf:  (n, padded_dim//2) int32, scratch
+        packed_buf: (n, padded_dim//2) uint8, output
+    Returns:
+        packed_buf with nibble-packed results
+    """
+    even_buf.copy_(indices[..., 0::2])  # uint8 → int32
+    odd_buf.copy_(indices[..., 1::2])  # uint8 → int32
+    odd_buf.mul_(16)  # << 4
+    odd_buf.add_(even_buf)  # high_nibble | low_nibble
+    packed_buf.copy_(odd_buf)  # int32 → uint8 (truncates to low byte)
+    return packed_buf
 
 
 def unpack_indices(packed: torch.Tensor, bits: int, padded_dim: int) -> torch.Tensor:
@@ -413,6 +553,7 @@ def turboquant_quantize(
     hadamard: HadamardTransform,
     bits: int = 4,
     mode: str = "mse",
+    workspace: Optional[QuantizeWorkspace] = None,
 ) -> dict:
     """Quantize input vectors using TurboQuant with bit-packed storage.
 
@@ -421,6 +562,9 @@ def turboquant_quantize(
         hadamard: HadamardTransform instance for this dimension
         bits: quantization bit-width (1-4)
         mode: "mse" for MSE-optimal, "prod" for inner-product-optimal (uses QJL)
+        workspace: optional pre-allocated QuantizeWorkspace.  When provided and
+                   large enough, ALL temporary allocations are eliminated —
+                   critical for CUDA graph capture.
 
     Returns:
         dict with keys:
@@ -433,38 +577,95 @@ def turboquant_quantize(
     num_tokens, dim = x.shape
     device = x.device
 
+    mse_bits = bits - 1 if mode == "prod" else bits
+    padded_dim = hadamard.padded_dim
+
+    # Decide whether to use the zero-allocation workspace path
+    use_ws = workspace is not None and num_tokens <= workspace.max_rows
+
+    if use_ws:
+        n = num_tokens
+        # Copy input to float32 rotated buffer (serves as both float conversion
+        # and Hadamard input — forward() transforms it in-place)
+        rotated_buf = workspace.rotated[:n]
+        rotated_buf[:, :dim].copy_(x)  # bf16 → float32
+        if dim < padded_dim:
+            rotated_buf[:, dim:].zero_()
+
+        norms = workspace.norms[:n]
+        rot_norm_buf = workspace.rotated_normalized[:n]
+        indices_buf = workspace.indices[:n]
+        fwht_tmp = workspace.fwht_tmp
+    else:
+        # Dynamic allocation path (used outside graph capture / oversized batches)
+        float_x = x.float()
+        if dim < padded_dim:
+            float_x = torch.nn.functional.pad(float_x, (0, padded_dim - dim))
+        rotated_buf = torch.empty(
+            num_tokens, padded_dim, dtype=torch.float32, device=device
+        )
+        norms = torch.empty(num_tokens, dtype=torch.float32, device=device)
+        rot_norm_buf = torch.empty(
+            num_tokens, padded_dim, dtype=torch.float32, device=device
+        )
+        indices_buf = torch.empty(
+            num_tokens, padded_dim, dtype=torch.uint8, device=device
+        )
+        fwht_tmp = None
+
     # Compute L2 norms before rotation (preserved by orthogonal transform)
-    norms = torch.norm(x.float(), dim=-1)
+    if use_ws:
+        torch.norm(rotated_buf[:, :dim], dim=-1, out=norms)
+    else:
+        torch.norm(x.float(), dim=-1, out=norms)
 
     # Step 1: Rotate via randomized Hadamard
-    rotated = hadamard.forward(x.float())  # (num_tokens, padded_dim)
-    padded_dim = rotated.shape[-1]
+    if use_ws:
+        # rotated_buf already contains float32 input; transform in-place
+        # (no out= needed since rotated_buf IS the working buffer)
+        rotated = hadamard.forward(rotated_buf, fwht_tmp=fwht_tmp)
+    else:
+        rotated = hadamard.forward(float_x, out=rotated_buf, fwht_tmp=fwht_tmp)
 
     # Get centroids scaled by 1/sqrt(d) for the coordinate distribution
-    mse_bits = bits - 1 if mode == "prod" else bits
-    centroids = _get_centroids_tensor(mse_bits, device)
-    rotated_normalized = rotated / (norms.unsqueeze(-1) + 1e-10)
-    scaled_centroids = centroids / math.sqrt(padded_dim)
+    sc_key = (mse_bits, padded_dim, device)
+    scaled_centroids = _scaled_centroids_cache.get(sc_key)
+    if scaled_centroids is None:
+        centroids = _get_centroids_tensor(mse_bits, device)
+        scaled_centroids = centroids / math.sqrt(padded_dim)
+        _scaled_centroids_cache[sc_key] = scaled_centroids
+
+    # Normalize (clamp norms in-place to avoid +1e-10 temp allocation)
+    norms.clamp_min_(1e-10)
+    torch.div(rotated, norms.unsqueeze(-1), out=rot_norm_buf)
 
     # Step 2: Quantize each coordinate to nearest centroid (unpacked first)
-    indices = torch.zeros(num_tokens, padded_dim, dtype=torch.uint8, device=device)
+    indices_buf.zero_()
 
     BLOCK_SIZE = 128
     num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
 
     _turboquant_quantize_kernel[(num_tokens, num_blocks)](
-        rotated_normalized,
-        indices,
+        rot_norm_buf,
+        indices_buf,
         scaled_centroids,
-        rotated_normalized.stride(0),
-        indices.stride(0),
+        rot_norm_buf.stride(0),
+        indices_buf.stride(0),
         DIM=padded_dim,
-        NUM_CENTROIDS=len(centroids),
+        NUM_CENTROIDS=len(scaled_centroids),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
     # Step 3: Bit-pack the indices
-    packed_indices = pack_indices(indices, mse_bits)
+    if use_ws and mse_bits == 4:
+        packed_indices = _pack_4bit_inplace(
+            indices_buf,
+            workspace.pack_even[:num_tokens],
+            workspace.pack_odd[:num_tokens],
+            workspace.packed[:num_tokens],
+        )
+    else:
+        packed_indices = pack_indices(indices_buf, mse_bits)
 
     result = {
         "packed_indices": packed_indices,
@@ -473,20 +674,21 @@ def turboquant_quantize(
     }
 
     # Step 4 (mode="prod" only): QJL on residual
+    # Note: prod mode is uncommon and not optimized for graph capture
     if mode == "prod":
         # Reconstruct MSE approximation to compute residual
-        dequant_normalized = torch.zeros_like(rotated_normalized)
+        dequant_normalized = torch.zeros_like(rot_norm_buf)
         _turboquant_dequantize_kernel[(num_tokens, num_blocks)](
-            indices,
+            indices_buf,
             dequant_normalized,
             scaled_centroids,
-            indices.stride(0),
+            indices_buf.stride(0),
             dequant_normalized.stride(0),
             DIM=padded_dim,
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        residual = rotated_normalized - dequant_normalized
+        residual = rot_norm_buf - dequant_normalized
         residual_norms = torch.norm(residual, dim=-1)
 
         # QJL: store sign bits of residual (1 bit per coordinate)

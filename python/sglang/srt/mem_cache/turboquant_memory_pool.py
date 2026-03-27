@@ -18,6 +18,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.quantization.turboquant_kernels import (
     HadamardTransform,
+    QuantizeWorkspace,
     _get_centroids_tensor,
     _next_power_of_2,
     compute_packed_dim,
@@ -448,11 +449,21 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 self._v_split_dim,
             )
         else:
+            k_ws = getattr(self, "_k_quantize_ws", None)
+            v_ws = getattr(self, "_v_quantize_ws", None)
             k_q = turboquant_quantize(
-                k_flat, self.k_hadamard, int(self.bits), self.mode
+                k_flat,
+                self.k_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=k_ws,
             )
             v_q = turboquant_quantize(
-                v_flat, self.v_hadamard, int(self.bits), self.mode
+                v_flat,
+                self.v_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=v_ws,
             )
 
         if self.is_mixed:
@@ -521,6 +532,31 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
     def can_use_fused_kernel(self):
         """True iff the fused dequant-attention Triton kernel can be used."""
         return self.mode == "mse" and self.mse_bits == 4 and not self.is_mixed
+
+    def init_quantize_workspace(self, max_tokens: int):
+        """Pre-allocate scratch buffers for zero-allocation quantization.
+
+        Must be called before CUDA graph capture.  The workspace is reused
+        across all layers (they run sequentially) and across K/V (separate
+        workspaces since results are read after both quantize calls).
+
+        Args:
+            max_tokens: maximum number of tokens per forward pass during
+                        CUDA graph capture (piecewise_cuda_graph_max_tokens).
+        """
+        max_rows = max_tokens * self.head_num
+        device = torch.device(self.device)
+
+        self._k_quantize_ws = QuantizeWorkspace(max_rows, self.padded_head_dim, device)
+        self._v_quantize_ws = QuantizeWorkspace(
+            max_rows, self.v_padded_head_dim, device
+        )
+        k_mb = self._k_quantize_ws.memory_bytes() / 1024 / 1024
+        v_mb = self._v_quantize_ws.memory_bytes() / 1024 / 1024
+        logger.info(
+            f"TurboQuant quantize workspace: max_tokens={max_tokens}, "
+            f"max_rows={max_rows}, K={k_mb:.1f}MB, V={v_mb:.1f}MB"
+        )
 
     def get_k_packed_buffer(self, layer_id: int):
         """Return raw packed K buffer for fused kernel."""

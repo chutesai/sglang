@@ -26,7 +26,7 @@ TP="${TP:-1}"
 PORT="${PORT:-30000}"
 MEM="${MEM:-0.85}"
 OUTDIR="${OUTDIR:-/tmp/bench_tq_llama3b}"
-CONTEXT="${CONTEXT:-32768}"
+CONTEXT="${CONTEXT:-16384}"
 
 mkdir -p "${OUTDIR}"
 
@@ -64,6 +64,7 @@ launch_server() {
         --host 127.0.0.1 \
         --context-length "${CONTEXT}" \
         --mem-fraction-static "${MEM}" \
+        --cuda-graph-max-bs 24 \
         --trust-remote-code \
         --attention-backend triton \
         "$@" \
@@ -153,7 +154,7 @@ run_comparison() {
 
     # --- TurboQuant ---
     echo "  >> TurboQuant 4-bit..."
-    if launch_server "tq_${name}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse; then
+    if launch_server "tq_${name}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse --mem-fraction-static 0.78 --piecewise-cuda-graph-max-tokens 512; then
         if "$@" "${tq_out}"; then
             echo "  >> TurboQuant: done"
         else
@@ -214,14 +215,14 @@ run_comparison "ruler_4k" \
     _ruler_4k
 
 # =============================================================================
-# 5. RULER 32K — Needle-in-a-haystack at 32K
+# 5. RULER 13K — Needle-in-a-haystack at 13K
 # =============================================================================
-_ruler_32k() {
-    run_lm_eval ruler "$1" --metadata "{\"max_seq_lengths\":[32768],\"pretrained\":\"${MODEL}\"}"
+_ruler_13k() {
+    run_lm_eval ruler "$1" --metadata "{\"max_seq_lengths\":[13000],\"pretrained\":\"${MODEL}\"}"
 }
-run_comparison "ruler_32k" \
-    "RULER needle-in-haystack at 32K context" \
-    _ruler_32k
+run_comparison "ruler_13k" \
+    "RULER needle-in-haystack at 13K context" \
+    _ruler_13k
 
 # =============================================================================
 # 6. Latency / throughput benchmark
@@ -233,7 +234,7 @@ echo "  TTFT/throughput at various input lengths"
 echo "================================================================"
 
 latency_ok=true
-for input_len in 512 2048 8192 16384; do
+for input_len in 512 2048 8192; do
     echo "  >> Baseline input_len=${input_len}..."
     if launch_server "baseline_lat_${input_len}"; then
         run_bench_serving "baseline_${input_len}" "${input_len}"
@@ -243,7 +244,7 @@ for input_len in 512 2048 8192 16384; do
     fi
 
     echo "  >> TurboQuant input_len=${input_len}..."
-    if launch_server "tq_lat_${input_len}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse; then
+    if launch_server "tq_lat_${input_len}" --kv-cache-dtype turboquant --turboquant-bits 4 --turboquant-mode mse --mem-fraction-static 0.78 --piecewise-cuda-graph-max-tokens 512; then
         run_bench_serving "tq_${input_len}" "${input_len}"
         kill_server
     else

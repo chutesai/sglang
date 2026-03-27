@@ -31,6 +31,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 HadamardTransform = _mod.HadamardTransform
+QuantizeWorkspace = _mod.QuantizeWorkspace
 _next_power_of_2 = _mod._next_power_of_2
 compute_packed_dim = _mod.compute_packed_dim
 compute_packed_dim_mixed = _mod.compute_packed_dim_mixed
@@ -529,6 +530,75 @@ def _make_mha_pool(
     )
 
 
+def test_quantize_workspace():
+    """Verify zero-allocation workspace path matches dynamic-alloc path."""
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+    x = torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    # Without workspace (dynamic alloc)
+    q_dyn = turboquant_quantize(x, h, bits=4, mode="mse", workspace=None)
+
+    # With workspace
+    ws = QuantizeWorkspace(max_rows=512, padded_dim=128, device=DEVICE)
+    q_ws = turboquant_quantize(x, h, bits=4, mode="mse", workspace=ws)
+
+    # Packed indices should match exactly
+    assert torch.equal(
+        q_dyn["packed_indices"], q_ws["packed_indices"]
+    ), "Workspace packed_indices differ from dynamic alloc"
+
+    # Norms should match (both clamp to 1e-10 now)
+    assert torch.allclose(
+        q_dyn["norms"], q_ws["norms"], atol=1e-6
+    ), "Workspace norms differ from dynamic alloc"
+
+    # Dequant results should match
+    r_dyn = turboquant_dequantize(q_dyn, h, 4, "mse", torch.float32)
+    r_ws = turboquant_dequantize(q_ws, h, 4, "mse", torch.float32)
+    assert torch.allclose(
+        r_dyn, r_ws, atol=1e-5
+    ), "Workspace dequant output differs from dynamic alloc"
+
+    # Test with smaller batch than workspace max
+    x_small = torch.randn(16, 128, device=DEVICE, dtype=torch.bfloat16)
+    q_small = turboquant_quantize(x_small, h, bits=4, mode="mse", workspace=ws)
+    assert q_small["packed_indices"].shape[0] == 16
+
+    print("PASS: test_quantize_workspace")
+
+
+def test_quantize_workspace_pool_integration():
+    """Verify pool with workspace produces same results as pool without."""
+    pool = _make_mha_pool(head_dim=128, head_num=8, bits=4.0, mode="mse", size=256)
+
+    class _FakeLayer:
+        layer_id = 0
+
+    loc = torch.arange(64, device=DEVICE)
+    cache_k = torch.randn(64, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    cache_v = torch.randn(64, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    # Store without workspace
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+    key_ref = pool._get_key_buffer(0).clone()
+    val_ref = pool._get_value_buffer(0).clone()
+
+    # Initialize workspace and store again
+    pool.init_quantize_workspace(max_tokens=128)
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+    key_ws = pool._get_key_buffer(0)
+    val_ws = pool._get_value_buffer(0)
+
+    # Should match
+    assert torch.allclose(
+        key_ref[loc], key_ws[loc], atol=1e-3
+    ), "K buffer mismatch with workspace"
+    assert torch.allclose(
+        val_ref[loc], val_ws[loc], atol=1e-3
+    ), "V buffer mismatch with workspace"
+    print("PASS: test_quantize_workspace_pool_integration")
+
+
 def test_mha_pool_fused_kernel_flag():
     """Verify can_use_fused_kernel for different bit/mode combos."""
     # 4-bit MSE should use fused kernel
@@ -907,6 +977,10 @@ def test_forward_decode_bypasses_workspace():
     backend.max_kv_splits = max_kv_splits
     backend.use_mla = False
     backend.device = DEVICE
+    backend.cuda_graph_tq_o_rot = None
+    backend.cuda_graph_tq_q_float = None
+    backend.cuda_graph_tq_v_float = None
+    backend.cuda_graph_tq_fwht_tmp = None
 
     # --- Build mock forward_batch ---
     class _MockForwardBatch:
@@ -987,6 +1061,11 @@ if __name__ == "__main__":
         test_mixed_precision,
     ]
 
+    workspace_tests = [
+        test_quantize_workspace,
+        test_quantize_workspace_pool_integration,
+    ]
+
     fused_mha_tests = [
         test_mha_pool_fused_kernel_flag,
         test_fused_kernel_vs_workspace_mha,
@@ -999,7 +1078,7 @@ if __name__ == "__main__":
         test_benchmark_qwen3_4b,
     ]
 
-    all_tests = unit_tests + fused_mha_tests + model_tests
+    all_tests = unit_tests + workspace_tests + fused_mha_tests + model_tests
     passed = 0
     failed = 0
     all_results = {}
