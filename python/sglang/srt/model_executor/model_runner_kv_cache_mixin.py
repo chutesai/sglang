@@ -817,19 +817,19 @@ class ModelRunnerKVCacheMixin:
                 )
 
     def _setup_turboquant_fused_decode(self: ModelRunner):
-        """Set up TurboQuant fused decode kernel for MLA attention modules.
+        """Set up TurboQuant fused decode kernel for attention modules.
 
-        For non-deep_gemm modules: compute w_vc_tq_rotated = R @ w_vc.
-        For deep_gemm modules: store Hadamard transform for inverse rotation,
-        allowing the fused kernel output to be unrotated then fed into the
-        existing FP8 deep_gemm path with original weights.
-
-        Sets _tq_fused_ready on RadixAttention layers.
+        Dispatches to MHA or MLA setup based on the pool type.
         """
         pool = self.token_to_kv_pool
         if not getattr(pool, "can_use_fused_kernel", False):
             return
 
+        if isinstance(pool, MHATokenToKVPoolTurboQuant):
+            self._setup_turboquant_fused_decode_mha(pool)
+            return
+
+        # MLA setup below — accesses pool.nope_hadamard, scans w_vc, etc.
         from sglang.srt.layers.attention.triton_ops.wvc_rotation import (
             compute_rotated_wvc,
         )
@@ -867,6 +867,33 @@ class ModelRunnerKVCacheMixin:
 
         if count > 0:
             logger.info(f"TurboQuant fused decode: set up {count} layers")
+
+    def _setup_turboquant_fused_decode_mha(
+        self: ModelRunner, pool: "MHATokenToKVPoolTurboQuant"
+    ):
+        """Set up TurboQuant fused decode for MHA/GQA attention modules.
+
+        Scans for RadixAttention layers and marks decoder self-attention
+        layers as fused-ready. No weight rotation needed — V inverse rotation
+        happens inline in the backend dispatch.
+        """
+        from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+
+        count = 0
+        for module in self.model.modules():
+            if not isinstance(module, RadixAttention):
+                continue
+            if getattr(module, "is_cross_attention", False):
+                continue
+            if getattr(module, "attn_type", None) != AttentionType.DECODER:
+                continue
+            module._tq_mha_fused_ready = True
+            count += 1
+
+        if count > 0:
+            logger.info(
+                f"TurboQuant fused decode (MHA): set up {count} layers"
+            )
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,

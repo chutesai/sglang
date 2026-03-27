@@ -483,6 +483,498 @@ def print_grid(results):
     print(f"  - MSE matches paper's theoretical bounds at all tested bit-widths")
 
 
+# ---------------------------------------------------------------------------
+# Fused MHA kernel tests
+# ---------------------------------------------------------------------------
+
+# Import path for MHA pool (use importlib to avoid full sglang init)
+_pool_path = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "srt",
+    "mem_cache",
+    "turboquant_memory_pool.py",
+)
+_pool_spec = importlib.util.spec_from_file_location(
+    "turboquant_memory_pool", os.path.abspath(_pool_path)
+)
+
+
+def _make_mha_pool(
+    head_dim=128,
+    head_num=8,
+    bits=4.0,
+    mode="mse",
+    size=256,
+    layer_num=1,
+    v_head_dim=None,
+):
+    """Create an MHA TurboQuant pool for testing."""
+    from sglang.srt.mem_cache.turboquant_memory_pool import (
+        MHATokenToKVPoolTurboQuant,
+    )
+
+    return MHATokenToKVPoolTurboQuant(
+        size=size,
+        page_size=1,
+        dtype=torch.bfloat16,
+        head_num=head_num,
+        head_dim=head_dim,
+        layer_num=layer_num,
+        device="cuda",
+        enable_memory_saver=False,
+        bits=bits,
+        mode=mode,
+        v_head_dim=v_head_dim,
+    )
+
+
+def test_mha_pool_fused_kernel_flag():
+    """Verify can_use_fused_kernel for different bit/mode combos."""
+    # 4-bit MSE should use fused kernel
+    pool_4b = _make_mha_pool(bits=4.0, mode="mse")
+    assert pool_4b.can_use_fused_kernel, "4-bit MSE should use fused kernel"
+    assert pool_4b.k_centroids_scaled is not None
+    assert pool_4b.v_centroids_scaled is not None
+
+    # 3-bit should not
+    pool_3b = _make_mha_pool(bits=3.0, mode="mse")
+    assert not pool_3b.can_use_fused_kernel, "3-bit should not use fused kernel"
+    assert pool_3b.k_centroids_scaled is None
+
+    # Prod mode should not
+    pool_prod = _make_mha_pool(bits=4.0, mode="prod")
+    assert not pool_prod.can_use_fused_kernel, "prod mode should not use fused kernel"
+
+    # Mixed-precision should not
+    pool_mixed = _make_mha_pool(bits=3.5, mode="mse")
+    assert (
+        not pool_mixed.can_use_fused_kernel
+    ), "3.5-bit mixed should not use fused kernel"
+
+    print("PASS: test_mha_pool_fused_kernel_flag")
+
+
+def test_fused_kernel_vs_workspace_mha():
+    """Verify fused kernel output matches workspace-dequant path for MHA."""
+    import torch.nn.functional as F
+
+    from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant_mha import (
+        decode_attention_fwd_tq_mha,
+    )
+
+    head_dim = 128
+    v_head_dim = 128
+    kv_heads = 8
+    q_heads = 64  # GQA: 8x group ratio
+    batch = 4
+    N_tokens = 64
+
+    pool = _make_mha_pool(
+        head_dim=head_dim,
+        head_num=kv_heads,
+        bits=4.0,
+        mode="mse",
+        size=256,
+        layer_num=1,
+        v_head_dim=v_head_dim,
+    )
+
+    # Fake layer for set_kv_buffer
+    class _FakeLayer:
+        def __init__(self):
+            self.layer_id = 0
+
+    layer = _FakeLayer()
+
+    loc = torch.arange(N_tokens, device=DEVICE)
+    cache_k = torch.randn(
+        N_tokens, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    cache_v = torch.randn(
+        N_tokens, kv_heads, v_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+
+    # Random Q (not rotated yet)
+    q = torch.randn(batch, q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
+
+    # Each batch element attends to 16 tokens
+    seq_lens = torch.tensor([16, 16, 16, 16], dtype=torch.int32, device=DEVICE)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+    kv_indices = torch.arange(N_tokens, dtype=torch.int32, device=DEVICE)
+
+    # --- Workspace path (reference) ---
+    key_buf = pool._get_key_buffer(0)  # (max_tokens, kv_heads, head_dim)
+    val_buf = pool._get_value_buffer(0)  # (max_tokens, kv_heads, v_head_dim)
+
+    ref_outputs = []
+    for b in range(batch):
+        start = kv_indptr[b].item()
+        end = kv_indptr[b + 1].item()
+        token_ids = kv_indices[start:end]
+
+        # For each Q head, map to KV head
+        per_head_out = []
+        for qh in range(q_heads):
+            kvh = qh // (q_heads // kv_heads)
+            k = key_buf[token_ids, kvh, :].float()  # (seq_len, head_dim)
+            v = val_buf[token_ids, kvh, :v_head_dim].float()  # (seq_len, v_head_dim)
+            q_h = q[b, qh].float()  # (head_dim,)
+            scores = q_h @ k.T  # (seq_len,)
+            probs = torch.softmax(scores, dim=-1)  # (seq_len,)
+            out = probs @ v  # (v_head_dim,)
+            per_head_out.append(out)
+        ref_outputs.append(torch.stack(per_head_out))
+
+    ref_output = torch.stack(ref_outputs)  # (batch, q_heads, v_head_dim)
+
+    # --- Fused kernel path ---
+    q_rot = pool.k_hadamard.forward(q)
+
+    num_kv_splits = torch.ones(batch, dtype=torch.int32, device=DEVICE)
+    max_kv_splits = 1
+
+    padded_v = pool.v_padded_head_dim
+    o_fused = torch.zeros(batch, q_heads, padded_v, device=DEVICE, dtype=torch.bfloat16)
+    decode_attention_fwd_tq_mha(
+        q_rot,
+        pool.get_k_packed_buffer(0),
+        pool.get_v_packed_buffer(0),
+        pool.get_k_norms_buffer(0),
+        pool.get_v_norms_buffer(0),
+        pool.k_centroids_scaled,
+        pool.v_centroids_scaled,
+        o_fused,
+        kv_indptr,
+        kv_indices,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale=1.0,
+    )
+
+    # Inverse-rotate from V-Hadamard space
+    o_unrotated = pool.v_hadamard.inverse(o_fused.float())[:, :, :v_head_dim]
+
+    cos = (
+        F.cosine_similarity(ref_output.flatten(1), o_unrotated.flatten(1), dim=-1)
+        .mean()
+        .item()
+    )
+    print(f"  Fused MHA kernel vs workspace cosine sim: {cos:.6f}")
+    assert cos > 0.99, f"Fused MHA kernel output cosine sim {cos:.4f} too low"
+    print("PASS: test_fused_kernel_vs_workspace_mha")
+
+
+def test_fused_kernel_mha_head_configs():
+    """Test fused kernel with MHA (equal heads) and GQA (grouped) configs."""
+    import torch.nn.functional as F
+
+    from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant_mha import (
+        decode_attention_fwd_tq_mha,
+    )
+
+    configs = [
+        # (head_dim, kv_heads, q_heads, label)
+        (128, 8, 8, "MHA 8/8"),
+        (128, 8, 64, "GQA 8/64"),
+        (128, 4, 32, "GQA 4/32"),
+    ]
+
+    batch = 2
+    N_tokens = 32
+
+    for head_dim, kv_heads, q_heads, label in configs:
+        pool = _make_mha_pool(
+            head_dim=head_dim,
+            head_num=kv_heads,
+            bits=4.0,
+            mode="mse",
+            size=64,
+            layer_num=1,
+        )
+
+        class _FakeLayer:
+            layer_id = 0
+
+        loc = torch.arange(N_tokens, device=DEVICE)
+        cache_k = torch.randn(
+            N_tokens, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+        )
+        cache_v = torch.randn(
+            N_tokens, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+        )
+        pool.set_kv_buffer(_FakeLayer(), loc, cache_k, cache_v)
+
+        q = torch.randn(batch, q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
+
+        seq_lens = torch.tensor([16, 16], dtype=torch.int32, device=DEVICE)
+        kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        kv_indices = torch.arange(N_tokens, dtype=torch.int32, device=DEVICE)
+
+        # Reference
+        key_buf = pool._get_key_buffer(0)
+        val_buf = pool._get_value_buffer(0)
+
+        ref_outputs = []
+        for b in range(batch):
+            start = kv_indptr[b].item()
+            end = kv_indptr[b + 1].item()
+            token_ids = kv_indices[start:end]
+            per_head = []
+            for qh in range(q_heads):
+                kvh = qh // (q_heads // kv_heads)
+                k = key_buf[token_ids, kvh, :].float()
+                v = val_buf[token_ids, kvh, :].float()
+                scores = q[b, qh].float() @ k.T
+                probs = torch.softmax(scores, dim=-1)
+                per_head.append(probs @ v)
+            ref_outputs.append(torch.stack(per_head))
+        ref_output = torch.stack(ref_outputs)
+
+        # Fused
+        q_rot = pool.k_hadamard.forward(q)
+        num_kv_splits = torch.ones(batch, dtype=torch.int32, device=DEVICE)
+        padded = pool.v_padded_head_dim
+        o_fused = torch.zeros(
+            batch, q_heads, padded, device=DEVICE, dtype=torch.bfloat16
+        )
+
+        decode_attention_fwd_tq_mha(
+            q_rot,
+            pool.get_k_packed_buffer(0),
+            pool.get_v_packed_buffer(0),
+            pool.get_k_norms_buffer(0),
+            pool.get_v_norms_buffer(0),
+            pool.k_centroids_scaled,
+            pool.v_centroids_scaled,
+            o_fused,
+            kv_indptr,
+            kv_indices,
+            num_kv_splits,
+            1,
+            sm_scale=1.0,
+        )
+
+        o_unrotated = pool.v_hadamard.inverse(o_fused.float())[:, :, :head_dim]
+        cos = (
+            F.cosine_similarity(ref_output.flatten(1), o_unrotated.flatten(1), dim=-1)
+            .mean()
+            .item()
+        )
+        print(f"  {label}: cosine={cos:.6f}")
+        assert cos > 0.99, f"{label}: cosine {cos:.4f} too low"
+
+    print("PASS: test_fused_kernel_mha_head_configs")
+
+
+def test_forward_decode_bypasses_workspace():
+    """Integration test: call forward_decode() and prove workspace dequant is bypassed.
+
+    This exercises the real dispatch path in triton_backend.py:forward_decode(),
+    verifying that when _tq_mha_fused_ready is set, get_key_buffer/get_value_buffer
+    are never called (the whole point of the fused kernel).
+    """
+    from unittest.mock import patch
+
+    import torch.nn.functional as F
+
+    from sglang.srt.layers.attention.triton_backend import (
+        ForwardMetadata,
+        TritonAttnBackend,
+    )
+
+    head_dim = 128
+    v_head_dim = 128
+    kv_heads = 8
+    q_heads = 32  # GQA 4x
+    batch = 2
+    N_tokens = 32
+
+    pool = _make_mha_pool(
+        head_dim=head_dim,
+        head_num=kv_heads,
+        bits=4.0,
+        mode="mse",
+        size=64,
+        layer_num=1,
+        v_head_dim=v_head_dim,
+    )
+
+    # Populate KV cache
+    class _FakeLayer:
+        layer_id = 0
+
+    loc = torch.arange(N_tokens, device=DEVICE)
+    cache_k = torch.randn(
+        N_tokens, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    cache_v = torch.randn(
+        N_tokens, kv_heads, v_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k, cache_v)
+
+    # --- Build reference output (workspace path) ---
+    key_buf = pool._get_key_buffer(0)
+    val_buf = pool._get_value_buffer(0)
+
+    seq_lens = torch.tensor([16, 16], dtype=torch.int32, device=DEVICE)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+    kv_indices = torch.arange(N_tokens, dtype=torch.int32, device=DEVICE)
+
+    q = torch.randn(batch, q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
+
+    ref_outputs = []
+    for b in range(batch):
+        start = kv_indptr[b].item()
+        end = kv_indptr[b + 1].item()
+        token_ids = kv_indices[start:end]
+        per_head = []
+        for qh in range(q_heads):
+            kvh = qh // (q_heads // kv_heads)
+            k = key_buf[token_ids, kvh, :].float()
+            v = val_buf[token_ids, kvh, :v_head_dim].float()
+            scores = q[b, qh].float() @ k.T
+            probs = torch.softmax(scores, dim=-1)
+            per_head.append(probs @ v)
+        ref_outputs.append(torch.stack(per_head))
+    ref_output = torch.stack(ref_outputs)  # (batch, q_heads, v_head_dim)
+
+    # --- Build mock layer with _tq_mha_fused_ready ---
+    _v_hd = v_head_dim  # avoid class-scope shadowing
+
+    class _MockLayer:
+        layer_id = 0
+        tp_q_head_num = q_heads
+        qk_head_dim = head_dim
+        v_head_dim = _v_hd
+        scaling = 1.0
+        logit_cap = 0.0
+        logit_capping_method = "tanh"
+        k_scale = None
+        v_scale = None
+        sliding_window_size = -1
+        _tq_mha_fused_ready = True
+        xai_temperature_len = 0
+
+    layer = _MockLayer()
+
+    # --- Build mock backend (only the fields forward_decode touches) ---
+    max_kv_splits = 8
+    num_kv_splits = torch.clamp(
+        torch.ceil(seq_lens / 32).to(torch.int32), min=1, max=max_kv_splits
+    )
+
+    metadata = ForwardMetadata(
+        attn_logits=torch.zeros(
+            batch,
+            q_heads,
+            max_kv_splits,
+            v_head_dim,
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+        attn_lse=torch.zeros(
+            batch,
+            q_heads,
+            max_kv_splits,
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+        max_extend_len=0,
+        num_kv_splits=num_kv_splits,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        qo_indptr=None,
+        custom_mask=None,
+        mask_indptr=None,
+        window_kv_indptr=None,
+        window_kv_indices=None,
+        window_num_kv_splits=None,
+        window_kv_offsets=None,
+    )
+
+    class _MockBackend:
+        # Bind real methods from TritonAttnBackend so forward_decode can call them
+        forward_decode = TritonAttnBackend.forward_decode
+        _forward_turboquant_fused_mha = TritonAttnBackend._forward_turboquant_fused_mha
+
+    backend = _MockBackend()
+    backend.forward_metadata = metadata
+    backend.max_kv_splits = max_kv_splits
+    backend.use_mla = False
+    backend.device = DEVICE
+
+    # --- Build mock forward_batch ---
+    class _MockForwardBatch:
+        pass
+
+    forward_batch = _MockForwardBatch()
+    forward_batch.token_to_kv_pool = pool
+    forward_batch.out_cache_loc = loc[:batch]  # only storing batch tokens
+
+    # --- Call forward_decode via the real method, with spy on workspace getters ---
+    q_flat = q.reshape(batch, q_heads * head_dim)
+    k_dummy = torch.randn(
+        batch, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    v_dummy = torch.randn(
+        batch, kv_heads, v_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+
+    get_key_called = []
+    get_value_called = []
+    orig_get_key = pool.__class__.get_key_buffer
+    orig_get_value = pool.__class__.get_value_buffer
+
+    def spy_get_key(self_pool, *args, **kwargs):
+        get_key_called.append(True)
+        return orig_get_key(self_pool, *args, **kwargs)
+
+    def spy_get_value(self_pool, *args, **kwargs):
+        get_value_called.append(True)
+        return orig_get_value(self_pool, *args, **kwargs)
+
+    with patch.object(pool.__class__, "get_key_buffer", spy_get_key), patch.object(
+        pool.__class__, "get_value_buffer", spy_get_value
+    ):
+        o = TritonAttnBackend.forward_decode(
+            backend,  # self
+            q_flat,
+            k_dummy,
+            v_dummy,
+            layer,
+            forward_batch,
+            save_kv_cache=False,  # skip KV store to simplify mock
+            sinks=None,
+        )
+
+    # Assert workspace getters were NOT called
+    assert len(get_key_called) == 0, (
+        f"get_key_buffer was called {len(get_key_called)} times — "
+        "fused path should bypass workspace dequant"
+    )
+    assert len(get_value_called) == 0, (
+        f"get_value_buffer was called {len(get_value_called)} times — "
+        "fused path should bypass workspace dequant"
+    )
+
+    # Verify output correctness
+    o_3d = o.view(batch, q_heads, v_head_dim)
+    cos = (
+        F.cosine_similarity(ref_output.flatten(1), o_3d.float().flatten(1), dim=-1)
+        .mean()
+        .item()
+    )
+    print(f"  forward_decode integration cosine sim: {cos:.6f}")
+    assert cos > 0.99, f"Integration test output cosine {cos:.4f} too low"
+    print("  Workspace get_key_buffer/get_value_buffer: NOT called (confirmed)")
+    print("PASS: test_forward_decode_bypasses_workspace")
+
+
 if __name__ == "__main__":
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}\n")
@@ -495,12 +987,19 @@ if __name__ == "__main__":
         test_mixed_precision,
     ]
 
+    fused_mha_tests = [
+        test_mha_pool_fused_kernel_flag,
+        test_fused_kernel_vs_workspace_mha,
+        test_fused_kernel_mha_head_configs,
+        test_forward_decode_bypasses_workspace,
+    ]
+
     model_tests = [
         test_benchmark_mistral_7b,
         test_benchmark_qwen3_4b,
     ]
 
-    all_tests = unit_tests + model_tests
+    all_tests = unit_tests + fused_mha_tests + model_tests
     passed = 0
     failed = 0
     all_results = {}

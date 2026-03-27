@@ -9,6 +9,7 @@ Follows the same pattern as MHATokenToKVPoolFP4 for buffer management.
 """
 
 import logging
+import math
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -17,6 +18,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.quantization.turboquant_kernels import (
     HadamardTransform,
+    _get_centroids_tensor,
     _next_power_of_2,
     compute_packed_dim,
     compute_packed_dim_mixed,
@@ -152,6 +154,17 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=enable_kv_cache_copy,
         )
+
+        # Pre-scaled centroid tables for the fused decode kernel.
+        # The centroids are scaled by 1/sqrt(dim) so the kernel only needs to
+        # multiply by the per-token norm (no additional 1/sqrt(d) factor).
+        if self.can_use_fused_kernel:
+            raw = _get_centroids_tensor(self.mse_bits, torch.device(device))
+            self.k_centroids_scaled = raw / math.sqrt(self.padded_head_dim)
+            self.v_centroids_scaled = raw / math.sqrt(self.v_padded_head_dim)
+        else:
+            self.k_centroids_scaled = None
+            self.v_centroids_scaled = None
 
     def _create_buffers(self):
         """Allocate bit-packed compressed storage buffers + shared workspace."""
@@ -503,3 +516,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 self.v_residual_norms_buffer[i][tgt_loc] = self.v_residual_norms_buffer[
                     i
                 ][src_loc]
+
+    @property
+    def can_use_fused_kernel(self):
+        """True iff the fused dequant-attention Triton kernel can be used."""
+        return self.mode == "mse" and self.mse_bits == 4 and not self.is_mixed
+
+    def get_k_packed_buffer(self, layer_id: int):
+        """Return raw packed K buffer for fused kernel."""
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_v_packed_buffer(self, layer_id: int):
+        """Return raw packed V buffer for fused kernel."""
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_k_norms_buffer(self, layer_id: int):
+        """Return K norms buffer for fused kernel."""
+        return self.k_norms_buffer[layer_id - self.start_layer]
+
+    def get_v_norms_buffer(self, layer_id: int):
+        """Return V norms buffer for fused kernel."""
+        return self.v_norms_buffer[layer_id - self.start_layer]

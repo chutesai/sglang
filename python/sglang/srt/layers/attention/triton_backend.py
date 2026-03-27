@@ -1089,6 +1089,16 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        # TurboQuant fused dequant-attention path for MHA/GQA
+        pool = forward_batch.token_to_kv_pool
+        _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
+            layer, "_tq_mha_fused_ready", False
+        )
+        if _tq_fused:
+            return self._forward_turboquant_fused_mha(
+                q, o, layer, forward_batch, kv_indptr, kv_indices, logits_soft_cap
+            )
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1107,6 +1117,69 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        return o
+
+    def _forward_turboquant_fused_mha(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        logits_soft_cap: float,
+    ) -> torch.Tensor:
+        """Fused TurboQuant dequant-attention for MHA/GQA decode.
+
+        Reads 4-bit packed K/V buffers directly, dequants on-the-fly during
+        attention, and inverse-rotates the V-space output.
+        """
+        from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant_mha import (
+            decode_attention_fwd_tq_mha,
+        )
+
+        pool = forward_batch.token_to_kv_pool
+        batch = q.shape[0]
+        q_3d = q.view(batch, layer.tp_q_head_num, layer.qk_head_dim)
+
+        # Rotate Q into K-Hadamard space
+        q_rot = pool.k_hadamard.forward(q_3d)
+
+        # Output in V-rotated space (padded to v_padded_head_dim for kernel)
+        v_head_dim = layer.v_head_dim
+        v_padded = pool.v_padded_head_dim
+        o_rot = torch.zeros(
+            batch,
+            layer.tp_q_head_num,
+            v_padded,
+            device=q.device,
+            dtype=q.dtype,
+        )
+
+        decode_attention_fwd_tq_mha(
+            q_rot,
+            pool.get_k_packed_buffer(layer.layer_id),
+            pool.get_v_packed_buffer(layer.layer_id),
+            pool.get_k_norms_buffer(layer.layer_id),
+            pool.get_v_norms_buffer(layer.layer_id),
+            pool.k_centroids_scaled,
+            pool.v_centroids_scaled,
+            o_rot,
+            kv_indptr,
+            kv_indices,
+            self.forward_metadata.num_kv_splits,
+            self.max_kv_splits,
+            layer.scaling,
+            logit_cap=logits_soft_cap,
+            attn_logits=self.forward_metadata.attn_logits,
+            attn_lse=self.forward_metadata.attn_lse,
+        )
+
+        # Inverse-rotate from V-Hadamard space and trim to v_head_dim
+        o_unrot = pool.v_hadamard.inverse(o_rot)
+        o_final = o_unrot[:, :, :v_head_dim]
+
+        o.copy_(o_final.reshape_as(o))
         return o
 
 
