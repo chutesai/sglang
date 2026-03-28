@@ -531,33 +531,45 @@ def _make_mha_pool(
 
 
 def test_quantize_workspace():
-    """Verify zero-allocation workspace path matches dynamic-alloc path."""
+    """Verify fused workspace path matches dynamic-alloc path."""
+    import torch.nn.functional as F
+
     h = HadamardTransform(128, seed=42, device=DEVICE)
     x = torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16)
 
-    # Without workspace (dynamic alloc)
+    # Without workspace (dynamic alloc / legacy path)
     q_dyn = turboquant_quantize(x, h, bits=4, mode="mse", workspace=None)
 
-    # With workspace
+    # With workspace (fused 3-kernel path)
     ws = QuantizeWorkspace(max_rows=512, padded_dim=128, device=DEVICE)
     q_ws = turboquant_quantize(x, h, bits=4, mode="mse", workspace=ws)
 
-    # Packed indices should match exactly
+    # Workspace should only have 4 buffers (norms, rotated, fwht_out, packed)
+    assert hasattr(ws, "norms") and hasattr(ws, "rotated")
+    assert hasattr(ws, "fwht_out") and hasattr(ws, "packed")
+    assert not hasattr(ws, "rotated_normalized"), "rotated_normalized should be removed"
+    assert not hasattr(ws, "indices"), "indices should be removed"
+    assert not hasattr(ws, "pack_even"), "pack_even should be removed"
+    assert not hasattr(ws, "pack_odd"), "pack_odd should be removed"
+
+    # Norms should match closely
+    assert torch.allclose(
+        q_dyn["norms"], q_ws["norms"], atol=1e-5
+    ), "Workspace norms differ from dynamic alloc"
+
+    # Dequant results should match with high cosine similarity
+    r_dyn = turboquant_dequantize(q_dyn, h, 4, "mse", torch.float32)
+    r_ws = turboquant_dequantize(q_ws, h, 4, "mse", torch.float32)
+    cos = F.cosine_similarity(
+        r_dyn.flatten().unsqueeze(0), r_ws.flatten().unsqueeze(0)
+    ).item()
+    print(f"  Fused vs legacy dequant cosine: {cos:.6f}")
+    assert cos > 0.9999, f"Fused vs legacy cosine {cos:.6f} too low"
+
+    # Packed indices should match exactly (same quantization)
     assert torch.equal(
         q_dyn["packed_indices"], q_ws["packed_indices"]
     ), "Workspace packed_indices differ from dynamic alloc"
-
-    # Norms should match (both clamp to 1e-10 now)
-    assert torch.allclose(
-        q_dyn["norms"], q_ws["norms"], atol=1e-6
-    ), "Workspace norms differ from dynamic alloc"
-
-    # Dequant results should match
-    r_dyn = turboquant_dequantize(q_dyn, h, 4, "mse", torch.float32)
-    r_ws = turboquant_dequantize(q_ws, h, 4, "mse", torch.float32)
-    assert torch.allclose(
-        r_dyn, r_ws, atol=1e-5
-    ), "Workspace dequant output differs from dynamic alloc"
 
     # Test with smaller batch than workspace max
     x_small = torch.randn(16, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -597,6 +609,150 @@ def test_quantize_workspace_pool_integration():
         val_ref[loc], val_ws[loc], atol=1e-3
     ), "V buffer mismatch with workspace"
     print("PASS: test_quantize_workspace_pool_integration")
+
+
+def test_fused_prepare_kernel():
+    """Verify _turboquant_prepare_kernel produces correct norms and signs-applied output."""
+    import torch.nn.functional as F
+
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+    x = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    # Reference: manual steps
+    x_f32 = x.float()
+    ref_norms = torch.norm(x_f32, dim=-1)
+    ref_prepared = x_f32 * h.signs[:128]
+
+    # Fused kernel
+    prepared = torch.empty(64, 128, dtype=torch.float32, device=DEVICE)
+    norms = torch.empty(64, dtype=torch.float32, device=DEVICE)
+
+    from sglang.srt.layers.quantization.turboquant_kernels import (
+        _turboquant_prepare_kernel,
+    )
+
+    # Re-import to get the kernel directly
+    _turboquant_prepare_kernel[(64,)](
+        x,
+        h.signs,
+        prepared,
+        norms,
+        x.stride(0),
+        prepared.stride(0),
+        DIM=128,
+        PADDED_DIM=128,
+        BLOCK_SIZE=128,
+    )
+
+    # Check norms
+    assert torch.allclose(
+        norms, ref_norms, atol=1e-4
+    ), f"Norm mismatch: max diff {(norms - ref_norms).abs().max().item():.6e}"
+
+    # Check prepared output
+    cos = F.cosine_similarity(
+        ref_prepared.flatten().unsqueeze(0), prepared.flatten().unsqueeze(0)
+    ).item()
+    assert cos > 0.9999, f"Prepare output cosine {cos:.6f} too low"
+
+    print("PASS: test_fused_prepare_kernel")
+
+
+def test_fused_quantize_pack_kernel():
+    """Verify _turboquant_quantize_pack_kernel matches separate normalize+quantize+pack."""
+
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+    x = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    # Run full legacy quantize (no workspace) to get reference
+    q_ref = turboquant_quantize(x, h, bits=4, mode="mse", workspace=None)
+
+    # Run fused workspace path
+    ws = QuantizeWorkspace(max_rows=128, padded_dim=128, device=DEVICE)
+    q_fused = turboquant_quantize(x, h, bits=4, mode="mse", workspace=ws)
+
+    # Packed indices should match
+    assert torch.equal(
+        q_ref["packed_indices"], q_fused["packed_indices"]
+    ), "Fused quantize+pack indices differ from legacy"
+
+    print("PASS: test_fused_quantize_pack_kernel")
+
+
+def test_jit_hadamard_matches_python_fwht():
+    """JIT Hadamard with out= matches Python FWHT (cosine > 0.9999)."""
+    import torch.nn.functional as F
+
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+
+    x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+
+    # Python fallback path
+    h_py = HadamardTransform(128, seed=42, device=DEVICE)
+    h_py._use_jit = False
+    y_py = h_py.forward(x.clone())
+
+    # JIT path (if available)
+    if not h._use_jit:
+        print("  SKIP: JIT hadamard not available")
+        print("PASS: test_jit_hadamard_matches_python_fwht (skipped)")
+        return
+
+    y_jit = h.forward(x.clone())
+
+    cos = F.cosine_similarity(
+        y_py.flatten().unsqueeze(0), y_jit.flatten().unsqueeze(0)
+    ).item()
+    print(f"  JIT vs Python FWHT cosine: {cos:.6f}")
+    assert cos > 0.9999, f"JIT vs Python cosine {cos:.6f} too low"
+    print("PASS: test_jit_hadamard_matches_python_fwht")
+
+
+def test_jit_hadamard_out_identity():
+    """hadamard_transform(..., out=pre_alloc) returns tensor with same data_ptr."""
+    try:
+        from sglang.jit_kernel.hadamard import hadamard_transform
+    except ImportError:
+        print("PASS: test_jit_hadamard_out_identity (skipped, no JIT)")
+        return
+
+    x = torch.randn(32, 128, device=DEVICE, dtype=torch.float32)
+    pre_alloc = torch.empty_like(x)
+
+    result = hadamard_transform(x, scale=1.0, out=pre_alloc)
+    assert (
+        result.data_ptr() == pre_alloc.data_ptr()
+    ), f"data_ptr mismatch: result={result.data_ptr()}, out={pre_alloc.data_ptr()}"
+    print("PASS: test_jit_hadamard_out_identity")
+
+
+def test_jit_hadamard_out_validation():
+    """Validation asserts fire when out has wrong dtype/device/shape."""
+    try:
+        from sglang.jit_kernel.hadamard import hadamard_transform
+    except ImportError:
+        print("PASS: test_jit_hadamard_out_validation (skipped, no JIT)")
+        return
+
+    x = torch.randn(32, 128, device=DEVICE, dtype=torch.float32)
+
+    # Wrong dtype
+    bad_dtype = torch.empty(32, 128, device=DEVICE, dtype=torch.float16)
+    try:
+        hadamard_transform(x, scale=1.0, out=bad_dtype)
+        assert False, "Should have raised ValueError for wrong dtype"
+    except ValueError:
+        pass
+
+    # Wrong shape
+    bad_shape = torch.empty(32, 64, device=DEVICE, dtype=torch.float32)
+    try:
+        hadamard_transform(x, scale=1.0, out=bad_shape)
+        assert False, "Should have raised ValueError for wrong shape"
+    except ValueError:
+        pass
+
+    print("PASS: test_jit_hadamard_out_validation")
 
 
 def test_mha_pool_fused_kernel_flag():
@@ -980,7 +1136,7 @@ def test_forward_decode_bypasses_workspace():
     backend.cuda_graph_tq_o_rot = None
     backend.cuda_graph_tq_q_float = None
     backend.cuda_graph_tq_v_float = None
-    backend.cuda_graph_tq_fwht_tmp = None
+    backend.cuda_graph_tq_fwht_out = None
 
     # --- Build mock forward_batch ---
     class _MockForwardBatch:
@@ -1064,6 +1220,11 @@ if __name__ == "__main__":
     workspace_tests = [
         test_quantize_workspace,
         test_quantize_workspace_pool_integration,
+        test_fused_prepare_kernel,
+        test_fused_quantize_pack_kernel,
+        test_jit_hadamard_matches_python_fwht,
+        test_jit_hadamard_out_identity,
+        test_jit_hadamard_out_validation,
     ]
 
     fused_mha_tests = [

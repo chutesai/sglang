@@ -76,6 +76,17 @@ CENTROIDS_4BIT = [
 _centroids_cache: dict = {}
 _scaled_centroids_cache: dict = {}
 
+# JIT Hadamard kernel availability
+try:
+    from sglang.jit_kernel.hadamard import hadamard_transform as _jit_hadamard_transform
+
+    _HAS_JIT_HADAMARD = True
+except ImportError:
+    _HAS_JIT_HADAMARD = False
+
+# Track which (dtype, dim) combos have been JIT-warmed to avoid redundant compilation
+_jit_warmed: set = set()
+
 
 class QuantizeWorkspace:
     """Pre-allocated scratch buffers for zero-allocation quantization.
@@ -90,31 +101,17 @@ class QuantizeWorkspace:
         self.padded_dim = padded_dim
         packed_dim = padded_dim // 2  # 4-bit nibble packing
 
-        # Norms buffer
+        # Norms buffer (prepare output / quantize_pack input)
         self.norms = torch.empty(max_rows, dtype=torch.float32, device=device)
-        # Hadamard rotation input/output (float32, written then transformed in-place)
+        # Prepare output / Hadamard input (float32, signs-applied + padded)
         self.rotated = torch.empty(
             max_rows, padded_dim, dtype=torch.float32, device=device
         )
-        # Normalized rotated coordinates
-        self.rotated_normalized = torch.empty(
+        # JIT Hadamard output buffer / quantize_pack input
+        self.fwht_out = torch.empty(
             max_rows, padded_dim, dtype=torch.float32, device=device
         )
-        # Quantization indices (unpacked uint8)
-        self.indices = torch.empty(
-            max_rows, padded_dim, dtype=torch.uint8, device=device
-        )
-        # FWHT butterfly temporary
-        self.fwht_tmp = torch.empty(
-            max_rows, padded_dim // 2, dtype=torch.float32, device=device
-        )
-        # 4-bit pack intermediates
-        self.pack_even = torch.empty(
-            max_rows, packed_dim, dtype=torch.int32, device=device
-        )
-        self.pack_odd = torch.empty(
-            max_rows, packed_dim, dtype=torch.int32, device=device
-        )
+        # Quantize+pack output (4-bit packed uint8)
         self.packed = torch.empty(
             max_rows, packed_dim, dtype=torch.uint8, device=device
         )
@@ -124,11 +121,7 @@ class QuantizeWorkspace:
         for attr in (
             "norms",
             "rotated",
-            "rotated_normalized",
-            "indices",
-            "fwht_tmp",
-            "pack_even",
-            "pack_odd",
+            "fwht_out",
             "packed",
         ):
             t = getattr(self, attr)
@@ -190,12 +183,29 @@ class HadamardTransform:
         self.signs = _generate_random_signs(self.padded_dim, seed, device)
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
+        self._use_jit = _HAS_JIT_HADAMARD
+
+        # JIT warmup: trigger compilation before CUDA graph capture.
+        # If the JIT build/load fails at runtime (e.g. missing compiler,
+        # unsupported GPU), fall back to the Python butterfly silently.
+        if self._use_jit and device.type == "cuda":
+            key = (torch.float32, self.padded_dim)
+            if key not in _jit_warmed:
+                try:
+                    dummy = torch.zeros(
+                        1, self.padded_dim, dtype=torch.float32, device=device
+                    )
+                    _jit_hadamard_transform(dummy, scale=1.0)
+                    _jit_warmed.add(key)
+                except Exception:
+                    self._use_jit = False
 
     def forward(
         self,
         x: torch.Tensor,
         out: torch.Tensor = None,
-        fwht_tmp: Optional[torch.Tensor] = None,
+        fwht_out: Optional[torch.Tensor] = None,
+        skip_signs: bool = False,
     ) -> torch.Tensor:
         """Apply randomized Hadamard: y = scale * H * diag(signs) * x.
 
@@ -203,8 +213,12 @@ class HadamardTransform:
             x: (..., dim) tensor
             out: optional pre-allocated output tensor (..., padded_dim).
                  When provided, x is copied into out and transformed in-place.
-            fwht_tmp: optional pre-allocated FWHT scratch buffer.
-                      Pass to avoid allocations during CUDA graph capture.
+            fwht_out: optional pre-allocated output buffer for the JIT Hadamard
+                      kernel (shape matches x after padding). When using the Python
+                      fallback, this is used as a butterfly scratch buffer (only
+                      needs padded_dim//2 cols, but padded_dim works too).
+            skip_signs: if True, skip the signs multiplication (caller already
+                        applied signs, e.g. in the fused prepare kernel).
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
@@ -223,20 +237,25 @@ class HadamardTransform:
             out.copy_(x)
             x = out
 
-        # Apply random signs
-        x.mul_(self.signs)
+        # Apply random signs (unless already applied by fused prepare kernel)
+        if not skip_signs:
+            x.mul_(self.signs)
 
-        # In-place Fast Walsh-Hadamard Transform
-        x = self._fwht_inplace(x, tmp=fwht_tmp)
-
-        x.mul_(self.scale)
+        # Hadamard transform
+        if self._use_jit:
+            # Single CUDA kernel, zero-alloc when fwht_out is provided
+            x = _jit_hadamard_transform(x, scale=self.scale, out=fwht_out)
+        else:
+            # Python butterfly fallback (fwht_out doubles as scratch buffer)
+            x = self._fwht_inplace(x, tmp=fwht_out)
+            x.mul_(self.scale)
         return x
 
     def inverse(
         self,
         y: torch.Tensor,
         out: torch.Tensor = None,
-        fwht_tmp: Optional[torch.Tensor] = None,
+        fwht_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
 
@@ -244,12 +263,19 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        if out is not None:
-            out.copy_(y)
-            x = self._fwht_inplace(out, tmp=fwht_tmp)
+        if self._use_jit:
+            if out is not None:
+                out.copy_(y)
+                x = _jit_hadamard_transform(out, scale=self.scale, out=fwht_out)
+            else:
+                x = _jit_hadamard_transform(y, scale=self.scale, out=fwht_out)
         else:
-            x = self._fwht_inplace(y, tmp=fwht_tmp)
-        x.mul_(self.scale)
+            if out is not None:
+                out.copy_(y)
+                x = self._fwht_inplace(out, tmp=fwht_out)
+            else:
+                x = self._fwht_inplace(y, tmp=fwht_out)
+            x.mul_(self.scale)
         x.mul_(self.signs)
         return x[..., : self.dim]
 
@@ -435,6 +461,100 @@ def unpack_indices(packed: torch.Tensor, bits: int, padded_dim: int) -> torch.Te
 
 
 @triton.jit
+def _turboquant_prepare_kernel(
+    # Pointers
+    x_ptr,  # [N, dim] bf16/f32 input
+    signs_ptr,  # [padded_dim] f32 signs
+    out_ptr,  # [N, padded_dim] f32 output (signs-applied, padded)
+    norms_ptr,  # [N] f32 output (L2 norms)
+    # Strides
+    x_stride_0,
+    out_stride_0,
+    # Constants
+    DIM: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused bf16→f32 + zero-pad + L2 norm + signs multiply."""
+    row = tl.program_id(0)
+    norm_acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for block_start in range(0, PADDED_DIM, BLOCK_SIZE):
+        offs = block_start + tl.arange(0, BLOCK_SIZE)
+        in_bounds = offs < DIM
+        pad_bounds = offs < PADDED_DIM
+        # Load bf16 → f32 (zero for padded region)
+        vals = tl.load(x_ptr + row * x_stride_0 + offs, mask=in_bounds, other=0.0).to(
+            tl.float32
+        )
+        # Accumulate L2 norm (only real dims)
+        norm_acc += tl.where(in_bounds, vals * vals, 0.0)
+        # Multiply by signs
+        signs = tl.load(signs_ptr + offs, mask=pad_bounds, other=0.0)
+        out_vals = vals * signs
+        tl.store(out_ptr + row * out_stride_0 + offs, out_vals, mask=pad_bounds)
+    # Store norm
+    tl.store(norms_ptr + row, tl.sqrt(tl.sum(norm_acc, axis=0)))
+
+
+@triton.jit
+def _turboquant_quantize_pack_kernel(
+    # Pointers
+    rotated_ptr,  # [N, padded_dim] f32
+    norms_ptr,  # [N] f32
+    centroids_ptr,  # [num_centroids] f32
+    packed_ptr,  # [N, packed_dim] u8 output
+    # Strides
+    rotated_stride_0,
+    packed_stride_0,
+    # Constants
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    NUM_CENTROIDS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused normalize + quantize to nearest centroid + 4-bit pack."""
+    row = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    norm = tl.maximum(tl.load(norms_ptr + row), 1e-10)
+    inv_norm = 1.0 / norm
+
+    offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < PACKED_DIM
+
+    # Load even and odd coordinates
+    even_offs = offs * 2
+    odd_offs = offs * 2 + 1
+    even_vals = (
+        tl.load(rotated_ptr + row * rotated_stride_0 + even_offs, mask=mask, other=0.0)
+        * inv_norm
+    )
+    odd_vals = (
+        tl.load(rotated_ptr + row * rotated_stride_0 + odd_offs, mask=mask, other=0.0)
+        * inv_norm
+    )
+
+    # Find nearest centroid for even and odd
+    best_even = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    best_odd = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    best_dist_even = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
+    best_dist_odd = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
+
+    for c in range(NUM_CENTROIDS):
+        centroid = tl.load(centroids_ptr + c)
+        de = (even_vals - centroid) * (even_vals - centroid)
+        do_ = (odd_vals - centroid) * (odd_vals - centroid)
+        best_even = tl.where(de < best_dist_even, c, best_even)
+        best_dist_even = tl.where(de < best_dist_even, de, best_dist_even)
+        best_odd = tl.where(do_ < best_dist_odd, c, best_odd)
+        best_dist_odd = tl.where(do_ < best_dist_odd, do_, best_dist_odd)
+
+    # Pack: low nibble = even, high nibble = odd
+    packed = ((best_odd << 4) | (best_even & 0x0F)).to(tl.uint8)
+    tl.store(packed_ptr + row * packed_stride_0 + offs, packed, mask=mask)
+
+
+@triton.jit
 def _turboquant_quantize_kernel(
     # Pointers
     rotated_ptr,  # [num_tokens, dim] float32 input (already rotated)
@@ -580,52 +700,10 @@ def turboquant_quantize(
     mse_bits = bits - 1 if mode == "prod" else bits
     padded_dim = hadamard.padded_dim
 
-    # Decide whether to use the zero-allocation workspace path
+    # Decide whether to use the zero-allocation fused workspace path.
+    # Fused path requires 4-bit MSE (the common KV cache case).
     use_ws = workspace is not None and num_tokens <= workspace.max_rows
-
-    if use_ws:
-        n = num_tokens
-        # Copy input to float32 rotated buffer (serves as both float conversion
-        # and Hadamard input — forward() transforms it in-place)
-        rotated_buf = workspace.rotated[:n]
-        rotated_buf[:, :dim].copy_(x)  # bf16 → float32
-        if dim < padded_dim:
-            rotated_buf[:, dim:].zero_()
-
-        norms = workspace.norms[:n]
-        rot_norm_buf = workspace.rotated_normalized[:n]
-        indices_buf = workspace.indices[:n]
-        fwht_tmp = workspace.fwht_tmp
-    else:
-        # Dynamic allocation path (used outside graph capture / oversized batches)
-        float_x = x.float()
-        if dim < padded_dim:
-            float_x = torch.nn.functional.pad(float_x, (0, padded_dim - dim))
-        rotated_buf = torch.empty(
-            num_tokens, padded_dim, dtype=torch.float32, device=device
-        )
-        norms = torch.empty(num_tokens, dtype=torch.float32, device=device)
-        rot_norm_buf = torch.empty(
-            num_tokens, padded_dim, dtype=torch.float32, device=device
-        )
-        indices_buf = torch.empty(
-            num_tokens, padded_dim, dtype=torch.uint8, device=device
-        )
-        fwht_tmp = None
-
-    # Compute L2 norms before rotation (preserved by orthogonal transform)
-    if use_ws:
-        torch.norm(rotated_buf[:, :dim], dim=-1, out=norms)
-    else:
-        torch.norm(x.float(), dim=-1, out=norms)
-
-    # Step 1: Rotate via randomized Hadamard
-    if use_ws:
-        # rotated_buf already contains float32 input; transform in-place
-        # (no out= needed since rotated_buf IS the working buffer)
-        rotated = hadamard.forward(rotated_buf, fwht_tmp=fwht_tmp)
-    else:
-        rotated = hadamard.forward(float_x, out=rotated_buf, fwht_tmp=fwht_tmp)
+    use_fused = use_ws and mse_bits == 4
 
     # Get centroids scaled by 1/sqrt(d) for the coordinate distribution
     sc_key = (mse_bits, padded_dim, device)
@@ -635,36 +713,107 @@ def turboquant_quantize(
         scaled_centroids = centroids / math.sqrt(padded_dim)
         _scaled_centroids_cache[sc_key] = scaled_centroids
 
-    # Normalize (clamp norms in-place to avoid +1e-10 temp allocation)
-    norms.clamp_min_(1e-10)
-    torch.div(rotated, norms.unsqueeze(-1), out=rot_norm_buf)
+    if use_fused:
+        # === Fused 3-kernel path (14 launches → 3) ===
+        n = num_tokens
+        prepared = workspace.rotated[:n]
+        norms = workspace.norms[:n]
+        fwht_out = workspace.fwht_out[:n]
+        packed_buf = workspace.packed[:n]
+        packed_dim = padded_dim // 2
 
-    # Step 2: Quantize each coordinate to nearest centroid (unpacked first)
-    indices_buf.zero_()
-
-    BLOCK_SIZE = 128
-    num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
-
-    _turboquant_quantize_kernel[(num_tokens, num_blocks)](
-        rot_norm_buf,
-        indices_buf,
-        scaled_centroids,
-        rot_norm_buf.stride(0),
-        indices_buf.stride(0),
-        DIM=padded_dim,
-        NUM_CENTROIDS=len(scaled_centroids),
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-    # Step 3: Bit-pack the indices
-    if use_ws and mse_bits == 4:
-        packed_indices = _pack_4bit_inplace(
-            indices_buf,
-            workspace.pack_even[:num_tokens],
-            workspace.pack_odd[:num_tokens],
-            workspace.packed[:num_tokens],
+        # Kernel 1: bf16→f32 + pad + signs + L2 norm
+        _turboquant_prepare_kernel[(n,)](
+            x,
+            hadamard.signs,
+            prepared,
+            norms,
+            x.stride(0),
+            prepared.stride(0),
+            DIM=dim,
+            PADDED_DIM=padded_dim,
+            BLOCK_SIZE=padded_dim,
         )
+
+        # Kernel 2: Hadamard transform (signs already applied)
+        rotated = hadamard.forward(prepared, fwht_out=fwht_out, skip_signs=True)
+
+        # Kernel 3: normalize + quantize + 4-bit pack
+        PACK_BLOCK = 128
+        _turboquant_quantize_pack_kernel[(n, triton.cdiv(packed_dim, PACK_BLOCK))](
+            rotated,
+            norms,
+            scaled_centroids,
+            packed_buf,
+            rotated.stride(0),
+            packed_buf.stride(0),
+            PADDED_DIM=padded_dim,
+            PACKED_DIM=packed_dim,
+            NUM_CENTROIDS=len(scaled_centroids),
+            BLOCK_SIZE=PACK_BLOCK,
+        )
+        packed_indices = packed_buf
+
     else:
+        # === Legacy per-step path (dynamic alloc or non-4bit workspace) ===
+        if use_ws:
+            n = num_tokens
+            rotated_buf = workspace.rotated[:n]
+            rotated_buf[:, :dim].copy_(x)  # bf16 → float32
+            if dim < padded_dim:
+                rotated_buf[:, dim:].zero_()
+            norms = workspace.norms[:n]
+            fwht_out = workspace.fwht_out[:n]
+        else:
+            float_x = x.float()
+            if dim < padded_dim:
+                float_x = torch.nn.functional.pad(float_x, (0, padded_dim - dim))
+            rotated_buf = torch.empty(
+                num_tokens, padded_dim, dtype=torch.float32, device=device
+            )
+            norms = torch.empty(num_tokens, dtype=torch.float32, device=device)
+            fwht_out = None
+
+        # Compute L2 norms before rotation (preserved by orthogonal transform)
+        if use_ws:
+            torch.norm(rotated_buf[:, :dim], dim=-1, out=norms)
+        else:
+            torch.norm(x.float(), dim=-1, out=norms)
+
+        # Step 1: Rotate via randomized Hadamard
+        if use_ws:
+            rotated = hadamard.forward(rotated_buf, fwht_out=fwht_out)
+        else:
+            rotated = hadamard.forward(float_x, out=rotated_buf, fwht_out=fwht_out)
+
+        # Normalize (clamp norms in-place to avoid +1e-10 temp allocation)
+        norms.clamp_min_(1e-10)
+        rot_norm_buf = torch.empty(
+            num_tokens, padded_dim, dtype=torch.float32, device=device
+        )
+        torch.div(rotated, norms.unsqueeze(-1), out=rot_norm_buf)
+
+        # Step 2: Quantize each coordinate to nearest centroid (unpacked first)
+        indices_buf = torch.empty(
+            num_tokens, padded_dim, dtype=torch.uint8, device=device
+        )
+        indices_buf.zero_()
+
+        BLOCK_SIZE = 128
+        num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
+
+        _turboquant_quantize_kernel[(num_tokens, num_blocks)](
+            rot_norm_buf,
+            indices_buf,
+            scaled_centroids,
+            rot_norm_buf.stride(0),
+            indices_buf.stride(0),
+            DIM=padded_dim,
+            NUM_CENTROIDS=len(scaled_centroids),
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        # Step 3: Bit-pack the indices
         packed_indices = pack_indices(indices_buf, mse_bits)
 
     result = {

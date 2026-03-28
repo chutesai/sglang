@@ -512,9 +512,10 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.float32,
                 device=self.device,
             )
-            # FWHT butterfly scratch (shared between forward and inverse)
-            self.cuda_graph_tq_fwht_tmp = torch.empty(
-                (max_decode_rows, max_pd // 2),
+            # JIT Hadamard output buffer (shared between forward and inverse).
+            # Full padded_dim (not half-size butterfly scratch) for single-kernel JIT.
+            self.cuda_graph_tq_fwht_out = torch.empty(
+                (max_decode_rows, max_pd),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -522,7 +523,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_tq_o_rot = None
             self.cuda_graph_tq_q_float = None
             self.cuda_graph_tq_v_float = None
-            self.cuda_graph_tq_fwht_tmp = None
+            self.cuda_graph_tq_fwht_out = None
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
@@ -1190,16 +1191,26 @@ class TritonAttnBackend(AttentionBackend):
         pool = forward_batch.token_to_kv_pool
         batch = q.shape[0]
         q_3d = q.view(batch, layer.tp_q_head_num, layer.qk_head_dim)
+        n_rows = batch * layer.tp_q_head_num
 
-        # Rotate Q into K-Hadamard space using pre-allocated float32 buffers
-        # to avoid allocations during CUDA graph capture.
-        if self.cuda_graph_tq_q_float is not None:
-            n_rows = batch * layer.tp_q_head_num
+        # Use pre-allocated buffers only when batch fits within CUDA graph
+        # max_bs.  During live serving batch can exceed max_bs, in which case
+        # we fall back to dynamic allocation (not graph-captured anyway).
+        use_prealloc = (
+            self.cuda_graph_tq_q_float is not None
+            and n_rows <= self.cuda_graph_tq_q_float.shape[0]
+        )
+
+        # Rotate Q into K-Hadamard space
+        if use_prealloc:
             q_float = self.cuda_graph_tq_q_float[:n_rows].view(
                 batch, layer.tp_q_head_num, -1
             )
+            fwht_buf = self.cuda_graph_tq_fwht_out[:n_rows, : pool.padded_head_dim]
             q_rot = pool.k_hadamard.forward(
-                q_3d, out=q_float, fwht_tmp=self.cuda_graph_tq_fwht_tmp
+                q_3d,
+                out=q_float,
+                fwht_out=fwht_buf.view(batch, layer.tp_q_head_num, -1),
             )
         else:
             q_rot = pool.k_hadamard.forward(q_3d)
@@ -1207,7 +1218,7 @@ class TritonAttnBackend(AttentionBackend):
         # Output in V-rotated space (padded to v_padded_head_dim for kernel)
         v_head_dim = layer.v_head_dim
         v_padded = pool.v_padded_head_dim
-        if self.cuda_graph_tq_o_rot is not None:
+        if use_prealloc:
             o_rot = self.cuda_graph_tq_o_rot[:batch]
             o_rot.zero_()
         else:
@@ -1238,14 +1249,16 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse=self.forward_metadata.attn_lse,
         )
 
-        # Inverse-rotate from V-Hadamard space using pre-allocated buffers
-        if self.cuda_graph_tq_v_float is not None:
-            n_rows = batch * layer.tp_q_head_num
+        # Inverse-rotate from V-Hadamard space
+        if use_prealloc:
             v_float = self.cuda_graph_tq_v_float[:n_rows].view(
                 batch, layer.tp_q_head_num, -1
             )
+            fwht_buf_v = self.cuda_graph_tq_fwht_out[:n_rows, : pool.v_padded_head_dim]
             o_unrot = pool.v_hadamard.inverse(
-                o_rot, out=v_float, fwht_tmp=self.cuda_graph_tq_fwht_tmp
+                o_rot,
+                out=v_float,
+                fwht_out=fwht_buf_v.view(batch, layer.tp_q_head_num, -1),
             )
         else:
             o_unrot = pool.v_hadamard.inverse(o_rot)
