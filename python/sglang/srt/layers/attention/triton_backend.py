@@ -947,13 +947,18 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        _sparse_kw = (
+            {"kv_indices": kv_indices}
+            if getattr(pool, "supports_sparse_dequant", False)
+            else {}
+        )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            pool.get_key_buffer(layer.layer_id),
-            pool.get_value_buffer(layer.layer_id),
+            pool.get_key_buffer(layer.layer_id, **_sparse_kw),
+            pool.get_value_buffer(layer.layer_id, **_sparse_kw),
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -1084,8 +1089,14 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         # Get KV buffers (dequantizes for TurboQuant pools)
-        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buf = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        pool = forward_batch.token_to_kv_pool
+        _sparse_kw = (
+            {"kv_indices": unified_kv_indices}
+            if getattr(pool, "supports_sparse_dequant", False)
+            else {}
+        )
+        k_buf = pool.get_key_buffer(layer.layer_id, **_sparse_kw)
+        v_buf = pool.get_value_buffer(layer.layer_id, **_sparse_kw)
 
         # TurboQuant async: patch raw new-token values into workspace AFTER
         # dequant (which populates the workspace from compressed buffers).
@@ -1222,13 +1233,18 @@ class TritonAttnBackend(AttentionBackend):
 
         # TurboQuant async decode: dequant historical, then patch new tokens
         # into workspace so attention reads correct data at loc positions.
+        _sparse_kw = (
+            {"kv_indices": kv_indices}
+            if getattr(pool, "supports_sparse_dequant", False)
+            else {}
+        )
         if _tq_async:
-            k_buf = pool.get_key_buffer(layer.layer_id)
-            v_buf = pool.get_value_buffer(layer.layer_id)
+            k_buf = pool.get_key_buffer(layer.layer_id, **_sparse_kw)
+            v_buf = pool.get_value_buffer(layer.layer_id, **_sparse_kw)
             pool.write_raw_to_workspace(forward_batch.out_cache_loc, k, v)
         else:
-            k_buf = pool.get_key_buffer(layer.layer_id)
-            v_buf = pool.get_value_buffer(layer.layer_id)
+            k_buf = pool.get_key_buffer(layer.layer_id, **_sparse_kw)
+            v_buf = pool.get_value_buffer(layer.layer_id, **_sparse_kw)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

@@ -374,6 +374,154 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 end - start, num_heads, out_dim
             )
 
+    def _dequant_sparse(
+        self,
+        unique_indices: torch.Tensor,
+        packed: torch.Tensor,
+        norms: torch.Tensor,
+        workspace: torch.Tensor,
+        hadamard,
+        padded_dim: int,
+        out_dim: int,
+        qjl_buf: Optional[torch.Tensor] = None,
+        residual_norms_buf: Optional[torch.Tensor] = None,
+        hadamard_hi: Optional[HadamardTransform] = None,
+        hadamard_lo: Optional[HadamardTransform] = None,
+        split_dim: int = 0,
+    ):
+        """Dequantize only the positions in *unique_indices* and scatter into workspace."""
+        n = unique_indices.shape[0]
+        num_heads = packed.shape[1]
+
+        # Gather compressed data at needed positions
+        g_packed = packed[unique_indices]  # (n, H, packed_dim)
+        g_norms = norms[unique_indices]  # (n, H) or (n, H, 2)
+
+        if self.is_mixed:
+            hi_packed_dim = compute_packed_dim(
+                _next_power_of_2(split_dim), self.bits_hi
+            )
+            flat_packed = g_packed.reshape(-1, g_packed.shape[-1])
+            flat_norms_hi = g_norms[..., 0].reshape(-1)
+            flat_norms_lo = g_norms[..., 1].reshape(-1)
+
+            quantized = {
+                "packed_hi": flat_packed[:, :hi_packed_dim],
+                "packed_lo": flat_packed[:, hi_packed_dim:],
+                "norms_hi": flat_norms_hi,
+                "norms_lo": flat_norms_lo,
+                "padded_dim_hi": _next_power_of_2(split_dim),
+                "padded_dim_lo": _next_power_of_2(out_dim - split_dim),
+                "split_dim": split_dim,
+                "bits_hi": self.bits_hi,
+                "bits_lo": self.bits_lo,
+            }
+            result = turboquant_dequantize_mixed(
+                quantized, hadamard_hi, hadamard_lo, self.dtype
+            )
+        else:
+            quantized = {
+                "packed_indices": g_packed.reshape(-1, g_packed.shape[-1]),
+                "norms": g_norms.reshape(-1),
+                "padded_dim": padded_dim,
+            }
+            if self.mode == "prod" and qjl_buf is not None:
+                g_qjl = qjl_buf[unique_indices]
+                quantized["qjl_signs"] = g_qjl.reshape(-1, g_qjl.shape[-1])
+                quantized["residual_norms"] = residual_norms_buf[
+                    unique_indices
+                ].reshape(-1)
+            result = turboquant_dequantize(
+                quantized, hadamard, int(self.bits), self.mode, self.dtype
+            )
+
+        # Scatter results back into workspace
+        workspace[unique_indices] = result[:, :out_dim].reshape(n, num_heads, out_dim)
+
+    def get_key_buffer(self, layer_id: int, kv_indices: Optional[torch.Tensor] = None):
+        """Dequantize and return key buffer. If kv_indices is provided, only
+        dequantize positions referenced by those indices (sparse path)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        idx = layer_id - self.start_layer
+        # Wait for async quantize from a previous pass
+        event = self._async_events[idx]
+        if event is not None:
+            self.device_module.current_stream().wait_event(event)
+            self._async_events[idx] = None
+
+        if kv_indices is not None and kv_indices.numel() > 0:
+            unique = torch.unique(kv_indices)
+            pool_size = self.k_buffer[idx].shape[0]
+            if unique.shape[0] < pool_size // 2:
+                qjl_buf = self.k_qjl_buffer[idx] if self.mode == "prod" else None
+                res_buf = (
+                    self.k_residual_norms_buffer[idx] if self.mode == "prod" else None
+                )
+                self._dequant_sparse(
+                    unique,
+                    self.k_buffer[idx],
+                    self.k_norms_buffer[idx],
+                    self._k_workspace,
+                    self.k_hadamard,
+                    self.padded_head_dim,
+                    self.head_dim,
+                    qjl_buf,
+                    res_buf,
+                    hadamard_hi=getattr(self, "k_hadamard_hi", None),
+                    hadamard_lo=getattr(self, "k_hadamard_lo", None),
+                    split_dim=getattr(self, "_k_split_dim", 0),
+                )
+                return self._k_workspace
+
+        # Fall through to full dequant
+        self._get_key_buffer(layer_id)
+        return self._k_workspace
+
+    def get_value_buffer(
+        self, layer_id: int, kv_indices: Optional[torch.Tensor] = None
+    ):
+        """Dequantize and return value buffer. If kv_indices is provided, only
+        dequantize positions referenced by those indices (sparse path)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        idx = layer_id - self.start_layer
+        # Wait for async quantize from a previous pass
+        event = self._async_events[idx]
+        if event is not None:
+            self.device_module.current_stream().wait_event(event)
+            self._async_events[idx] = None
+
+        if kv_indices is not None and kv_indices.numel() > 0:
+            unique = torch.unique(kv_indices)
+            pool_size = self.v_buffer[idx].shape[0]
+            if unique.shape[0] < pool_size // 2:
+                qjl_buf = self.v_qjl_buffer[idx] if self.mode == "prod" else None
+                res_buf = (
+                    self.v_residual_norms_buffer[idx] if self.mode == "prod" else None
+                )
+                self._dequant_sparse(
+                    unique,
+                    self.v_buffer[idx],
+                    self.v_norms_buffer[idx],
+                    self._v_workspace,
+                    self.v_hadamard,
+                    self.v_padded_head_dim,
+                    self.v_head_dim,
+                    qjl_buf,
+                    res_buf,
+                    hadamard_hi=getattr(self, "v_hadamard_hi", None),
+                    hadamard_lo=getattr(self, "v_hadamard_lo", None),
+                    split_dim=getattr(self, "_v_split_dim", 0),
+                )
+                return self._v_workspace
+
+        # Fall through to full dequant
+        self._get_value_buffer(layer_id)
+        return self._v_workspace
+
     def _get_key_buffer(self, layer_id: int):
         """Dequantize and return full key buffer for a layer."""
         idx = layer_id - self.start_layer
@@ -545,6 +693,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
 
     # Flag for triton_backend to detect async quantize support.
     supports_async_quantize = True
+    # Flag for triton_backend to detect sparse dequant support.
+    supports_sparse_dequant = True
 
     def set_kv_buffer_async(
         self,
