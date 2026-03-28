@@ -15,12 +15,49 @@ For KV cache compression at b total bits per coordinate:
   - TurboQuant_prod uses (b-1) bits for Stage 1 + 1 bit QJL for Stage 2
 """
 
+import logging
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
+
+# Profiling: set TURBOQUANT_PROFILE=1 to measure per-kernel GPU time.
+# This adds CUDA event overhead — never leave on in production.
+_PROFILE_TQ = os.environ.get("TURBOQUANT_PROFILE", "0") == "1"
+_profile_timings: dict = {
+    "prepare": [],
+    "hadamard": [],
+    "quantize_pack": [],
+    "total": [],
+}
+
+
+def _profile_report():
+    """Print profiling summary and reset counters."""
+    if not _profile_timings["total"]:
+        return
+    n = len(_profile_timings["total"])
+    total_ms = sum(_profile_timings["total"])
+    print(
+        f"\n=== TurboQuant Profiling ({n} quantize calls, {total_ms:.1f}ms total) ==="
+    )
+    for key in ["prepare", "hadamard", "quantize_pack"]:
+        vals = _profile_timings[key]
+        if vals:
+            avg = sum(vals) / len(vals)
+            total = sum(vals)
+            pct = total / total_ms * 100 if total_ms > 0 else 0
+            print(f"  {key:>15s}: avg={avg:.3f}ms, total={total:.1f}ms ({pct:.1f}%)")
+    print(f"  {'TOTAL':>15s}: avg={total_ms/n:.3f}ms, total={total_ms:.1f}ms")
+    # Reset
+    for k in _profile_timings:
+        _profile_timings[k].clear()
+
 
 # ---------------------------------------------------------------------------
 # Precomputed optimal centroids for the Beta-distributed coordinates after
@@ -75,6 +112,7 @@ CENTROIDS_4BIT = [
 
 _centroids_cache: dict = {}
 _scaled_centroids_cache: dict = {}
+_scaled_boundaries_cache: dict = {}
 
 # JIT Hadamard kernel availability
 try:
@@ -501,18 +539,34 @@ def _turboquant_quantize_pack_kernel(
     # Pointers
     rotated_ptr,  # [N, padded_dim] f32
     norms_ptr,  # [N] f32
-    centroids_ptr,  # [num_centroids] f32
+    boundaries_ptr,  # [num_centroids - 1] f32 decision boundaries
     packed_ptr,  # [N, packed_dim] u8 output
     # Strides
     rotated_stride_0,
     packed_stride_0,
+    # Direct pool write params (pool_packed_ptr == 0 means disabled)
+    pool_packed_ptr,  # pool's packed buffer for this layer
+    pool_norms_ptr,  # pool's norms buffer for this layer
+    loc_ptr,  # [num_tokens] int64 location indices
+    pool_packed_stride_0,  # stride(0) of pool packed buffer
+    pool_packed_stride_1,  # stride(1) of pool packed buffer
+    pool_norms_stride_0,  # stride(0) of pool norms buffer
     # Constants
     PADDED_DIM: tl.constexpr,
     PACKED_DIM: tl.constexpr,
     NUM_CENTROIDS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HEAD_NUM: tl.constexpr,  # 0 = no pool write
 ):
-    """Fused normalize + quantize to nearest centroid + 4-bit pack."""
+    """Fused normalize + quantize to nearest centroid + 4-bit pack.
+
+    Uses precomputed decision boundaries (midpoints between adjacent centroids)
+    instead of linear search. Index = count of boundaries the value exceeds.
+    This is 15 comparisons + 15 additions vs 16 × (sub + mul + 2 cmp + 2 select).
+
+    When HEAD_NUM > 0, also writes packed data and norms directly to pool
+    buffers at scatter locations, eliminating separate scatter writes.
+    """
     row = tl.program_id(0)
     block_id = tl.program_id(1)
 
@@ -534,24 +588,145 @@ def _turboquant_quantize_pack_kernel(
         * inv_norm
     )
 
-    # Find nearest centroid for even and odd
+    # Boundary-based nearest centroid: index = number of boundaries exceeded
     best_even = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     best_odd = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    best_dist_even = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
-    best_dist_odd = tl.full([BLOCK_SIZE], float("inf"), dtype=tl.float32)
-
-    for c in range(NUM_CENTROIDS):
-        centroid = tl.load(centroids_ptr + c)
-        de = (even_vals - centroid) * (even_vals - centroid)
-        do_ = (odd_vals - centroid) * (odd_vals - centroid)
-        best_even = tl.where(de < best_dist_even, c, best_even)
-        best_dist_even = tl.where(de < best_dist_even, de, best_dist_even)
-        best_odd = tl.where(do_ < best_dist_odd, c, best_odd)
-        best_dist_odd = tl.where(do_ < best_dist_odd, do_, best_dist_odd)
+    for b in tl.static_range(NUM_CENTROIDS - 1):
+        boundary = tl.load(boundaries_ptr + b)
+        best_even += (even_vals >= boundary).to(tl.int32)
+        best_odd += (odd_vals >= boundary).to(tl.int32)
 
     # Pack: low nibble = even, high nibble = odd
     packed = ((best_odd << 4) | (best_even & 0x0F)).to(tl.uint8)
+
+    # Write to workspace (always)
     tl.store(packed_ptr + row * packed_stride_0 + offs, packed, mask=mask)
+
+    # Write directly to pool buffer if enabled
+    if HEAD_NUM > 0:
+        token_id = row // HEAD_NUM
+        head_id = row % HEAD_NUM
+        pool_loc = tl.load(loc_ptr + token_id)
+        pool_base = pool_loc * pool_packed_stride_0 + head_id * pool_packed_stride_1
+        tl.store(pool_packed_ptr + pool_base + offs, packed, mask=mask)
+
+        # Write norms (only from first block to avoid duplicate writes)
+        if block_id == 0:
+            pool_norms_base = pool_loc * pool_norms_stride_0 + head_id
+            tl.store(pool_norms_ptr + pool_norms_base, norm)
+
+
+@triton.jit
+def _turboquant_fused_quantize_kernel(
+    # Input
+    x_ptr,  # [N, dim] bf16/f32 input
+    signs_ptr,  # [padded_dim] f32 random signs
+    boundaries_ptr,  # [NUM_CENTROIDS - 1] f32 decision boundaries
+    norms_ptr,  # [N] f32 output (L2 norms)
+    packed_ptr,  # [N, packed_dim] u8 output
+    # Scratch buffer for FWHT butterfly (reuses workspace.rotated)
+    scratch_ptr,  # [N, padded_dim] f32
+    # Direct pool write params (pool_packed_ptr == 0 means disabled)
+    pool_packed_ptr,
+    pool_norms_ptr,
+    loc_ptr,
+    pool_packed_stride_0,
+    pool_packed_stride_1,
+    pool_norms_stride_0,
+    # Strides
+    x_stride_0,
+    packed_stride_0,
+    scratch_stride_0,
+    # Constants
+    DIM: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    LOG2_DIM: tl.constexpr,
+    NUM_CENTROIDS: tl.constexpr,
+    HEAD_NUM: tl.constexpr,  # 0 = no pool write
+    SCALE: tl.constexpr,  # 1.0 / sqrt(padded_dim)
+):
+    """Fused prepare + FWHT + normalize + quantize + pack in a single kernel.
+
+    Eliminates two global memory round-trips between the prepare→hadamard→quantize
+    pipeline by doing the FWHT butterfly in-kernel using scratch memory (hot in L1
+    cache). For dim=128 this is 7 butterfly stages, each writing/reading 512 bytes
+    that stay in L1.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, PADDED_DIM)
+
+    # === Stage 1: Load bf16→f32, pad, compute L2 norm, apply signs ===
+    in_bounds = offs < DIM
+    vals = tl.load(x_ptr + row * x_stride_0 + offs, mask=in_bounds, other=0.0).to(
+        tl.float32
+    )
+
+    # L2 norm (padding positions are 0, don't affect sum)
+    norm = tl.sqrt(tl.sum(vals * vals, axis=0))
+    tl.store(norms_ptr + row, norm)
+
+    # Apply random signs
+    signs = tl.load(signs_ptr + offs)
+    vals = vals * signs
+
+    # === Stage 2: FWHT butterfly using scratch memory (L1-resident) ===
+    scratch_row = scratch_ptr + row * scratch_stride_0
+
+    for s in tl.static_range(LOG2_DIM):
+        tl.store(scratch_row + offs, vals)
+        tl.debug_barrier()
+        partner = offs ^ (1 << s)
+        partner_vals = tl.load(scratch_row + partner)
+        is_top = (offs & (1 << s)) == 0
+        vals = tl.where(is_top, vals + partner_vals, partner_vals - vals)
+        tl.debug_barrier()
+
+    # Apply Hadamard scale: y = vals / sqrt(d)
+    vals = vals * SCALE
+
+    # === Stage 3: Normalize + quantize + 4-bit pack + optional scatter ===
+    # Store rotated values for even/odd reindexing
+    tl.store(scratch_row + offs, vals)
+    tl.debug_barrier()
+
+    inv_norm = 1.0 / tl.maximum(norm, 1e-10)
+
+    # Load even/odd pairs for nibble packing
+    pack_offs = tl.arange(0, PACKED_DIM)
+    pack_mask = pack_offs < PACKED_DIM
+    even_vals = (
+        tl.load(scratch_row + pack_offs * 2, mask=pack_mask, other=0.0) * inv_norm
+    )
+    odd_vals = (
+        tl.load(scratch_row + pack_offs * 2 + 1, mask=pack_mask, other=0.0) * inv_norm
+    )
+
+    # Boundary-based nearest centroid search
+    best_even = tl.zeros([PACKED_DIM], dtype=tl.int32)
+    best_odd = tl.zeros([PACKED_DIM], dtype=tl.int32)
+    for b in tl.static_range(NUM_CENTROIDS - 1):
+        boundary = tl.load(boundaries_ptr + b)
+        best_even += (even_vals >= boundary).to(tl.int32)
+        best_odd += (odd_vals >= boundary).to(tl.int32)
+
+    # Pack: low nibble = even, high nibble = odd
+    packed = ((best_odd << 4) | (best_even & 0x0F)).to(tl.uint8)
+
+    # Write to workspace
+    tl.store(packed_ptr + row * packed_stride_0 + pack_offs, packed, mask=pack_mask)
+
+    # Write directly to pool buffer if enabled
+    if HEAD_NUM > 0:
+        token_id = row // HEAD_NUM
+        head_id = row % HEAD_NUM
+        pool_loc = tl.load(loc_ptr + token_id)
+        pool_base = pool_loc * pool_packed_stride_0 + head_id * pool_packed_stride_1
+        tl.store(pool_packed_ptr + pool_base + pack_offs, packed, mask=pack_mask)
+        # Write norms (use head_id == 0 guard to avoid redundant writes from other heads;
+        # actually each head has its own norm, so all heads must write)
+        pool_norms_base = pool_loc * pool_norms_stride_0 + head_id
+        tl.store(pool_norms_ptr + pool_norms_base, norm)
 
 
 @triton.jit
@@ -674,6 +849,10 @@ def turboquant_quantize(
     bits: int = 4,
     mode: str = "mse",
     workspace: Optional[QuantizeWorkspace] = None,
+    pool_packed: Optional[torch.Tensor] = None,
+    pool_norms: Optional[torch.Tensor] = None,
+    loc: Optional[torch.Tensor] = None,
+    head_num: int = 0,
 ) -> dict:
     """Quantize input vectors using TurboQuant with bit-packed storage.
 
@@ -685,6 +864,12 @@ def turboquant_quantize(
         workspace: optional pre-allocated QuantizeWorkspace.  When provided and
                    large enough, ALL temporary allocations are eliminated —
                    critical for CUDA graph capture.
+        pool_packed: optional pool packed buffer [pool_size, head_num, packed_dim]
+                     for direct scatter writes from the kernel.
+        pool_norms: optional pool norms buffer [pool_size, head_num] for direct
+                    scatter writes from the kernel.
+        loc: optional [num_tokens] int64 location indices for scatter writes.
+        head_num: number of heads (>0 enables direct pool writes).
 
     Returns:
         dict with keys:
@@ -713,45 +898,60 @@ def turboquant_quantize(
         scaled_centroids = centroids / math.sqrt(padded_dim)
         _scaled_centroids_cache[sc_key] = scaled_centroids
 
-    if use_fused:
-        # === Fused 3-kernel path (14 launches → 3) ===
-        n = num_tokens
-        prepared = workspace.rotated[:n]
-        norms = workspace.norms[:n]
-        fwht_out = workspace.fwht_out[:n]
-        packed_buf = workspace.packed[:n]
-        packed_dim = padded_dim // 2
+    # Decision boundaries: midpoints between adjacent centroids (for boundary search)
+    sb_key = (mse_bits, padded_dim, device)
+    scaled_boundaries = _scaled_boundaries_cache.get(sb_key)
+    if scaled_boundaries is None:
+        sc = scaled_centroids
+        scaled_boundaries = (sc[:-1] + sc[1:]) / 2.0
+        _scaled_boundaries_cache[sb_key] = scaled_boundaries
 
-        # Kernel 1: bf16→f32 + pad + signs + L2 norm
-        _turboquant_prepare_kernel[(n,)](
+    if use_fused:
+        # === Single fused kernel: prepare + FWHT + quantize + pack ===
+        # Eliminates 2 kernel launches and 2 global memory round-trips vs
+        # the previous 3-kernel pipeline. FWHT butterfly runs in-kernel
+        # using scratch memory that stays L1-resident.
+        n = num_tokens
+        norms = workspace.norms[:n]
+        packed_buf = workspace.packed[:n]
+        scratch = workspace.rotated[:n]  # repurposed as butterfly scratch
+        packed_dim = padded_dim // 2
+        log2_dim = padded_dim.bit_length() - 1
+
+        use_pool = (
+            pool_packed is not None
+            and pool_norms is not None
+            and loc is not None
+            and head_num > 0
+        )
+        _turboquant_fused_quantize_kernel[(n,)](
             x,
             hadamard.signs,
-            prepared,
+            scaled_boundaries,
             norms,
+            packed_buf,
+            scratch,
+            # Pool write params
+            pool_packed if use_pool else 0,
+            pool_norms if use_pool else 0,
+            loc if use_pool else 0,
+            pool_packed.stride(0) if use_pool else 0,
+            pool_packed.stride(1) if use_pool else 0,
+            pool_norms.stride(0) if use_pool else 0,
+            # Strides
             x.stride(0),
-            prepared.stride(0),
+            packed_buf.stride(0),
+            scratch.stride(0),
+            # Constants
             DIM=dim,
             PADDED_DIM=padded_dim,
-            BLOCK_SIZE=padded_dim,
-        )
-
-        # Kernel 2: Hadamard transform (signs already applied)
-        rotated = hadamard.forward(prepared, fwht_out=fwht_out, skip_signs=True)
-
-        # Kernel 3: normalize + quantize + 4-bit pack
-        PACK_BLOCK = 128
-        _turboquant_quantize_pack_kernel[(n, triton.cdiv(packed_dim, PACK_BLOCK))](
-            rotated,
-            norms,
-            scaled_centroids,
-            packed_buf,
-            rotated.stride(0),
-            packed_buf.stride(0),
-            PADDED_DIM=padded_dim,
             PACKED_DIM=packed_dim,
+            LOG2_DIM=log2_dim,
             NUM_CENTROIDS=len(scaled_centroids),
-            BLOCK_SIZE=PACK_BLOCK,
+            HEAD_NUM=head_num if use_pool else 0,
+            SCALE=hadamard.scale,
         )
+
         packed_indices = packed_buf
 
     else:

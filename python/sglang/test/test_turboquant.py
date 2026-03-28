@@ -580,7 +580,7 @@ def test_quantize_workspace():
 
 
 def test_quantize_workspace_pool_integration():
-    """Verify pool with workspace produces same results as pool without."""
+    """Verify pool with workspace + direct scatter produces same results as pool without."""
     pool = _make_mha_pool(head_dim=128, head_num=8, bits=4.0, mode="mse", size=256)
 
     class _FakeLayer:
@@ -590,18 +590,45 @@ def test_quantize_workspace_pool_integration():
     cache_k = torch.randn(64, 8, 128, device=DEVICE, dtype=torch.bfloat16)
     cache_v = torch.randn(64, 8, 128, device=DEVICE, dtype=torch.bfloat16)
 
-    # Store without workspace
+    # Store without workspace (uses scatter writes)
     pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+    k_packed_ref = pool.k_buffer[0][loc].clone()
+    k_norms_ref = pool.k_norms_buffer[0][loc].clone()
+    v_packed_ref = pool.v_buffer[0][loc].clone()
+    v_norms_ref = pool.v_norms_buffer[0][loc].clone()
     key_ref = pool._get_key_buffer(0).clone()
     val_ref = pool._get_value_buffer(0).clone()
 
-    # Initialize workspace and store again
+    # Initialize workspace (enables direct pool writes from kernel)
     pool.init_quantize_workspace(max_tokens=128)
+
+    # Zero out buffers to prove the kernel writes them
+    pool.k_buffer[0].zero_()
+    pool.v_buffer[0].zero_()
+    pool.k_norms_buffer[0].zero_()
+    pool.v_norms_buffer[0].zero_()
+
     pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+
+    # Packed indices should match exactly (same quantization)
+    assert torch.equal(
+        k_packed_ref, pool.k_buffer[0][loc]
+    ), "K packed buffer mismatch with direct write"
+    assert torch.equal(
+        v_packed_ref, pool.v_buffer[0][loc]
+    ), "V packed buffer mismatch with direct write"
+
+    # Norms should match closely (written by kernel)
+    assert torch.allclose(
+        k_norms_ref, pool.k_norms_buffer[0][loc], atol=1e-5
+    ), "K norms mismatch with direct write"
+    assert torch.allclose(
+        v_norms_ref, pool.v_norms_buffer[0][loc], atol=1e-5
+    ), "V norms mismatch with direct write"
+
+    # Dequantized output should match
     key_ws = pool._get_key_buffer(0)
     val_ws = pool._get_value_buffer(0)
-
-    # Should match
     assert torch.allclose(
         key_ref[loc], key_ws[loc], atol=1e-3
     ), "K buffer mismatch with workspace"
@@ -609,6 +636,44 @@ def test_quantize_workspace_pool_integration():
         val_ref[loc], val_ws[loc], atol=1e-3
     ), "V buffer mismatch with workspace"
     print("PASS: test_quantize_workspace_pool_integration")
+
+
+def test_triton_warmup():
+    """Verify init_quantize_workspace warms up Triton kernels without error."""
+    pool = _make_mha_pool(head_dim=128, head_num=8, bits=4.0, mode="mse", size=256)
+
+    # init_quantize_workspace should trigger warmup (compile kernels)
+    pool.init_quantize_workspace(max_tokens=64)
+
+    # Verify workspace was created
+    assert hasattr(pool, "_k_quantize_ws"), "K workspace not created"
+    assert hasattr(pool, "_v_quantize_ws"), "V workspace not created"
+
+    # Subsequent quantize calls should not trigger recompilation
+    # (this is fast if kernels are already compiled)
+    import time
+
+    loc = torch.arange(16, device=DEVICE)
+    cache_k = torch.randn(16, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    cache_v = torch.randn(16, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    class _FakeLayer:
+        layer_id = 0
+
+    # Warm CUDA
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+    torch.cuda.synchronize()
+
+    # Time 10 iterations — should be fast (no JIT stalls)
+    start = time.perf_counter()
+    for _ in range(10):
+        pool.set_kv_buffer(_FakeLayer(), loc, cache_k.clone(), cache_v.clone())
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    avg_ms = elapsed / 10 * 1000
+    print(f"  Avg set_kv_buffer: {avg_ms:.2f}ms (should be <50ms if warmed up)")
+    assert avg_ms < 500, f"set_kv_buffer took {avg_ms:.1f}ms — possible JIT stall"
+    print("PASS: test_triton_warmup")
 
 
 def test_fused_prepare_kernel():
@@ -1220,6 +1285,7 @@ if __name__ == "__main__":
     workspace_tests = [
         test_quantize_workspace,
         test_quantize_workspace_pool_integration,
+        test_triton_warmup,
         test_fused_prepare_kernel,
         test_fused_quantize_pack_kernel,
         test_jit_hadamard_matches_python_fwht,

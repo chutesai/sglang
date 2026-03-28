@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+logger = logging.getLogger(__name__)
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -869,19 +872,23 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        pool = forward_batch.token_to_kv_pool
+        _tq_async = save_kv_cache and getattr(pool, "supports_async_quantize", False)
+
         # Save KV cache first (must do this before unified kernel)
-        if save_kv_cache:
+        # For TurboQuant async: defer quantize to after attention.
+        if save_kv_cache and not _tq_async:
             if (
                 self.use_mla or layer.k_scale is None
             ):  # Triton MLA currently doesn't support quantized kv cache
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
                     v,
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
@@ -905,9 +912,19 @@ class TritonAttnBackend(AttentionBackend):
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
-            return self._forward_extend_unified(
-                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
+            result = self._forward_extend_unified(
+                q,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks,
+                async_tq_kv=(k, v) if _tq_async else None,
             )
+            if _tq_async:
+                pool.set_kv_buffer_async(layer, forward_batch.out_cache_loc, k, v)
+            return result
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -935,8 +952,8 @@ class TritonAttnBackend(AttentionBackend):
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -953,6 +970,12 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
+
+        # TurboQuant async: quantize on alt_stream after attention completes.
+        # 2-stage extend takes raw k,v separately — no workspace patching needed.
+        if _tq_async:
+            pool.set_kv_buffer_async(layer, forward_batch.out_cache_loc, k, v)
+
         return o
 
     def _forward_extend_unified(
@@ -964,6 +987,7 @@ class TritonAttnBackend(AttentionBackend):
         causal: bool,
         logits_soft_cap: float,
         sinks: Optional[torch.Tensor],
+        async_tq_kv: Optional[tuple] = None,
     ):
         """
         Unified 1-stage extend attention for deterministic inference.
@@ -1059,12 +1083,25 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        # Get KV buffers (dequantizes for TurboQuant pools)
+        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buf = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # TurboQuant async: patch raw new-token values into workspace AFTER
+        # dequant (which populates the workspace from compressed buffers).
+        # Must happen before the kernel reads from these positions.
+        if async_tq_kv is not None:
+            ak, av = async_tq_kv
+            forward_batch.token_to_kv_pool.write_raw_to_workspace(
+                forward_batch.out_cache_loc, ak, av
+            )
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buf,
+            v_buf,
             k_descale,
             v_descale,
             self.forward_metadata.qo_indptr,
@@ -1107,16 +1144,60 @@ class TritonAttnBackend(AttentionBackend):
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
-        if save_kv_cache:
+        pool = forward_batch.token_to_kv_pool
+        _tq_async = save_kv_cache and getattr(pool, "supports_async_quantize", False)
+
+        # TurboQuant fused dequant-attention path for MHA/GQA
+        # Fused path reads packed buffers directly — keep synchronous.
+        _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
+            layer, "_tq_mha_fused_ready", False
+        )
+        logger.info(
+            "tq decode check: can_use=%s fused_ready=%s layer=%s",
+            getattr(pool, "can_use_fused_kernel", False),
+            getattr(layer, "_tq_mha_fused_ready", False),
+            layer.layer_id,
+        )
+        if _tq_fused:
+            # Fused kernel reads from packed 4-bit buffers directly.
+            # Must quantize synchronously before attention.
+            if save_kv_cache:
+                pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+            return self._forward_turboquant_fused_mha(
+                q,
+                o,
+                layer,
+                forward_batch,
+                (
+                    self.forward_metadata.window_kv_indptr
+                    if (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                    )
+                    else self.forward_metadata.kv_indptr
+                ),
+                (
+                    self.forward_metadata.window_kv_indices
+                    if (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                    )
+                    else self.forward_metadata.kv_indices
+                ),
+                logits_soft_cap,
+            )
+
+        # Non-fused paths: save KV cache synchronously for non-TQ pools
+        if save_kv_cache and not _tq_async:
             if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
                     v,
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
@@ -1139,20 +1220,20 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # TurboQuant fused dequant-attention path for MHA/GQA
-        pool = forward_batch.token_to_kv_pool
-        _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
-            layer, "_tq_mha_fused_ready", False
-        )
-        if _tq_fused:
-            return self._forward_turboquant_fused_mha(
-                q, o, layer, forward_batch, kv_indptr, kv_indices, logits_soft_cap
-            )
+        # TurboQuant async decode: dequant historical, then patch new tokens
+        # into workspace so attention reads correct data at loc positions.
+        if _tq_async:
+            k_buf = pool.get_key_buffer(layer.layer_id)
+            v_buf = pool.get_value_buffer(layer.layer_id)
+            pool.write_raw_to_workspace(forward_batch.out_cache_loc, k, v)
+        else:
+            k_buf = pool.get_key_buffer(layer.layer_id)
+            v_buf = pool.get_value_buffer(layer.layer_id)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buf,
+            v_buf,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
@@ -1167,6 +1248,11 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
+
+        # TurboQuant async: quantize on alt_stream after attention completes.
+        if _tq_async:
+            pool.set_kv_buffer_async(layer, forward_batch.out_cache_loc, k, v)
+
         return o
 
     def _forward_turboquant_fused_mha(

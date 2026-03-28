@@ -156,6 +156,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             enable_kv_cache_copy=enable_kv_cache_copy,
         )
 
+        # Per-layer CUDA events for async quantize completion tracking.
+        # Each entry is either None (no pending async work) or a CUDA event
+        # recorded on alt_stream after that layer's quantize finished.
+        self._async_events = [None] * self.layer_num
+
         # Pre-scaled centroid tables for the fused decode kernel.
         # The centroids are scaled by 1/sqrt(dim) so the kernel only needs to
         # multiply by the per-token norm (no additional 1/sqrt(d) factor).
@@ -372,6 +377,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
     def _get_key_buffer(self, layer_id: int):
         """Dequantize and return full key buffer for a layer."""
         idx = layer_id - self.start_layer
+        # Wait for this layer's async quantize from a previous pass (if any)
+        event = self._async_events[idx]
+        if event is not None:
+            self.device_module.current_stream().wait_event(event)
+            self._async_events[idx] = None
         qjl_buf = self.k_qjl_buffer[idx] if self.mode == "prod" else None
         res_buf = self.k_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_layer_chunked(
@@ -392,6 +402,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
     def _get_value_buffer(self, layer_id: int):
         """Dequantize and return full value buffer for a layer."""
         idx = layer_id - self.start_layer
+        # Wait for this layer's async quantize from a previous pass (if any)
+        event = self._async_events[idx]
+        if event is not None:
+            self.device_module.current_stream().wait_event(event)
+            self._async_events[idx] = None
         qjl_buf = self.v_qjl_buffer[idx] if self.mode == "prod" else None
         res_buf = self.v_residual_norms_buffer[idx] if self.mode == "prod" else None
         self._dequant_layer_chunked(
@@ -451,12 +466,25 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         else:
             k_ws = getattr(self, "_k_quantize_ws", None)
             v_ws = getattr(self, "_v_quantize_ws", None)
+
+            # When workspace is available and we're on the fused 4-bit path,
+            # pass pool buffers so the kernel writes directly (no scatter).
+            use_direct = (
+                k_ws is not None
+                and int(self.bits) == 4
+                and self.mode == "mse"
+                and num_tokens * self.head_num <= k_ws.max_rows
+            )
             k_q = turboquant_quantize(
                 k_flat,
                 self.k_hadamard,
                 int(self.bits),
                 self.mode,
                 workspace=k_ws,
+                pool_packed=self.k_buffer[idx] if use_direct else None,
+                pool_norms=self.k_norms_buffer[idx] if use_direct else None,
+                loc=loc if use_direct else None,
+                head_num=self.head_num if use_direct else 0,
             )
             v_q = turboquant_quantize(
                 v_flat,
@@ -464,6 +492,10 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 int(self.bits),
                 self.mode,
                 workspace=v_ws,
+                pool_packed=self.v_buffer[idx] if use_direct else None,
+                pool_norms=self.v_norms_buffer[idx] if use_direct else None,
+                loc=loc if use_direct else None,
+                head_num=self.head_num if use_direct else 0,
             )
 
         if self.is_mixed:
@@ -481,7 +513,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             ).reshape(num_tokens, self.head_num, 2)
             self.k_norms_buffer[idx][loc] = k_norms_stacked
             self.v_norms_buffer[idx][loc] = v_norms_stacked
-        else:
+        elif not use_direct:
+            # Fallback: scatter writes when direct pool write wasn't used
             self.k_buffer[idx][loc] = k_q["packed_indices"].reshape(
                 num_tokens, self.head_num, -1
             )
@@ -494,6 +527,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_norms_buffer[idx][loc] = v_q["norms"].reshape(
                 num_tokens, self.head_num
             )
+        # else: direct pool write path — kernel already wrote to pool buffers
 
         if not self.is_mixed and self.mode == "prod":
             self.k_qjl_buffer[idx][loc] = k_q["qjl_signs"].reshape(
@@ -509,10 +543,67 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 num_tokens, self.head_num
             )
 
+    # Flag for triton_backend to detect async quantize support.
+    supports_async_quantize = True
+
+    def set_kv_buffer_async(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        **kwargs,
+    ):
+        """Quantize and store on alt_stream. Data not needed until next forward pass.
+
+        TurboQuant's set_kv_buffer is read-only on cache_k/cache_v inputs
+        (no in-place mutation), so record_stream suffices to prevent
+        premature deallocation.
+        """
+        if self.alt_stream is None:
+            return self.set_kv_buffer(layer, loc, cache_k, cache_v, **kwargs)
+
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        layer_id = kwargs.get("layer_id_override") or layer.layer_id
+        idx = layer_id - self.start_layer
+
+        # Prevent tensor deallocation until alt_stream catches up
+        if not get_is_capture_mode():
+            cache_k.record_stream(self.alt_stream)
+            cache_v.record_stream(self.alt_stream)
+
+        # alt_stream waits for default stream (k,v data must be ready)
+        self.alt_stream.wait_stream(self.device_module.current_stream())
+
+        with self.device_module.stream(self.alt_stream):
+            self.set_kv_buffer(layer, loc, cache_k, cache_v, **kwargs)
+            # Record per-layer completion event
+            self._async_events[idx] = self.alt_stream.record_event()
+
+    def write_raw_to_workspace(
+        self, loc: torch.Tensor, cache_k: torch.Tensor, cache_v: torch.Tensor
+    ):
+        """Write raw bf16 K,V to dequant workspace at loc positions.
+
+        Used by the unified extend and decode paths so that attention can read
+        new tokens' data from the workspace before async quantize completes.
+        """
+        n = cache_k.shape[0]
+        self._k_workspace[loc] = cache_k.reshape(n, self.head_num, self.head_dim)
+        self._v_workspace[loc] = cache_v.reshape(n, self.head_num, self.v_head_dim)
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Copy KV cache entries between locations."""
         if tgt_loc.numel() == 0:
             return
+        # Drain all outstanding async quantize events — move_kv_cache reads
+        # compressed pool buffers directly (not through _get_key_buffer).
+        current_stream = self.device_module.current_stream()
+        for i, event in enumerate(self._async_events):
+            if event is not None:
+                current_stream.wait_event(event)
+                self._async_events[i] = None
         for i in range(self.layer_num):
             self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
             self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
@@ -557,6 +648,55 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             f"TurboQuant quantize workspace: max_tokens={max_tokens}, "
             f"max_rows={max_rows}, K={k_mb:.1f}MB, V={v_mb:.1f}MB"
         )
+
+        # Warmup: trigger Triton JIT compilation for prepare + quantize_pack
+        # kernels before any real requests arrive. Without this, the first
+        # invocation during CUDA graph capture causes multi-second stalls.
+        # We warmup both HEAD_NUM=0 (no pool write) and HEAD_NUM=head_num
+        # (direct pool write) variants since Triton compiles separately.
+        if not self.is_mixed and int(self.bits) == 4:
+            dummy = torch.zeros(1, self.head_dim, dtype=torch.bfloat16, device=device)
+            dummy_loc = torch.zeros(1, dtype=torch.int64, device=device)
+            # Warmup without pool write (HEAD_NUM=0)
+            turboquant_quantize(
+                dummy,
+                self.k_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=self._k_quantize_ws,
+            )
+            turboquant_quantize(
+                dummy,
+                self.v_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=self._v_quantize_ws,
+            )
+            # Warmup with pool write (HEAD_NUM=head_num) — compiles the
+            # scatter-fused variant used during actual serving.
+            turboquant_quantize(
+                dummy,
+                self.k_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=self._k_quantize_ws,
+                pool_packed=self.k_buffer[0],
+                pool_norms=self.k_norms_buffer[0],
+                loc=dummy_loc,
+                head_num=self.head_num,
+            )
+            turboquant_quantize(
+                dummy,
+                self.v_hadamard,
+                int(self.bits),
+                self.mode,
+                workspace=self._v_quantize_ws,
+                pool_packed=self.v_buffer[0],
+                pool_norms=self.v_norms_buffer[0],
+                loc=dummy_loc,
+                head_num=self.head_num,
+            )
+            logger.info("TurboQuant Triton kernels warmed up")
 
     def get_k_packed_buffer(self, layer_id: int):
         """Return raw packed K buffer for fused kernel."""
