@@ -915,6 +915,12 @@ class ModelRunnerKVCacheMixin:
             return
 
         if isinstance(pool, MHATokenToKVPoolTurboQuant):
+            if not self.server_args.turboquant_fused_decode:
+                logger.info(
+                    "TurboQuant fused decode disabled via --no-turboquant-fused-decode; "
+                    "using standard attention kernels on dequantized workspace"
+                )
+                return
             self._setup_turboquant_fused_decode_mha(pool)
             return
 

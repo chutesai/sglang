@@ -331,6 +331,7 @@ class ServerArgs:
     kv_cache_dtype: str = "auto"
     turboquant_bits: float = 4.0
     turboquant_mode: str = "mse"
+    turboquant_fused_decode: bool = True
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -3841,6 +3842,14 @@ class ServerArgs:
             default=ServerArgs.turboquant_mode,
             choices=["mse", "prod"],
             help='TurboQuant mode: "mse" for MSE-optimal, "prod" for QJL inner-product. Default "mse".',
+        )
+        parser.add_argument(
+            "--turboquant-fused-decode",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.turboquant_fused_decode,
+            help="Enable custom fused Triton decode kernel for TurboQuant. "
+            "When disabled, decode uses standard attention kernels on dequantized workspace. "
+            "Default: enabled. Use --no-turboquant-fused-decode to disable.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

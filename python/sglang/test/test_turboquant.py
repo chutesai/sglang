@@ -43,6 +43,7 @@ turboquant_quantize = _mod.turboquant_quantize
 turboquant_dequantize = _mod.turboquant_dequantize
 turboquant_quantize_mixed = _mod.turboquant_quantize_mixed
 turboquant_dequantize_mixed = _mod.turboquant_dequantize_mixed
+turboquant_dequantize_fused = _mod.turboquant_dequantize_fused
 
 DEVICE = torch.device("cuda")
 
@@ -139,6 +140,245 @@ def test_mixed_precision():
             f"  {eff}b mixed (independent instances): MSE={mse_mixed:.6f} (between {bl}b={mse_lo:.6f} and {bh}b={mse_hi:.6f})"
         )
     print("PASS: test_mixed_precision")
+
+
+def test_norm_correction_mse():
+    """Norm correction: ||dequant(x)|| / ||x|| should be ≈1.0 after correction.
+
+    Before correction this ratio drifts 5-10%.  With correction it should be
+    near-exact (< 1% relative error per vector).
+    """
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+    x = torch.randn(512, 128, device=DEVICE, dtype=torch.bfloat16)
+    x_f32 = x.float()
+    orig_norms = torch.norm(x_f32, dim=-1)
+
+    for bits in [4, 3, 2]:
+        q = turboquant_quantize(x, h, bits, "mse")
+        r = turboquant_dequantize(q, h, bits, "mse", torch.float32)
+        recon_norms = torch.norm(r, dim=-1)
+        ratio = recon_norms / orig_norms.clamp_min(1e-10)
+        mean_ratio = ratio.mean().item()
+        max_err = (ratio - 1.0).abs().max().item()
+        print(
+            f"  {bits}b MSE: mean ||dequant||/||x|| = {mean_ratio:.6f}, max |ratio-1| = {max_err:.6f}"
+        )
+        assert (
+            abs(mean_ratio - 1.0) < 0.01
+        ), f"{bits}b: mean norm ratio {mean_ratio:.6f} too far from 1.0"
+        assert max_err < 0.05, f"{bits}b: worst-case norm error {max_err:.6f} too large"
+
+    # Verify fused workspace path also gets correction
+    ws = QuantizeWorkspace(max_rows=512, padded_dim=128, device=DEVICE)
+    q_ws = turboquant_quantize(x, h, 4, "mse", workspace=ws)
+    r_ws = turboquant_dequantize(q_ws, h, 4, "mse", torch.float32)
+    ws_norms = torch.norm(r_ws, dim=-1)
+    ws_ratio = (ws_norms / orig_norms.clamp_min(1e-10)).mean().item()
+    print(f"  4b MSE (workspace): mean ratio = {ws_ratio:.6f}")
+    assert (
+        abs(ws_ratio - 1.0) < 0.01
+    ), f"Workspace path norm ratio {ws_ratio:.6f} too far from 1.0"
+
+    print("PASS: test_norm_correction_mse")
+
+
+def test_norm_correction_prod_unaffected():
+    """Prod mode norms should NOT be corrected (QJL residuals depend on uncorrected norms)."""
+    h = HadamardTransform(128, seed=42, device=DEVICE)
+    x = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+
+    q = turboquant_quantize(x, h, 4, "prod")
+    # In prod mode, stored norms should equal original L2 norms (no correction)
+    orig_norms = torch.norm(x.float(), dim=-1)
+    stored_norms = q["norms"]
+    assert torch.allclose(
+        stored_norms, orig_norms, atol=1e-4
+    ), f"Prod mode norms were modified: max diff = {(stored_norms - orig_norms).abs().max().item():.6e}"
+    print("PASS: test_norm_correction_prod_unaffected")
+
+
+def test_fused_dequantize_vs_legacy():
+    """turboquant_dequantize_fused() must match turboquant_dequantize() numerically."""
+    import torch.nn.functional as F
+
+    for dim in [64, 128, 256]:
+        h = HadamardTransform(dim, seed=42, device=DEVICE)
+        padded_dim = h.padded_dim
+        x = torch.randn(256, dim, device=DEVICE, dtype=torch.bfloat16)
+
+        q = turboquant_quantize(x, h, 4, "mse")
+
+        # Legacy path
+        r_legacy = turboquant_dequantize(q, h, 4, "mse", torch.bfloat16)
+
+        # Fused path
+        n = q["packed_indices"].shape[0]
+        scratch = torch.zeros(n, padded_dim, dtype=torch.float32, device=DEVICE)
+        r_fused = torch.zeros(n, dim, dtype=torch.bfloat16, device=DEVICE)
+        turboquant_dequantize_fused(
+            q["packed_indices"],
+            q["norms"],
+            padded_dim,
+            h,
+            scratch,
+            out=r_fused,
+        )
+
+        cos = F.cosine_similarity(
+            r_legacy.flatten().unsqueeze(0).float(),
+            r_fused.flatten().unsqueeze(0).float(),
+        ).item()
+        max_diff = (r_legacy.float() - r_fused.float()).abs().max().item()
+        print(f"  dim={dim}: cosine={cos:.6f}, max_diff={max_diff:.6e}")
+        assert cos > 0.9999, f"dim={dim}: fused vs legacy cosine {cos:.6f} too low"
+
+    print("PASS: test_fused_dequantize_vs_legacy")
+
+
+def test_fused_dequant_pool_chunked():
+    """Fused dequant in _dequant_layer_chunked: force small chunks, verify equivalence."""
+    import torch.nn.functional as F
+
+    pool = _make_mha_pool(
+        head_dim=128,
+        head_num=8,
+        bits=4.0,
+        mode="mse",
+        size=256,
+        layer_num=1,
+    )
+
+    class _FakeLayer:
+        layer_id = 0
+
+    n_tokens = 128
+    loc = torch.arange(n_tokens, device=DEVICE)
+    cache_k = torch.randn(n_tokens, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    cache_v = torch.randn(n_tokens, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k, cache_v)
+
+    # Reference: standard dequant (whatever path the pool uses by default)
+    pool._get_key_buffer(0)
+    ref_k = pool._k_workspace[loc].clone()
+    pool._get_value_buffer(0)
+    ref_v = pool._v_workspace[loc].clone()
+
+    # Now force fused dequant with a very small chunk size to exercise multi-chunk
+    assert pool._use_fused_dequant, "Pool should use fused dequant for 4-bit MSE bf16"
+    orig_chunk = pool._dequant_chunk_tokens
+    pool._dequant_chunk_tokens = 16  # force 128/16 = 8 chunks
+
+    pool._get_key_buffer(0)
+    fused_k = pool._k_workspace[loc].clone()
+    pool._get_value_buffer(0)
+    fused_v = pool._v_workspace[loc].clone()
+
+    pool._dequant_chunk_tokens = orig_chunk  # restore
+
+    cos_k = F.cosine_similarity(
+        ref_k.flatten().unsqueeze(0).float(), fused_k.flatten().unsqueeze(0).float()
+    ).item()
+    cos_v = F.cosine_similarity(
+        ref_v.flatten().unsqueeze(0).float(), fused_v.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  K cosine (chunked fused vs ref): {cos_k:.6f}")
+    print(f"  V cosine (chunked fused vs ref): {cos_v:.6f}")
+    assert cos_k > 0.9999, f"K chunked fused cosine {cos_k:.6f} too low"
+    assert cos_v > 0.9999, f"V chunked fused cosine {cos_v:.6f} too low"
+
+    print("PASS: test_fused_dequant_pool_chunked")
+
+
+def test_fused_dequant_sparse_multi_chunk():
+    """Force _dequant_sparse fused path to chunk across >1 chunk boundary."""
+    import torch.nn.functional as F
+
+    pool = _make_mha_pool(
+        head_dim=128,
+        head_num=8,
+        bits=4.0,
+        mode="mse",
+        size=512,
+        layer_num=1,
+    )
+
+    class _FakeLayer:
+        layer_id = 0
+
+    n_tokens = 200
+    loc = torch.arange(n_tokens, device=DEVICE)
+    cache_k = torch.randn(n_tokens, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    cache_v = torch.randn(n_tokens, 8, 128, device=DEVICE, dtype=torch.bfloat16)
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k, cache_v)
+
+    assert pool._use_fused_dequant, "Pool should use fused dequant"
+
+    # Reference: full dequant via _get_key_buffer
+    pool._get_key_buffer(0)
+    ref_k = pool._k_workspace[loc].clone()
+    pool._get_value_buffer(0)
+    ref_v = pool._v_workspace[loc].clone()
+
+    # Force tiny chunk to make sparse path chunk multiple times
+    orig_chunk = pool._dequant_chunk_tokens
+    pool._dequant_chunk_tokens = 8  # 200 tokens → 25 chunks
+
+    # Reallocate scratch/staging to match tiny chunk size
+    max_padded = max(pool.padded_head_dim, pool.v_padded_head_dim)
+    pool._dequant_scratch = torch.zeros(
+        8 * pool.head_num,
+        max_padded,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    pool._dequant_staging = torch.zeros(
+        8,
+        pool.head_num,
+        max(pool.head_dim, pool.v_head_dim),
+        dtype=pool.dtype,
+        device=DEVICE,
+    )
+
+    # Use sparse dequant with all 200 indices (forces multi-chunk)
+    unique_indices = loc.clone()
+    pool._k_workspace.zero_()
+    pool._dequant_sparse(
+        unique_indices,
+        pool.k_buffer[0],
+        pool.k_norms_buffer[0],
+        pool._k_workspace,
+        pool.k_hadamard,
+        pool.padded_head_dim,
+        pool.head_dim,
+    )
+    sparse_k = pool._k_workspace[loc].clone()
+
+    pool._v_workspace.zero_()
+    pool._dequant_sparse(
+        unique_indices,
+        pool.v_buffer[0],
+        pool.v_norms_buffer[0],
+        pool._v_workspace,
+        pool.v_hadamard,
+        pool.v_padded_head_dim,
+        pool.v_head_dim,
+    )
+    sparse_v = pool._v_workspace[loc].clone()
+
+    pool._dequant_chunk_tokens = orig_chunk  # restore
+
+    cos_k = F.cosine_similarity(
+        ref_k.flatten().unsqueeze(0).float(), sparse_k.flatten().unsqueeze(0).float()
+    ).item()
+    cos_v = F.cosine_similarity(
+        ref_v.flatten().unsqueeze(0).float(), sparse_v.flatten().unsqueeze(0).float()
+    ).item()
+    print(f"  K cosine (sparse multi-chunk vs ref): {cos_k:.6f}")
+    print(f"  V cosine (sparse multi-chunk vs ref): {cos_v:.6f}")
+    assert cos_k > 0.9999, f"K sparse multi-chunk cosine {cos_k:.6f} too low"
+    assert cos_v > 0.9999, f"V sparse multi-chunk cosine {cos_v:.6f} too low"
+
+    print("PASS: test_fused_dequant_sparse_multi_chunk")
 
 
 # ---------------------------------------------------------------------------
@@ -1280,6 +1520,8 @@ if __name__ == "__main__":
         test_quantize_dequantize_quality,
         test_compression_ratios,
         test_mixed_precision,
+        test_norm_correction_mse,
+        test_norm_correction_prod_unaffected,
     ]
 
     workspace_tests = [
@@ -1291,6 +1533,12 @@ if __name__ == "__main__":
         test_jit_hadamard_matches_python_fwht,
         test_jit_hadamard_out_identity,
         test_jit_hadamard_out_validation,
+    ]
+
+    fused_dequant_tests = [
+        test_fused_dequantize_vs_legacy,
+        test_fused_dequant_pool_chunked,
+        test_fused_dequant_sparse_multi_chunk,
     ]
 
     fused_mha_tests = [
@@ -1305,7 +1553,13 @@ if __name__ == "__main__":
         test_benchmark_qwen3_4b,
     ]
 
-    all_tests = unit_tests + workspace_tests + fused_mha_tests + model_tests
+    all_tests = (
+        unit_tests
+        + workspace_tests
+        + fused_dequant_tests
+        + fused_mha_tests
+        + model_tests
+    )
     passed = 0
     failed = 0
     all_results = {}

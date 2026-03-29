@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.turboquant_kernels import (
     compute_packed_dim_mixed,
     parse_bits,
     turboquant_dequantize,
+    turboquant_dequantize_fused,
     turboquant_dequantize_mixed,
     turboquant_quantize,
     turboquant_quantize_mixed,
@@ -161,6 +162,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         # recorded on alt_stream after that layer's quantize finished.
         self._async_events = [None] * self.layer_num
 
+        # Fused dequant eligibility: requires bf16 output (kernel hardcodes tl.bfloat16)
+        self._use_fused_dequant = (
+            self.can_use_fused_kernel and self.dtype == torch.bfloat16
+        )
+
         # Pre-scaled centroid tables for the fused decode kernel.
         # The centroids are scaled by 1/sqrt(dim) so the kernel only needs to
         # multiply by the per-token norm (no additional 1/sqrt(d) factor).
@@ -168,9 +174,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             raw = _get_centroids_tensor(self.mse_bits, torch.device(device))
             self.k_centroids_scaled = raw / math.sqrt(self.padded_head_dim)
             self.v_centroids_scaled = raw / math.sqrt(self.v_padded_head_dim)
+
+            # Dense rotation matrices for fusing Hadamard transforms into
+            # Triton kernels via tl.dot (eliminates 2 kernel launches).
+            k_rot_full = self.k_hadamard.get_fwd_rotation_matrix_bf16()
+            # Pre-split into even/odd columns to match nibble-packed K layout
+            self.k_fwd_rot_even = k_rot_full[:, 0::2].contiguous()  # (pd, pd//2)
+            self.k_fwd_rot_odd = k_rot_full[:, 1::2].contiguous()  # (pd, pd//2)
+            v_inv_full = self.v_hadamard.get_inv_rotation_matrix_bf16()
+            # For fused V-inverse path, v_head_dim must be a power of 2
+            # (= v_padded_dim), so the matrix is square. If not, the fused
+            # Stage 2 kernel will assert and fall back to legacy path.
+            self.v_inv_rot_matrix = v_inv_full.contiguous()
         else:
             self.k_centroids_scaled = None
             self.v_centroids_scaled = None
+            self.k_fwd_rot_even = None
+            self.k_fwd_rot_odd = None
+            self.v_inv_rot_matrix = None
 
     def _create_buffers(self):
         """Allocate bit-packed compressed storage buffers + shared workspace."""
@@ -258,6 +279,26 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                         for _ in range(self.layer_num)
                     ]
 
+                # Fused dequant scratch + staging buffers (pre-allocated, zero hot-path allocs)
+                if self._use_fused_dequant:
+                    max_padded = max(self.padded_head_dim, self.v_padded_head_dim)
+                    scratch_rows = self._dequant_chunk_tokens * self.head_num
+                    self._dequant_scratch = torch.zeros(
+                        (scratch_rows, max_padded),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    # Staging buffer for sparse dequant scatter
+                    self._dequant_staging = torch.zeros(
+                        (
+                            self._dequant_chunk_tokens,
+                            self.head_num,
+                            max(self.head_dim, self.v_head_dim),
+                        ),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+
                 # Shared workspace buffers for dequantized data — reused across
                 # layers.  Only one layer's attention runs at a time, so a single
                 # pair suffices.
@@ -279,6 +320,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         del self.v_norms_buffer
         del self._k_workspace
         del self._v_workspace
+        if self._use_fused_dequant:
+            del self._dequant_scratch
+            del self._dequant_staging
         if self.mode == "prod":
             del self.k_qjl_buffer
             del self.v_qjl_buffer
@@ -292,6 +336,12 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         v_size = sum(get_tensor_size_bytes(b) for b in self.v_buffer)
         v_size += sum(get_tensor_size_bytes(b) for b in self.v_norms_buffer)
         v_size += get_tensor_size_bytes(self._v_workspace)
+        if self._use_fused_dequant:
+            # Shared scratch/staging — split evenly between K and V accounting
+            scratch_bytes = get_tensor_size_bytes(self._dequant_scratch) // 2
+            staging_bytes = get_tensor_size_bytes(self._dequant_staging) // 2
+            k_size += scratch_bytes + staging_bytes
+            v_size += scratch_bytes + staging_bytes
         if self.mode == "prod":
             k_size += sum(get_tensor_size_bytes(b) for b in self.k_qjl_buffer)
             k_size += sum(
@@ -354,6 +404,23 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 workspace[start:end] = result[:, :out_dim].reshape(
                     n_chunk, num_heads, out_dim
                 )
+            elif not self.is_mixed and self._use_fused_dequant:
+                # Fused single-kernel dequant: unpack+centroid+norm+FWHT+signs→bf16
+                flat_packed = c_packed.reshape(-1, c_packed.shape[-1])
+                flat_norms = c_norms.reshape(-1)
+                n_flat = flat_packed.shape[0]
+                scratch = self._dequant_scratch[:n_flat, :padded_dim]
+                # Write directly into workspace slice — zero allocations
+                out_view = workspace[start:end].reshape(n_flat, out_dim)
+                turboquant_dequantize_fused(
+                    flat_packed,
+                    flat_norms,
+                    padded_dim,
+                    hadamard,
+                    scratch,
+                    out=out_view,
+                )
+                continue  # skip the workspace write at the end
             else:
                 quantized = {
                     "packed_indices": c_packed.reshape(-1, c_packed.shape[-1]),
@@ -419,6 +486,32 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             result = turboquant_dequantize_mixed(
                 quantized, hadamard_hi, hadamard_lo, self.dtype
             )
+        elif not self.is_mixed and self._use_fused_dequant:
+            # Fused dequant with token-unit chunking into staging buffer
+            chunk_toks = self._dequant_chunk_tokens
+            for tok_start in range(0, n, chunk_toks):
+                tok_end = min(tok_start + chunk_toks, n)
+                c_toks = tok_end - tok_start
+                c_rows = c_toks * num_heads
+
+                c_packed = g_packed[tok_start:tok_end].reshape(c_rows, -1)
+                c_norms = g_norms[tok_start:tok_end].reshape(c_rows)
+                scratch = self._dequant_scratch[:c_rows, :padded_dim]
+                staging = self._dequant_staging[:c_toks].reshape(c_rows, out_dim)
+
+                turboquant_dequantize_fused(
+                    c_packed,
+                    c_norms,
+                    padded_dim,
+                    hadamard,
+                    scratch,
+                    out=staging,
+                )
+                # Scatter this chunk's tokens into workspace
+                workspace[unique_indices[tok_start:tok_end]] = self._dequant_staging[
+                    :c_toks, :num_heads, :out_dim
+                ]
+            return
         else:
             quantized = {
                 "packed_indices": g_packed.reshape(-1, g_packed.shape[-1]),
@@ -846,6 +939,45 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 loc=dummy_loc,
                 head_num=self.head_num,
             )
+            # Warmup fused dequant kernel (JIT-compile before CUDA graph capture)
+            if self._use_fused_dequant:
+                dummy_packed = torch.zeros(
+                    1, self.padded_head_dim // 2, dtype=torch.uint8, device=device
+                )
+                dummy_norms = torch.ones(1, dtype=torch.float32, device=device)
+                dummy_scratch = torch.zeros(
+                    1, self.padded_head_dim, dtype=torch.float32, device=device
+                )
+                dummy_out = torch.zeros(
+                    1, self.head_dim, dtype=torch.bfloat16, device=device
+                )
+                turboquant_dequantize_fused(
+                    dummy_packed,
+                    dummy_norms,
+                    self.padded_head_dim,
+                    self.k_hadamard,
+                    dummy_scratch,
+                    out=dummy_out,
+                )
+                # Also warmup V dimension if different
+                if self.v_padded_head_dim != self.padded_head_dim:
+                    dummy_packed_v = torch.zeros(
+                        1, self.v_padded_head_dim // 2, dtype=torch.uint8, device=device
+                    )
+                    dummy_scratch_v = torch.zeros(
+                        1, self.v_padded_head_dim, dtype=torch.float32, device=device
+                    )
+                    dummy_out_v = torch.zeros(
+                        1, self.v_head_dim, dtype=torch.bfloat16, device=device
+                    )
+                    turboquant_dequantize_fused(
+                        dummy_packed_v,
+                        dummy_norms,
+                        self.v_padded_head_dim,
+                        self.v_hadamard,
+                        dummy_scratch_v,
+                        out=dummy_out_v,
+                    )
             logger.info("TurboQuant Triton kernels warmed up")
 
     def get_k_packed_buffer(self, layer_id: int):

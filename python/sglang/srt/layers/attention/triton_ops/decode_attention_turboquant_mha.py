@@ -16,6 +16,12 @@ Hadamard transforms, separate centroids, and multiple KV heads.
 Scope: 4-bit uniform MSE mode only (matches MLA fused kernel scope).
 
 Based on _fwd_grouped_kernel_stage1_tq from decode_attention_turboquant.py.
+
+Fused Hadamard rotation support:
+  - FUSE_K_ROT=True: K-Hadamard rotation is fused into Stage 1 via
+    pre-computed dense rotation matrices (eliminates external kernel launch).
+  - Grouped Stage 2 with V-inverse rotation: eliminates external V-Hadamard
+    inverse kernel launch.
 """
 
 import torch
@@ -35,8 +41,8 @@ from sglang.srt.layers.attention.triton_ops.decode_attention import (
 
 @triton.jit
 def _fwd_grouped_kernel_stage1_tq_mha(
-    # Q input (already K-Hadamard-rotated by caller)
-    Q,  # (batch, q_heads, head_dim) — K-rotated
+    # Q input — either pre-rotated or raw (when FUSE_K_ROT=True)
+    Q,  # (batch, q_heads, head_dim)
     # Compressed KV buffers — separate K and V
     K_Packed,  # uint8, (max_tokens, kv_heads, k_packed_dim)
     V_Packed,  # uint8, (max_tokens, kv_heads, v_packed_dim)
@@ -53,6 +59,9 @@ def _fwd_grouped_kernel_stage1_tq_mha(
     Att_Out,
     Att_Lse,
     num_kv_splits,
+    # K-Hadamard rotation matrices (used when FUSE_K_ROT=True)
+    K_Rot_Even,  # bf16, (padded_dim, k_packed_dim) — even columns of rotation matrix
+    K_Rot_Odd,  # bf16, (padded_dim, k_packed_dim) — odd columns of rotation matrix
     # Strides for Q
     stride_q_bs,
     stride_q_h,
@@ -82,6 +91,8 @@ def _fwd_grouped_kernel_stage1_tq_mha(
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr,
+    FUSE_K_ROT: tl.constexpr,  # fuse K-Hadamard rotation into this kernel
+    PADDED_DIM: tl.constexpr,  # padded head dim (power of 2), used when FUSE_K_ROT
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -113,24 +124,52 @@ def _fwd_grouped_kernel_stage1_tq_mha(
     acc_odd = tl.zeros([BLOCK_H, V_PACKED_DIM], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        # Load Q (even/odd for nibble-packed K layout)
-        offs_k_even = tl.arange(0, K_PACKED_DIM) * 2
-        offs_k_odd = tl.arange(0, K_PACKED_DIM) * 2 + 1
+        if FUSE_K_ROT:
+            # ---- Fused K-Hadamard: load raw Q, rotate via dense matmul ----
+            # Load full Q: (BLOCK_H, PADDED_DIM)
+            offs_full = tl.arange(0, PADDED_DIM)
+            q_full = tl.load(
+                Q
+                + cur_batch * stride_q_bs
+                + cur_head[:, None] * stride_q_h
+                + offs_full[None, :],
+                mask=mask_h[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
 
-        offs_q_even = (
-            cur_batch * stride_q_bs
-            + cur_head[:, None] * stride_q_h
-            + offs_k_even[None, :]
-        )
-        offs_q_odd = (
-            cur_batch * stride_q_bs
-            + cur_head[:, None] * stride_q_h
-            + offs_k_odd[None, :]
-        )
-        q_even = tl.load(Q + offs_q_even, mask=mask_h[:, None], other=0.0).to(
-            tl.bfloat16
-        )
-        q_odd = tl.load(Q + offs_q_odd, mask=mask_h[:, None], other=0.0).to(tl.bfloat16)
+            # Load rotation matrix halves: (PADDED_DIM, K_PACKED_DIM) each
+            offs_rot_k = tl.arange(0, K_PACKED_DIM)
+            rot_even = tl.load(
+                K_Rot_Even + offs_full[:, None] * K_PACKED_DIM + offs_rot_k[None, :]
+            ).to(tl.bfloat16)
+            rot_odd = tl.load(
+                K_Rot_Odd + offs_full[:, None] * K_PACKED_DIM + offs_rot_k[None, :]
+            ).to(tl.bfloat16)
+
+            # Q_rot_even = Q @ Rot_Even, Q_rot_odd = Q @ Rot_Odd
+            q_even = tl.dot(q_full, rot_even).to(tl.bfloat16)
+            q_odd = tl.dot(q_full, rot_odd).to(tl.bfloat16)
+        else:
+            # ---- Legacy path: Q already K-Hadamard-rotated by caller ----
+            offs_k_even = tl.arange(0, K_PACKED_DIM) * 2
+            offs_k_odd = tl.arange(0, K_PACKED_DIM) * 2 + 1
+
+            offs_q_even = (
+                cur_batch * stride_q_bs
+                + cur_head[:, None] * stride_q_h
+                + offs_k_even[None, :]
+            )
+            offs_q_odd = (
+                cur_batch * stride_q_bs
+                + cur_head[:, None] * stride_q_h
+                + offs_k_odd[None, :]
+            )
+            q_even = tl.load(Q + offs_q_even, mask=mask_h[:, None], other=0.0).to(
+                tl.bfloat16
+            )
+            q_odd = tl.load(Q + offs_q_odd, mask=mask_h[:, None], other=0.0).to(
+                tl.bfloat16
+            )
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -282,6 +321,109 @@ def _fwd_grouped_kernel_stage1_tq_mha(
 
 
 # ---------------------------------------------------------------------------
+# Stage 2 with fused V-Hadamard inverse rotation (grouped heads)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fwd_kernel_stage2_tq_v_inv(
+    Mid_O,
+    Mid_O_1,
+    O,
+    V_Inv_Rot,  # bf16, (v_padded_dim, v_head_dim) — truncated V-inverse rotation
+    kv_indptr,
+    num_kv_splits,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    stride_vr_row,  # stride for V_Inv_Rot rows
+    MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    BLOCK_DV: tl.constexpr,  # v_padded_dim (padded, power of 2)
+    Lv: tl.constexpr,  # v_head_dim (actual output dim)
+    BLOCK_H_S2: tl.constexpr,  # heads per thread block
+    q_head_num: tl.constexpr,
+):
+    """Stage 2: reduce KV splits + apply V-inverse Hadamard rotation.
+
+    Processes BLOCK_H_S2 heads per thread block. After reducing across KV
+    splits, applies the dense V-inverse rotation matrix via tl.dot to
+    eliminate the external V-Hadamard inverse kernel launch.
+    """
+    cur_batch = tl.program_id(0)
+    head_block_id = tl.program_id(1)
+
+    cur_head = head_block_id * BLOCK_H_S2 + tl.arange(0, BLOCK_H_S2)
+    mask_h = cur_head < q_head_num
+
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
+        kv_indptr + cur_batch
+    )
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < BLOCK_DV  # always True for padded dim
+
+    # Per-head accumulators: (BLOCK_H_S2, BLOCK_DV)
+    e_sum = tl.zeros([BLOCK_H_S2], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_H_S2], dtype=tl.float32) - float("inf")
+    acc = tl.zeros([BLOCK_H_S2, BLOCK_DV], dtype=tl.float32)
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+
+    for split_kv_id in range(0, MAX_KV_SPLITS):
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        if split_kv_end > split_kv_start:
+            # Load mid_o: (BLOCK_H_S2, BLOCK_DV)
+            offs_v = (
+                cur_batch * stride_mid_ob
+                + cur_head[:, None] * stride_mid_oh
+                + split_kv_id * stride_mid_os
+                + offs_d[None, :]
+            )
+            tv = tl.load(Mid_O + offs_v, mask=mask_h[:, None], other=0.0)
+
+            # Load LSE: (BLOCK_H_S2,)
+            offs_logic = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // BLOCK_DV
+            tlogic = tl.load(Mid_O_1 + offs_logic, mask=mask_h, other=-float("inf"))
+
+            n_e_max = tl.maximum(tlogic, e_max)
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale[:, None]
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic[:, None] * tv
+
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
+
+    # Normalize: (BLOCK_H_S2, BLOCK_DV)
+    acc = acc / e_sum[:, None]
+
+    # Apply V-inverse Hadamard rotation via dense matmul:
+    # result = acc @ V_Inv_Rot  where V_Inv_Rot is (BLOCK_DV, Lv)
+    # This fuses the V-Hadamard inverse into Stage 2, eliminating a kernel launch.
+    offs_lv = tl.arange(0, Lv)
+    rot_mat = tl.load(
+        V_Inv_Rot + offs_d[:, None] * stride_vr_row + offs_lv[None, :]
+    ).to(tl.bfloat16)
+    result = tl.dot(acc.to(tl.bfloat16), rot_mat)  # (BLOCK_H_S2, Lv)
+
+    # Store final output
+    offs_out = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_lv[None, :]
+    tl.store(O + offs_out, result, mask=mask_h[:, None])
+
+
+# ---------------------------------------------------------------------------
 # Python wrapper — launches stage1 + stage2
 # ---------------------------------------------------------------------------
 
@@ -303,6 +445,10 @@ def decode_attention_fwd_tq_mha(
     logit_cap: float = 0.0,
     attn_logits: torch.Tensor = None,
     attn_lse: torch.Tensor = None,
+    # Fused Hadamard rotation matrices (None = legacy path)
+    k_rot_even: torch.Tensor = None,  # bf16, (padded_dim, k_packed_dim)
+    k_rot_odd: torch.Tensor = None,  # bf16, (padded_dim, k_packed_dim)
+    v_inv_rot: torch.Tensor = None,  # bf16, (v_padded_dim, v_head_dim)
 ):
     """Launch the fused TurboQuant dequant-attention decode kernel for MHA/GQA."""
     batch = q.shape[0]
@@ -315,9 +461,13 @@ def decode_attention_fwd_tq_mha(
 
     kv_group_num = q_head_num // kv_head_num
 
+    fuse_k_rot = k_rot_even is not None and k_rot_odd is not None
+    fuse_v_inv = v_inv_rot is not None
+
     BLOCK_N = 32
     BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
     BLOCK_DV = triton.next_power_of_2(v_head_dim)
+    PADDED_DIM = head_dim if not fuse_k_rot else k_rot_even.shape[0]
 
     MAX_KV_SPLITS = max_kv_splits
     grid = (
@@ -360,6 +510,9 @@ def decode_attention_fwd_tq_mha(
         attn_logits,
         attn_lse,
         num_kv_splits,
+        # K-rotation matrices (None when not fusing)
+        k_rot_even if fuse_k_rot else k_packed,  # dummy ptr when not used
+        k_rot_odd if fuse_k_rot else k_packed,  # dummy ptr when not used
         # Q strides
         q.stride(0),
         q.stride(1),
@@ -389,35 +542,73 @@ def decode_attention_fwd_tq_mha(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
+        FUSE_K_ROT=fuse_k_rot,
+        PADDED_DIM=PADDED_DIM,
         num_warps=4,
         num_stages=2,
     )
 
-    # Stage 2: reduce across KV splits (reuse existing kernel)
+    # Stage 2: reduce across KV splits
     Lv = v_head_dim
     BLOCK_DV_S2 = triton.next_power_of_2(Lv)
-    grid_s2 = (batch, q_head_num)
 
-    _fwd_kernel_stage2[grid_s2](
-        attn_logits,
-        attn_lse,
-        o,
-        1.0,  # v_scale = 1.0 (no FP8 scaling)
-        kv_indptr,
-        num_kv_splits,
-        None,  # no sinks
-        attn_logits.stride(0),
-        attn_logits.stride(1),
-        attn_logits.stride(2),
-        o.stride(0),
-        o.stride(1),
-        MAX_KV_SPLITS=MAX_KV_SPLITS,
-        MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        BLOCK_DV=BLOCK_DV_S2,
-        Lv=Lv,
-        HAS_SINK=False,
-        num_warps=4,
-        num_stages=2,
-    )
+    if fuse_v_inv:
+        # Grouped Stage 2 with fused V-inverse Hadamard rotation.
+        # tl.dot requires all dims to be multiples of 16; fall back to legacy
+        # if v_head_dim is not a power of 2 (rare in practice).
+        assert Lv == BLOCK_DV_S2, (
+            f"Fused V-inverse requires v_head_dim to be a power of 2, "
+            f"got {Lv} (padded to {BLOCK_DV_S2})"
+        )
+        BLOCK_H_S2 = triton.next_power_of_2(min(16, q_head_num))
+        grid_s2 = (batch, triton.cdiv(q_head_num, BLOCK_H_S2))
+
+        _fwd_kernel_stage2_tq_v_inv[grid_s2](
+            attn_logits,
+            attn_lse,
+            o,
+            v_inv_rot,
+            kv_indptr,
+            num_kv_splits,
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            o.stride(0),
+            o.stride(1),
+            v_inv_rot.stride(0),
+            MAX_KV_SPLITS=MAX_KV_SPLITS,
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            BLOCK_DV=BLOCK_DV_S2,
+            Lv=Lv,
+            BLOCK_H_S2=BLOCK_H_S2,
+            q_head_num=q_head_num,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        # Legacy Stage 2: one head per thread block, no V-inverse
+        grid_s2 = (batch, q_head_num)
+
+        _fwd_kernel_stage2[grid_s2](
+            attn_logits,
+            attn_lse,
+            o,
+            1.0,  # v_scale = 1.0 (no FP8 scaling)
+            kv_indptr,
+            num_kv_splits,
+            None,  # no sinks
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            o.stride(0),
+            o.stride(1),
+            MAX_KV_SPLITS=MAX_KV_SPLITS,
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            BLOCK_DV=BLOCK_DV_S2,
+            Lv=Lv,
+            HAS_SINK=False,
+            num_warps=4,
+            num_stages=2,
+        )
 
     return o

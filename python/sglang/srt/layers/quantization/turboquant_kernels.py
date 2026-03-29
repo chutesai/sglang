@@ -317,6 +317,35 @@ class HadamardTransform:
         x.mul_(self.signs)
         return x[..., : self.dim]
 
+    @torch.no_grad()
+    def get_fwd_rotation_matrix_bf16(self) -> torch.Tensor:
+        """Dense (padded_dim, padded_dim) bf16 matrix M: forward(x) ≈ x @ M.
+
+        Precompute for fusing the K-Hadamard rotation into Triton kernels
+        via tl.dot, eliminating a separate kernel launch.
+        """
+        I = torch.eye(self.padded_dim, device=self.device, dtype=torch.float32)
+        # forward(I) transforms each row e_i, giving M[i,j] such that
+        # forward(x) = x @ M for any row vector x.
+        return self.forward(I).to(torch.bfloat16).contiguous()
+
+    @torch.no_grad()
+    def get_inv_rotation_matrix_bf16(self) -> torch.Tensor:
+        """Dense (padded_dim, padded_dim) bf16 matrix M: inverse_no_truncate(x) ≈ x @ M.
+
+        Precompute for fusing the V-Hadamard inverse into Triton kernels.
+        The caller is responsible for truncating the output to self.dim.
+        """
+        I = torch.eye(self.padded_dim, device=self.device, dtype=torch.float32)
+        # Manual inverse without truncation: scale * H(y) then multiply by signs
+        if self._use_jit:
+            x = _jit_hadamard_transform(I, scale=self.scale)
+        else:
+            x = self._fwht_inplace(I)
+            x.mul_(self.scale)
+        x.mul_(self.signs)
+        return x.to(torch.bfloat16).contiguous()
+
     @staticmethod
     def _fwht(x: torch.Tensor) -> torch.Tensor:
         """Fast Walsh-Hadamard Transform along the last dimension."""
@@ -622,6 +651,7 @@ def _turboquant_fused_quantize_kernel(
     x_ptr,  # [N, dim] bf16/f32 input
     signs_ptr,  # [padded_dim] f32 random signs
     boundaries_ptr,  # [NUM_CENTROIDS - 1] f32 decision boundaries
+    centroids_ptr,  # [NUM_CENTROIDS] f32 scaled centroids (for norm correction)
     norms_ptr,  # [N] f32 output (L2 norms)
     packed_ptr,  # [N, packed_dim] u8 output
     # Scratch buffer for FWHT butterfly (reuses workspace.rotated)
@@ -664,7 +694,6 @@ def _turboquant_fused_quantize_kernel(
 
     # L2 norm (padding positions are 0, don't affect sum)
     norm = tl.sqrt(tl.sum(vals * vals, axis=0))
-    tl.store(norms_ptr + row, norm)
 
     # Apply random signs
     signs = tl.load(signs_ptr + offs)
@@ -710,6 +739,20 @@ def _turboquant_fused_quantize_kernel(
         best_even += (even_vals >= boundary).to(tl.int32)
         best_odd += (odd_vals >= boundary).to(tl.int32)
 
+    # Norm correction: look up chosen centroids, compute reconstruction norm
+    # so that ||dequant(x)|| == ||x||. The stored norm becomes
+    # corrected_norm = original_norm / reconstruction_norm.
+    recon_even = tl.load(centroids_ptr + best_even)
+    recon_odd = tl.load(centroids_ptr + best_odd)
+    recon_sq = tl.sum(recon_even * recon_even, axis=0) + tl.sum(
+        recon_odd * recon_odd, axis=0
+    )
+    recon_norm = tl.sqrt(recon_sq)
+    corrected_norm = norm / tl.maximum(recon_norm, 1e-10)
+
+    # Store corrected norm
+    tl.store(norms_ptr + row, corrected_norm)
+
     # Pack: low nibble = even, high nibble = odd
     packed = ((best_odd << 4) | (best_even & 0x0F)).to(tl.uint8)
 
@@ -723,10 +766,9 @@ def _turboquant_fused_quantize_kernel(
         pool_loc = tl.load(loc_ptr + token_id)
         pool_base = pool_loc * pool_packed_stride_0 + head_id * pool_packed_stride_1
         tl.store(pool_packed_ptr + pool_base + pack_offs, packed, mask=pack_mask)
-        # Write norms (use head_id == 0 guard to avoid redundant writes from other heads;
-        # actually each head has its own norm, so all heads must write)
+        # Write norms (each head has its own norm, so all heads write)
         pool_norms_base = pool_loc * pool_norms_stride_0 + head_id
-        tl.store(pool_norms_ptr + pool_norms_base, norm)
+        tl.store(pool_norms_ptr + pool_norms_base, corrected_norm)
 
 
 @triton.jit
@@ -838,6 +880,67 @@ def _turboquant_dequantize_kernel(
     tl.store(output_ptr + token_id * output_stride_0 + offs, vals, mask=mask)
 
 
+@triton.jit
+def _turboquant_fused_dequantize_4bit_kernel(
+    packed_ptr,  # [N, packed_dim] uint8
+    norms_ptr,  # [N] float32 (corrected norms)
+    signs_ptr,  # [padded_dim] float32
+    centroids_ptr,  # [16] float32 scaled centroids
+    output_ptr,  # [N, out_dim] bf16
+    scratch_ptr,  # [N, padded_dim] float32
+    packed_stride_0,
+    output_stride_0,
+    scratch_stride_0,
+    DIM: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    LOG2_DIM: tl.constexpr,
+    SCALE: tl.constexpr,  # 1.0 / sqrt(padded_dim)
+):
+    """Fused dequantize: unpack → centroid lookup → norm × → inverse FWHT → signs × → bf16.
+
+    Replaces 5 separate kernel launches with 1, keeping the FWHT butterfly
+    L1-resident via scratch memory (same pattern as _turboquant_fused_quantize_kernel).
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, PADDED_DIM)
+    scratch_row = scratch_ptr + row * scratch_stride_0
+
+    # Step 1: Unpack nibbles + centroid lookup
+    pack_offs = tl.arange(0, PACKED_DIM)
+    packed = tl.load(packed_ptr + row * packed_stride_0 + pack_offs).to(tl.int32)
+    val_even = tl.load(centroids_ptr + (packed & 0x0F))
+    val_odd = tl.load(centroids_ptr + ((packed >> 4) & 0x0F))
+
+    # Step 2: Interleave to full dimension via scratch
+    tl.store(scratch_row + pack_offs * 2, val_even)
+    tl.store(scratch_row + pack_offs * 2 + 1, val_odd)
+    tl.debug_barrier()
+    vals = tl.load(scratch_row + offs)
+
+    # Step 3: Multiply by (corrected) norm
+    vals = vals * tl.load(norms_ptr + row)
+
+    # Step 4: Inverse FWHT butterfly (H is self-inverse up to scale)
+    for s in tl.static_range(LOG2_DIM):
+        tl.store(scratch_row + offs, vals)
+        tl.debug_barrier()
+        partner = offs ^ (1 << s)
+        partner_vals = tl.load(scratch_row + partner)
+        is_top = (offs & (1 << s)) == 0
+        vals = tl.where(is_top, vals + partner_vals, partner_vals - vals)
+        tl.debug_barrier()
+    vals = vals * SCALE
+
+    # Step 5: Signs + truncate + bf16 cast
+    vals = vals * tl.load(signs_ptr + offs)
+    tl.store(
+        output_ptr + row * output_stride_0 + offs,
+        vals.to(tl.bfloat16),
+        mask=offs < DIM,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
@@ -928,6 +1031,7 @@ def turboquant_quantize(
             x,
             hadamard.signs,
             scaled_boundaries,
+            scaled_centroids,
             norms,
             packed_buf,
             scratch,
@@ -1015,6 +1119,15 @@ def turboquant_quantize(
 
         # Step 3: Bit-pack the indices
         packed_indices = pack_indices(indices_buf, mse_bits)
+
+        # Norm correction (MSE mode only — prod mode computes QJL residuals
+        # against the stage-1 normalized reconstruction, so changing norms
+        # there would break the combined reconstruction contract)
+        if mode == "mse":
+            indices_int = indices_buf.to(torch.int64)
+            centroid_vals = scaled_centroids[indices_int]  # (N, padded_dim)
+            recon_norms = torch.norm(centroid_vals, dim=-1)  # (N,)
+            norms.div_(recon_norms.clamp_min(1e-10))
 
     result = {
         "packed_indices": packed_indices,
@@ -1127,6 +1240,61 @@ def turboquant_dequantize(
     reconstructed = hadamard.inverse(dequant)
 
     return reconstructed.to(output_dtype)
+
+
+def turboquant_dequantize_fused(
+    packed_indices: torch.Tensor,
+    norms: torch.Tensor,
+    padded_dim: int,
+    hadamard: HadamardTransform,
+    scratch: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Fused dequantize: unpack + centroid + norm + inverse FWHT + signs → bf16.
+
+    Writes directly into *out* (pre-allocated bf16 buffer). Zero allocations.
+
+    Args:
+        packed_indices: (N, packed_dim) uint8, 4-bit nibble-packed centroid indices
+        norms: (N,) float32, corrected L2 norms
+        padded_dim: power-of-2 padded dimension
+        hadamard: HadamardTransform for this dimension (provides signs, scale, dim)
+        scratch: (>=N, padded_dim) float32 scratch buffer for FWHT butterfly
+        out: (N, dim) bf16 output buffer, written in-place
+    """
+    n = packed_indices.shape[0]
+    if n == 0:
+        return
+
+    packed_dim = packed_indices.shape[-1]
+    dim = hadamard.dim
+    log2_dim = padded_dim.bit_length() - 1
+
+    # Get cached scaled centroids
+    device = packed_indices.device
+    sc_key = (4, padded_dim, device)
+    scaled_centroids = _scaled_centroids_cache.get(sc_key)
+    if scaled_centroids is None:
+        centroids = _get_centroids_tensor(4, device)
+        scaled_centroids = centroids / math.sqrt(padded_dim)
+        _scaled_centroids_cache[sc_key] = scaled_centroids
+
+    _turboquant_fused_dequantize_4bit_kernel[(n,)](
+        packed_indices,
+        norms,
+        hadamard.signs,
+        scaled_centroids,
+        out,
+        scratch,
+        packed_indices.stride(0),
+        out.stride(0),
+        scratch.stride(0),
+        DIM=dim,
+        PADDED_DIM=padded_dim,
+        PACKED_DIM=packed_dim,
+        LOG2_DIM=log2_dim,
+        SCALE=hadamard.scale,
+    )
 
 
 # ---------------------------------------------------------------------------

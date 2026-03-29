@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -28,6 +29,39 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+_TQ_PROFILE = os.environ.get("SGLANG_TQ_PROFILE") == "1"
+
+
+class _TQProfileAccumulator:
+    """Accumulates per-layer CUDA event timings for TQ fused decode profiling."""
+
+    def __init__(self):
+        self.enabled = _TQ_PROFILE
+        self._counts = {}  # layer_id -> call count
+        self._totals = {}  # layer_id -> {step_name: total_ms}
+        self._log_interval = int(os.environ.get("SGLANG_TQ_PROFILE_INTERVAL", "100"))
+
+    def record(self, layer_id: int, timings: dict):
+        if layer_id not in self._counts:
+            self._counts[layer_id] = 0
+            self._totals[layer_id] = {}
+        self._counts[layer_id] += 1
+        for name, ms in timings.items():
+            self._totals[layer_id][name] = self._totals[layer_id].get(name, 0.0) + ms
+        if self._counts[layer_id] % self._log_interval == 0:
+            n = self._counts[layer_id]
+            parts = []
+            total = 0.0
+            for name in ["set_kv", "k_hadamard", "attn_s1s2", "v_hadamard"]:
+                avg = self._totals[layer_id].get(name, 0.0) / n
+                total += avg
+                parts.append(f"{name}={avg:.3f}ms")
+            parts.append(f"total={total:.3f}ms")
+            logger.info("TQ_PROFILE layer=%d n=%d %s", layer_id, n, " ".join(parts))
+
+
+_tq_profiler = _TQProfileAccumulator() if _TQ_PROFILE else None
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -1172,31 +1206,61 @@ class TritonAttnBackend(AttentionBackend):
         if _tq_fused:
             # Fused kernel reads from packed 4-bit buffers directly.
             # Must quantize synchronously before attention.
+            if _tq_profiler is not None:
+                _ev_start = torch.cuda.Event(enable_timing=True)
+                _ev_after_kv = torch.cuda.Event(enable_timing=True)
+                _ev_start.record()
+
             if save_kv_cache:
                 pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
-            return self._forward_turboquant_fused_mha(
+
+            if _tq_profiler is not None:
+                _ev_after_kv.record()
+
+            _kv_indptr = (
+                self.forward_metadata.window_kv_indptr
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+                else self.forward_metadata.kv_indptr
+            )
+            _kv_indices = (
+                self.forward_metadata.window_kv_indices
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                )
+                else self.forward_metadata.kv_indices
+            )
+
+            result = self._forward_turboquant_fused_mha(
                 q,
                 o,
                 layer,
                 forward_batch,
-                (
-                    self.forward_metadata.window_kv_indptr
-                    if (
-                        layer.sliding_window_size is not None
-                        and layer.sliding_window_size > -1
-                    )
-                    else self.forward_metadata.kv_indptr
-                ),
-                (
-                    self.forward_metadata.window_kv_indices
-                    if (
-                        layer.sliding_window_size is not None
-                        and layer.sliding_window_size > -1
-                    )
-                    else self.forward_metadata.kv_indices
-                ),
+                _kv_indptr,
+                _kv_indices,
                 logits_soft_cap,
             )
+
+            if _tq_profiler is not None:
+                # Retrieve sub-step events recorded inside _forward_turboquant_fused_mha
+                _ev_after_kh = self._tq_prof_ev_after_k_hadamard
+                _ev_after_attn = self._tq_prof_ev_after_attn
+                _ev_after_vh = self._tq_prof_ev_after_v_hadamard
+                torch.cuda.synchronize()
+                _tq_profiler.record(
+                    layer.layer_id,
+                    {
+                        "set_kv": _ev_start.elapsed_time(_ev_after_kv),
+                        "k_hadamard": _ev_after_kv.elapsed_time(_ev_after_kh),
+                        "attn_s1s2": _ev_after_kh.elapsed_time(_ev_after_attn),
+                        "v_hadamard": _ev_after_attn.elapsed_time(_ev_after_vh),
+                    },
+                )
+
+            return result
 
         # Non-fused paths: save KV cache synchronously for non-TQ pools
         if save_kv_cache and not _tq_async:
@@ -1285,6 +1349,11 @@ class TritonAttnBackend(AttentionBackend):
 
         Reads 4-bit packed K/V buffers directly, dequants on-the-fly during
         attention, and inverse-rotates the V-space output.
+
+        When the pool has pre-computed rotation matrices (k_fwd_rot_even/odd,
+        v_inv_rot_matrix), the K-Hadamard and V-inverse Hadamard transforms
+        are fused into the Triton kernels via tl.dot, eliminating 2 kernel
+        launches (5 -> 3 launches per layer).
         """
         from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant_mha import (
             decode_attention_fwd_tq_mha,
@@ -1294,6 +1363,10 @@ class TritonAttnBackend(AttentionBackend):
         batch = q.shape[0]
         q_3d = q.view(batch, layer.tp_q_head_num, layer.qk_head_dim)
         n_rows = batch * layer.tp_q_head_num
+        v_head_dim = layer.v_head_dim
+
+        # Check if fused Hadamard rotation matrices are available
+        has_fused_rot = getattr(pool, "k_fwd_rot_even", None) is not None
 
         # Use pre-allocated buffers only when batch fits within CUDA graph
         # max_bs.  During live serving batch can exceed max_bs, in which case
@@ -1303,7 +1376,46 @@ class TritonAttnBackend(AttentionBackend):
             and n_rows <= self.cuda_graph_tq_q_float.shape[0]
         )
 
-        # Rotate Q into K-Hadamard space
+        if has_fused_rot:
+            # ---- Fused path: K-Hadamard + V-inverse inside Triton kernels ----
+            # Pass raw (unrotated) Q directly; kernel does rotation via matmul.
+            # V-inverse is done in grouped Stage 2 via matmul.
+
+            if _tq_profiler is not None:
+                self._tq_prof_ev_after_k_hadamard = torch.cuda.Event(enable_timing=True)
+                self._tq_prof_ev_after_k_hadamard.record()
+
+            decode_attention_fwd_tq_mha(
+                q_3d,
+                pool.get_k_packed_buffer(layer.layer_id),
+                pool.get_v_packed_buffer(layer.layer_id),
+                pool.get_k_norms_buffer(layer.layer_id),
+                pool.get_v_norms_buffer(layer.layer_id),
+                pool.k_centroids_scaled,
+                pool.v_centroids_scaled,
+                o.view(batch, layer.tp_q_head_num, v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                attn_logits=self.forward_metadata.attn_logits,
+                attn_lse=self.forward_metadata.attn_lse,
+                k_rot_even=pool.k_fwd_rot_even,
+                k_rot_odd=pool.k_fwd_rot_odd,
+                v_inv_rot=pool.v_inv_rot_matrix,
+            )
+
+            if _tq_profiler is not None:
+                self._tq_prof_ev_after_attn = torch.cuda.Event(enable_timing=True)
+                self._tq_prof_ev_after_attn.record()
+                self._tq_prof_ev_after_v_hadamard = torch.cuda.Event(enable_timing=True)
+                self._tq_prof_ev_after_v_hadamard.record()
+
+            return o
+
+        # ---- Legacy path: external K-Hadamard + V-inverse kernel launches ----
         if use_prealloc:
             q_float = self.cuda_graph_tq_q_float[:n_rows].view(
                 batch, layer.tp_q_head_num, -1
@@ -1317,8 +1429,11 @@ class TritonAttnBackend(AttentionBackend):
         else:
             q_rot = pool.k_hadamard.forward(q_3d)
 
+        if _tq_profiler is not None:
+            self._tq_prof_ev_after_k_hadamard = torch.cuda.Event(enable_timing=True)
+            self._tq_prof_ev_after_k_hadamard.record()
+
         # Output in V-rotated space (padded to v_padded_head_dim for kernel)
-        v_head_dim = layer.v_head_dim
         v_padded = pool.v_padded_head_dim
         if use_prealloc:
             o_rot = self.cuda_graph_tq_o_rot[:batch]
@@ -1351,6 +1466,10 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse=self.forward_metadata.attn_lse,
         )
 
+        if _tq_profiler is not None:
+            self._tq_prof_ev_after_attn = torch.cuda.Event(enable_timing=True)
+            self._tq_prof_ev_after_attn.record()
+
         # Inverse-rotate from V-Hadamard space
         if use_prealloc:
             v_float = self.cuda_graph_tq_v_float[:n_rows].view(
@@ -1364,8 +1483,12 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             o_unrot = pool.v_hadamard.inverse(o_rot)
-        o_final = o_unrot[:, :, :v_head_dim]
 
+        if _tq_profiler is not None:
+            self._tq_prof_ev_after_v_hadamard = torch.cuda.Event(enable_timing=True)
+            self._tq_prof_ev_after_v_hadamard.record()
+
+        o_final = o_unrot[:, :, :v_head_dim]
         o.copy_(o_final.reshape_as(o))
         return o
 
