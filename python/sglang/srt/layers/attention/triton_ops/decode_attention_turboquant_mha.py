@@ -24,6 +24,8 @@ Fused Hadamard rotation support:
     inverse kernel launch.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -32,6 +34,17 @@ from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _MIN_BLOCK_KV,
     _fwd_kernel_stage2,
     tanh,
+)
+
+# ---------------------------------------------------------------------------
+# Tuning configuration for Stage 1 kernel.
+# Set SGLANG_TQ_DECODE_CONFIG=<BLOCK_N>/<num_warps>/<num_stages> to override.
+# Example: SGLANG_TQ_DECODE_CONFIG=64/8/3
+# Default: 32/4/2 (current production config)
+# ---------------------------------------------------------------------------
+_TQ_DECODE_CONFIG = os.environ.get("SGLANG_TQ_DECODE_CONFIG", "32/4/2")
+_TQ_BLOCK_N, _TQ_NUM_WARPS, _TQ_NUM_STAGES = (
+    int(x) for x in _TQ_DECODE_CONFIG.split("/")
 )
 
 # ---------------------------------------------------------------------------
@@ -464,10 +477,12 @@ def decode_attention_fwd_tq_mha(
     fuse_k_rot = k_rot_even is not None and k_rot_odd is not None
     fuse_v_inv = v_inv_rot is not None
 
-    BLOCK_N = 32
+    BLOCK_N = _TQ_BLOCK_N
     BLOCK_H = triton.next_power_of_2(min(16, kv_group_num))
     BLOCK_DV = triton.next_power_of_2(v_head_dim)
     PADDED_DIM = head_dim if not fuse_k_rot else k_rot_even.shape[0]
+    NUM_WARPS = _TQ_NUM_WARPS
+    NUM_STAGES = _TQ_NUM_STAGES
 
     MAX_KV_SPLITS = max_kv_splits
     grid = (
@@ -544,8 +559,8 @@ def decode_attention_fwd_tq_mha(
         logit_cap=logit_cap,
         FUSE_K_ROT=fuse_k_rot,
         PADDED_DIM=PADDED_DIM,
-        num_warps=4,
-        num_stages=2,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
     )
 
     # Stage 2: reduce across KV splits
