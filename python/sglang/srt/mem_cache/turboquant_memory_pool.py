@@ -141,6 +141,16 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             1, _DEQUANT_CHUNK_MEMORY_BUDGET // bytes_per_token
         )
 
+        # Fused dequant eligibility: requires 4-bit MSE non-mixed + bf16 output
+        # (kernel hardcodes tl.bfloat16). Must be set before super().__init__()
+        # because _create_buffers() is called from there.
+        self._use_fused_dequant = (
+            mode == "mse"
+            and not self.is_mixed
+            and self.mse_bits == 4
+            and dtype == torch.bfloat16
+        )
+
         super().__init__(
             size=size,
             page_size=page_size,
@@ -161,11 +171,6 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         # Each entry is either None (no pending async work) or a CUDA event
         # recorded on alt_stream after that layer's quantize finished.
         self._async_events = [None] * self.layer_num
-
-        # Fused dequant eligibility: requires bf16 output (kernel hardcodes tl.bfloat16)
-        self._use_fused_dequant = (
-            self.can_use_fused_kernel and self.dtype == torch.bfloat16
-        )
 
         # Pre-scaled centroid tables for the fused decode kernel.
         # The centroids are scaled by 1/sqrt(dim) so the kernel only needs to
