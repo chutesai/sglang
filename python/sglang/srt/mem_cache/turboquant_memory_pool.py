@@ -620,6 +620,17 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         self._get_value_buffer(layer_id)
         return self._v_workspace
 
+    def get_kv_buffer(self, layer_id: int, **kwargs):
+        kv_indices = kwargs.get("kv_indices", None)
+        return (
+            self.get_key_buffer(layer_id, kv_indices=kv_indices),
+            self.get_value_buffer(layer_id, kv_indices=kv_indices),
+        )
+
+    @property
+    def supports_sparse_dequant(self):
+        return True
+
     def _get_key_buffer(self, layer_id: int):
         """Dequantize and return full key buffer for a layer."""
         idx = layer_id - self.start_layer

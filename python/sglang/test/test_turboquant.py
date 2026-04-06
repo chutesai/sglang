@@ -1510,6 +1510,192 @@ def test_forward_decode_bypasses_workspace():
     print("PASS: test_forward_decode_bypasses_workspace")
 
 
+def test_flashinfer_sparse_dequant_decode():
+    """Integration test: FlashInfer decode path uses sparse dequant via get_kv_buffer(kv_indices=...).
+
+    Verifies that FlashInferAttnBackend.forward_decode():
+    1. Passes kv_indices from DecodeMetadata to pool.get_kv_buffer()
+    2. Triggers the sparse dequant path (_dequant_sparse) instead of full dequant
+    3. Produces correct output (cosine similarity > 0.99 vs reference)
+    """
+    from unittest.mock import MagicMock, patch
+
+    import torch.nn.functional as F
+
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        DecodeMetadata,
+        FlashInferAttnBackend,
+        WrapperDispatch,
+    )
+
+    head_dim = 128
+    v_head_dim = 128
+    kv_heads = 8
+    q_heads = 32  # GQA 4x
+    batch = 2
+    N_tokens = 32
+
+    pool = _make_mha_pool(
+        head_dim=head_dim,
+        head_num=kv_heads,
+        bits=4.0,
+        mode="mse",
+        size=64,
+        layer_num=1,
+        v_head_dim=v_head_dim,
+    )
+
+    # Populate KV cache
+    class _FakeLayer:
+        layer_id = 0
+
+    loc = torch.arange(N_tokens, device=DEVICE)
+    cache_k = torch.randn(
+        N_tokens, kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    cache_v = torch.randn(
+        N_tokens, kv_heads, v_head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    pool.set_kv_buffer(_FakeLayer(), loc, cache_k, cache_v)
+
+    # --- Build reference output via full workspace dequant + manual attention ---
+    pool._get_key_buffer(0)
+    key_buf = pool._k_workspace.clone()
+    pool._get_value_buffer(0)
+    val_buf = pool._v_workspace.clone()
+
+    seq_lens = torch.tensor([16, 16], dtype=torch.int32, device=DEVICE)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+    kv_indices = torch.arange(N_tokens, dtype=torch.int32, device=DEVICE)
+
+    q = torch.randn(batch, q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
+
+    ref_outputs = []
+    for b in range(batch):
+        start = kv_indptr[b].item()
+        end = kv_indptr[b + 1].item()
+        token_ids = kv_indices[start:end]
+        per_head = []
+        for qh in range(q_heads):
+            kvh = qh // (q_heads // kv_heads)
+            k = key_buf[token_ids, kvh, :].float()
+            v = val_buf[token_ids, kvh, :v_head_dim].float()
+            scores = q[b, qh].float() @ k.T
+            probs = torch.softmax(scores, dim=-1)
+            per_head.append(probs @ v)
+        ref_outputs.append(torch.stack(per_head))
+    ref_output = torch.stack(ref_outputs)  # (batch, q_heads, v_head_dim)
+
+    # --- Build mock FlashInfer decode wrapper that does manual attention ---
+    class _MockDecodeWrapper:
+        def forward(self, q_3d, kv_buf, sm_scale=1.0, logits_soft_cap=0.0,
+                    k_scale=None, v_scale=None):
+            """Manual attention using the dequanted kv buffers."""
+            k_data, v_data = kv_buf
+            bs = q_3d.shape[0]
+            results = []
+            for b in range(bs):
+                start = kv_indptr[b].item()
+                end = kv_indptr[b + 1].item()
+                token_ids = kv_indices[start:end]
+                per_head = []
+                for qh in range(q_3d.shape[1]):
+                    kvh = qh // (q_heads // kv_heads)
+                    k = k_data[token_ids, kvh, :].float()
+                    v = v_data[token_ids, kvh, :v_head_dim].float()
+                    scores = q_3d[b, qh].float() @ k.T
+                    probs = torch.softmax(scores, dim=-1)
+                    per_head.append(probs @ v)
+                results.append(torch.stack(per_head))
+            return torch.stack(results).to(q_3d.dtype)
+
+    mock_wrapper = _MockDecodeWrapper()
+
+    # --- Build mock layer ---
+    _v_hd = v_head_dim
+
+    class _MockLayer:
+        layer_id = 0
+        tp_q_head_num = q_heads
+        tp_k_head_num = kv_heads
+        head_dim = head_dim
+        v_head_dim = _v_hd
+        scaling = 1.0
+        logit_cap = 0.0
+        k_scale = None
+        v_scale = None
+        k_scale_float = None
+        v_scale_float = None
+        sliding_window_size = -1
+        is_cross_attention = False
+
+    layer = _MockLayer()
+
+    # --- Build DecodeMetadata with active kv_indices ---
+    metadata = DecodeMetadata(
+        decode_wrappers=[mock_wrapper],
+        active_kv_indices=[kv_indices],
+    )
+
+    # --- Build mock backend ---
+    class _MockBackend:
+        forward_decode = FlashInferAttnBackend.forward_decode
+        _get_wrapper_idx = FlashInferAttnBackend._get_wrapper_idx
+
+    backend = _MockBackend()
+    backend.forward_metadata = metadata
+    backend.num_wrappers = 1
+    backend.dispatch_reason = WrapperDispatch.SLIDING_WINDOW  # doesn't matter; num_wrappers=1
+
+    # --- Build mock forward_batch ---
+    class _MockForwardBatch:
+        pass
+
+    forward_batch = _MockForwardBatch()
+    forward_batch.token_to_kv_pool = pool
+    forward_batch.out_cache_loc = loc[:batch]
+
+    # --- Spy on _dequant_sparse to confirm sparse path is used ---
+    sparse_called = []
+    orig_dequant_sparse = pool.__class__._dequant_sparse
+
+    def spy_dequant_sparse(self_pool, *args, **kwargs):
+        sparse_called.append(True)
+        return orig_dequant_sparse(self_pool, *args, **kwargs)
+
+    q_flat = q.reshape(batch, q_heads * head_dim)
+
+    with patch.object(pool.__class__, "_dequant_sparse", spy_dequant_sparse):
+        o = FlashInferAttnBackend.forward_decode(
+            backend,
+            q_flat,
+            None,  # k=None, skip KV store
+            None,  # v=None
+            layer,
+            forward_batch,
+            save_kv_cache=False,
+        )
+
+    # Verify sparse dequant was called (once for K, once for V)
+    assert len(sparse_called) >= 2, (
+        f"_dequant_sparse called {len(sparse_called)} times, expected >= 2 "
+        "(once for K, once for V). Sparse dequant path was not triggered."
+    )
+    print(f"  _dequant_sparse called {len(sparse_called)} times (OK)")
+
+    # Verify output correctness
+    o_3d = o.view(batch, q_heads, v_head_dim)
+    cos = (
+        F.cosine_similarity(ref_output.flatten(1), o_3d.float().flatten(1), dim=-1)
+        .mean()
+        .item()
+    )
+    print(f"  FlashInfer sparse dequant decode cosine sim: {cos:.6f}")
+    assert cos > 0.99, f"Output cosine {cos:.4f} too low"
+    print("PASS: test_flashinfer_sparse_dequant_decode")
+
+
 if __name__ == "__main__":
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}\n")
@@ -1546,6 +1732,7 @@ if __name__ == "__main__":
         test_fused_kernel_vs_workspace_mha,
         test_fused_kernel_mha_head_configs,
         test_forward_decode_bypasses_workspace,
+        test_flashinfer_sparse_dequant_decode,
     ]
 
     model_tests = [

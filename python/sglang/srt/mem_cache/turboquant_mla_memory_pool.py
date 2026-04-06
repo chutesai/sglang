@@ -422,7 +422,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         )
         return nope_ws
 
-    def get_kv_buffer(self, layer_id: int):
+    def get_kv_buffer(self, layer_id: int, **kwargs):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     @property

@@ -704,7 +704,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_buffer(self, layer_id: int, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -981,7 +981,7 @@ class MHATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
 
-    def get_kv_buffer(self, layer_id: int):
+    def get_kv_buffer(self, layer_id: int, **kwargs):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
@@ -1348,10 +1348,10 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
-    def get_kv_buffer(self, layer_id: int):
+    def get_kv_buffer(self, layer_id: int, **kwargs):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_kv_buffer(layer_id)
+        return self.full_kv_pool.get_kv_buffer(layer_id, **kwargs)
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
@@ -1535,7 +1535,7 @@ class MLATokenToKVPool(KVCache):
             ].view(self.dtype)
         return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
 
-    def get_kv_buffer(self, layer_id: int):
+    def get_kv_buffer(self, layer_id: int, **kwargs):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
@@ -2013,7 +2013,7 @@ class DoubleSparseTokenToKVPool(KVCache):
     def get_label_buffer(self, layer_id: int):
         return self.label_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int):
+    def get_kv_buffer(self, layer_id: int, **kwargs):
         return (
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],

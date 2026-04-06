@@ -93,6 +93,7 @@ class MultiItemScoringParams:
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    active_kv_indices: Optional[List[Optional[torch.Tensor]]] = None
 
 
 @dataclass
@@ -436,7 +437,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrappers,
+                active_kv_indices=self.indices_updater_decode._pending_kv_indices,
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -874,9 +878,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        wrapper_idx = self._get_wrapper_idx(layer)
+        decode_wrapper = self.forward_metadata.decode_wrappers[wrapper_idx]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -890,10 +893,35 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        pool = forward_batch.token_to_kv_pool
+        is_tq = getattr(pool, "supports_sparse_dequant", False)
+
+        if is_tq:
+            # TurboQuant sparse dequant does not support sliding-window attention.
+            # SWA translates kv_indices into SWA-pool locations that don't address
+            # the TQ compressed pool, so sparse dequant would read wrong data.
+            if (
+                self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                and wrapper_idx == 0
+            ):
+                raise NotImplementedError(
+                    "TurboQuant does not support sliding-window attention"
+                )
+
+            # Sparse dequant path: dequant only referenced tokens, then FlashInfer decode
+            kv_indices = (
+                self.forward_metadata.active_kv_indices[wrapper_idx]
+                if self.forward_metadata.active_kv_indices is not None
+                else None
+            )
+            kv_buf = pool.get_kv_buffer(layer.layer_id, kv_indices=kv_indices)
+        else:
+            kv_buf = pool.get_kv_buffer(layer.layer_id)
+
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv_buf,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
@@ -935,6 +963,10 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+
+        # Per-wrapper active kv_indices for sparse dequant (TurboQuant)
+        self._pending_kv_indices: List[Optional[torch.Tensor]] = [None] * attn_backend.num_wrappers
+        self._last_active_kv_indices: Optional[torch.Tensor] = None
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -985,6 +1017,7 @@ class FlashInferIndicesUpdaterDecode:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        self._pending_kv_indices[0] = self._last_active_kv_indices
 
     def update_sliding_window(
         self,
@@ -1035,6 +1068,7 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu=seq_lens_cpu_tmp,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
             )
+            self._pending_kv_indices[wrapper_id] = self._last_active_kv_indices
 
     def update_cross_attention(
         self,
@@ -1069,6 +1103,7 @@ class FlashInferIndicesUpdaterDecode:
                 spec_info,
                 seq_lens_cpu=seq_lens_cpu,
             )
+            self._pending_kv_indices[wrapper_id] = self._last_active_kv_indices
 
     def call_begin_forward(
         self,
@@ -1170,6 +1205,10 @@ class FlashInferIndicesUpdaterDecode:
                     disable_split_kv if disable_split_kv is not None else False
                 ),
             )
+
+        # Save active kv_indices slice for sparse dequant (TurboQuant)
+        active_len = int(kv_indptr[-1])
+        self._last_active_kv_indices = kv_indices[:active_len] if active_len > 0 else None
 
         if locally_override:
             global_override_indptr_cpu = None
