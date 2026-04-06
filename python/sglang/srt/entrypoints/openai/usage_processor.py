@@ -23,13 +23,14 @@ class UsageProcessor:
         completion_tokens = sum(
             r["meta_info"].get("completion_tokens", 0) for r in responses
         )
-        reasoning_tokens = sum(
-            r["meta_info"].get("reasoning_tokens", 0) for r in responses
-        )
-
         prompt_tokens = sum(
             responses[i]["meta_info"].get("prompt_tokens", 0)
             for i in range(0, len(responses), n_choices)
+        )
+
+        # some API don't have reasoning_tokens semantics
+        reasoning_tokens = sum(
+            r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
         cached_details = None
@@ -84,8 +85,8 @@ class UsageProcessor:
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
-        cached_tokens: Optional[PromptTokensDetails] = None,
         reasoning_tokens: int = 0,
+        cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
