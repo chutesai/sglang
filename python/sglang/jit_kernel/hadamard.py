@@ -34,6 +34,7 @@ def _hadamard_transform_impl(
     scale: float,
     pad_multiple: int,
     kernel_fn: Callable,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError(f"{kernel_fn.__name__} only supports CUDA tensors")
@@ -46,36 +47,69 @@ def _hadamard_transform_impl(
 
     needs_pad = dim_og % pad_multiple != 0
     if needs_pad:
+        if out is not None:
+            raise ValueError("out= not supported when input needs padding")
         x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
 
-    out = torch.empty_like(x)
-    kernel_fn(x, out, scale)
+    if out is not None:
+        if out.device != x.device:
+            raise ValueError(f"out device {out.device} != x device {x.device}")
+        if out.dtype != x.dtype:
+            raise ValueError(f"out dtype {out.dtype} != x dtype {x.dtype}")
+        out_2d = out.reshape(-1, x.size(-1))
+        if out_2d.stride(-1) != 1:
+            raise ValueError("out must be contiguous in last dimension")
+        if out_2d.shape != x.shape:
+            raise ValueError(f"out shape {out_2d.shape} != x shape {x.shape}")
+    else:
+        out_2d = torch.empty_like(x)
+
+    kernel_fn(x, out_2d, scale)
 
     if needs_pad:
-        out = out[:, :dim_og]
-    return out.reshape(shapes_og)
+        out_2d = out_2d[:, :dim_og]
+        return out_2d.reshape(shapes_og)
+    return out_2d.reshape(shapes_og)
 
 
-def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def hadamard_transform(
+    x: torch.Tensor, scale: float = 1.0, out: torch.Tensor | None = None
+) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
+    return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform, out=out)
 
 
-def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def hadamard_transform_12n(
+    x: torch.Tensor, scale: float = 1.0, out: torch.Tensor | None = None
+) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 12, module.hadamard_transform_12n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 12, module.hadamard_transform_12n, out=out
+    )
 
 
-def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def hadamard_transform_20n(
+    x: torch.Tensor, scale: float = 1.0, out: torch.Tensor | None = None
+) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 20, module.hadamard_transform_20n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 20, module.hadamard_transform_20n, out=out
+    )
 
 
-def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def hadamard_transform_28n(
+    x: torch.Tensor, scale: float = 1.0, out: torch.Tensor | None = None
+) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 28, module.hadamard_transform_28n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 28, module.hadamard_transform_28n, out=out
+    )
 
 
-def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def hadamard_transform_40n(
+    x: torch.Tensor, scale: float = 1.0, out: torch.Tensor | None = None
+) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 40, module.hadamard_transform_40n, out=out
+    )

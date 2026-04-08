@@ -1951,6 +1951,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "turboquant":
+            # TurboQuant stores bit-packed indices internally but dequantizes
+            # to the model dtype before attention. The attention backend sees
+            # the working dtype, not the storage dtype.
+            self.kv_cache_dtype = self.dtype
+            self._turboquant_enabled = True
+            self._turboquant_bits = self.server_args.turboquant_bits
+            self._turboquant_mode = self.server_args.turboquant_mode
+            log_info_on_rank0(
+                logger,
+                f"TurboQuant KV cache compression enabled "
+                f"({self._turboquant_bits}-bit, mode={self._turboquant_mode}, ICLR 2026)",
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

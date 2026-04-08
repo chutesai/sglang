@@ -55,6 +55,10 @@ if is_flashinfer_available():
 @dataclass
 class DecodeMetadata:
     decode_wrapper: BatchMLAPagedAttentionWrapper
+    # Cached for TurboQuant fused decode kernel (bypasses FlashInfer)
+    kv_indptr: Optional[torch.Tensor] = None
+    kv_indices: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -285,6 +289,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
+        # Pre-allocated TurboQuant fused decode split buffers (lazy init on first use)
+        self._tq_attn_logits: Optional[torch.Tensor] = None
+        self._tq_attn_lse: Optional[torch.Tensor] = None
+        self._tq_max_kv_splits = 128
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -294,7 +303,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrapper,
+                kv_indptr=self.indices_updater_decode._cached_kv_indptr,
+                kv_indices=self.indices_updater_decode._cached_kv_indices,
+                seq_lens=self.indices_updater_decode._cached_seq_lens,
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -401,7 +415,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
-            self.forward_metadata = DecodeMetadata(decode_wrapper)
+            self.forward_metadata = DecodeMetadata(
+                decode_wrapper,
+                kv_indptr=self.indices_updater_decode._cached_kv_indptr,
+                kv_indices=self.indices_updater_decode._cached_kv_indices,
+                seq_lens=self.indices_updater_decode._cached_seq_lens,
+            )
             decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
         elif forward_mode.is_target_verify():
             verify_wrapper = BatchMLAPagedAttentionWrapper(
@@ -483,6 +502,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=True,
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
+            )
+            # Update forward_metadata with refreshed indices for TQ fused kernel
+            self.forward_metadata = DecodeMetadata(
+                self.decode_cuda_graph_metadata[bs],
+                kv_indptr=self.indices_updater_decode._cached_kv_indptr,
+                kv_indices=self.indices_updater_decode._cached_kv_indices,
+                seq_lens=self.indices_updater_decode._cached_seq_lens,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -636,9 +662,81 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-            q.dtype
+        pool = forward_batch.token_to_kv_pool
+
+        # TurboQuant fused dequant-attention path (4-bit MSE only)
+        _tq_fused = getattr(pool, "can_use_fused_kernel", False) and getattr(
+            layer, "_tq_fused_ready", False
         )
+        if _tq_fused:
+            from sglang.srt.layers.attention.triton_ops.decode_attention_turboquant import (
+                decode_attention_fwd_tq,
+            )
+
+            # Rotate Q using existing HadamardTransform
+            q_nope_rot = pool.nope_hadamard.forward(q_nope)
+            q_rope_rot = pool.rope_hadamard.forward(q_rope)
+
+            # Get raw compressed buffers (no dequant)
+            nope_packed = pool.get_nope_packed_buffer(layer.layer_id)
+            rope_packed = pool.get_rope_packed_buffer(layer.layer_id)
+            nope_norms = pool.get_nope_norms_buffer(layer.layer_id)
+            rope_norms = pool.get_rope_norms_buffer(layer.layer_id)
+
+            # Compute num_kv_splits
+            metadata = self.forward_metadata
+            bs = q_nope.shape[0]
+            head_num = q_nope.shape[1]
+            kv_lora_rank = q_nope.shape[2]
+            BLOCK_N = 32
+            max_kv_splits = self._tq_max_kv_splits
+            num_kv_splits = torch.clamp(
+                (metadata.seq_lens[:bs] + BLOCK_N * 4 - 1) // (BLOCK_N * 4),
+                min=1,
+                max=max_kv_splits,
+            ).to(torch.int32)
+
+            # Lazy-allocate split buffers once, reuse across all subsequent calls
+            if self._tq_attn_logits is None or self._tq_attn_logits.shape[1] < head_num:
+                max_bs = self.kv_indptr.shape[0] - 1  # req_to_token_pool.size
+                self._tq_attn_logits = torch.zeros(
+                    (max_bs, head_num, max_kv_splits, kv_lora_rank),
+                    dtype=torch.float32,
+                    device=q_nope.device,
+                )
+                self._tq_attn_lse = torch.zeros(
+                    (max_bs, head_num, max_kv_splits),
+                    dtype=torch.float32,
+                    device=q_nope.device,
+                )
+
+            o = q_nope.new_empty(q_nope.shape[0], q_nope.shape[1], q_nope.shape[2])
+            decode_attention_fwd_tq(
+                q_nope_rot,
+                q_rope_rot,
+                nope_packed,
+                rope_packed,
+                nope_norms,
+                rope_norms,
+                pool.nope_centroids_scaled,
+                pool.rope_centroids_scaled,
+                o,
+                metadata.kv_indptr,
+                metadata.kv_indices,
+                num_kv_splits,
+                max_kv_splits,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                attn_logits=self._tq_attn_logits,
+                attn_lse=self._tq_attn_lse,
+            )
+
+            # Flag so forward_mla.py uses w_vc_tq_rotated
+            forward_batch._tq_rotated_output = True
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        # Existing FlashInfer path (unchanged fallback)
+        k_buffer = pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
@@ -729,6 +827,11 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+
+        # Cache for TurboQuant fused decode (which bypasses FlashInfer wrapper)
+        self._cached_kv_indptr = kv_indptr
+        self._cached_kv_indices = kv_indices
+        self._cached_seq_lens = paged_kernel_lens
 
         if not init_metadata_replay:
             wrapper.plan(
