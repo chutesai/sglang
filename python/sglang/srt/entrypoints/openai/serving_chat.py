@@ -122,6 +122,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.is_gemma4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
+        )
 
         # Auto-detect reasoning parser for GPT-OSS models
         if self.is_gpt_oss and not self.reasoning_parser:
@@ -417,7 +422,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss:
+        if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
             # Avoid inserting spaces between structural tokens like <|end|>
             if request.chat_template_kwargs is None:
@@ -1576,6 +1581,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return (
                 chat_template_kwargs is not None
                 and chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser == "gemma4":
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         if self.reasoning_parser in ["kimi_k2"]:
             # Models that thinking by default, and can be disabled by setting thinking=False
