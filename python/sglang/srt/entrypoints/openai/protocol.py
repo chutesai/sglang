@@ -736,7 +736,7 @@ class ChatCompletionRequest(BaseModel):
             name_ = payload.get("name") or schema.get("title") or "Schema"
             strict_flag = payload.get("strict")
             if strict_flag is None:
-                strict_flag = True
+                strict_flag = False
 
             normalized_schema = normalize_json_schema(schema, strict_flag)
             response_format.pop("schema", None)

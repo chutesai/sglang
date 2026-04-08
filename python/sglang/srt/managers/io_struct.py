@@ -1146,24 +1146,6 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
-class UpdateIndexCacheReqInput(BaseReq):
-    """Update which layers use IndexCache (Shared vs Full).
-
-    shared_layers: set of layer IDs that should reuse indices from preceding
-    Full layer. All other layers compute their own indices (Full).
-    Used by calibration scripts to toggle layers without engine restart.
-    """
-
-    shared_layers: List[int] = field(default_factory=list)
-
-
-@dataclass
-class UpdateIndexCacheReqOutput(BaseReq):
-    success: bool
-    num_toggled: int = 0
-
-
-@dataclass
 class AddExternalCorpusReqInput(BaseReq):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

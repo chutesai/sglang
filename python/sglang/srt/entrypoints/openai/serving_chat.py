@@ -280,22 +280,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Check against --max-completion-tokens / --max-stream-completion-tokens caps
         if request.stream:
             server_cap = self.tokenizer_manager.server_args.max_stream_completion_tokens
-            other_cap = self.tokenizer_manager.server_args.max_completion_tokens
-            mode_name = "streaming"
-            other_mode = "non-streaming"
         else:
             server_cap = self.tokenizer_manager.server_args.max_completion_tokens
-            other_cap = self.tokenizer_manager.server_args.max_stream_completion_tokens
-            mode_name = "non-streaming"
-            other_mode = "streaming"
         if max_output_tokens and server_cap and max_output_tokens > server_cap:
-            msg = (
+            return (
                 f"max_completion_tokens is too large: {max_output_tokens}. "
-                f"This server allows up to {server_cap} completion tokens for {mode_name} requests."
+                f"This server allows up to {server_cap} completion tokens."
             )
-            if other_cap and other_cap > server_cap:
-                msg += f" ({other_mode} mode allows up to {other_cap})"
-            return msg
 
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
@@ -933,11 +924,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         elif hasattr(parser, "flush_buffered_content"):
                             flush_method = parser.flush_buffered_content
 
+                        flushed_tool_calls = False
                         if flush_method:
                             flush_result = flush_method(request.tools)
 
                             # Emit tool calls if any were parsed
                             if flush_result.calls:
+                                flushed_tool_calls = True
                                 history_tool_calls_cnt = (
                                     self._get_history_tool_calls_cnt(request)
                                 )
@@ -1002,12 +995,15 @@ class OpenAIServingChat(OpenAIServingBase):
                                 )
                                 yield f"data: {chunk.model_dump_json()}\n\n"
 
-                        # Then check for any remaining argument diffs
-                        remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index
-                        )
-                        if remaining_chunk:
-                            yield remaining_chunk
+                        # Only check for remaining argument diffs if flush
+                        # did not already emit complete tool calls (avoids
+                        # double-sending the same tool call data).
+                        if not flushed_tool_calls:
+                            remaining_chunk = self._check_for_unstreamed_tool_args(
+                                parser, content, request, index
+                            )
+                            if remaining_chunk:
+                                yield remaining_chunk
 
                 else:
                     # Regular content

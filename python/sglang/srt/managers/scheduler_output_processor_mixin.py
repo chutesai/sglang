@@ -1045,30 +1045,6 @@ class SchedulerOutputProcessorMixin:
                 reasoning_tokens.append(req.reasoning_tokens)
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
-                # Compute reasoning_tokens from grammar state or by scanning output_ids
-                reasoning_token_count = 0
-                grammar = getattr(req, "grammar", None)
-                tokens_after = getattr(grammar, "tokens_after_think_end", None)
-                if tokens_after is not None and tokens_after >= 0:
-                    reasoning_token_count = len(output_ids_) - tokens_after
-                elif hasattr(self, "tokenizer"):
-                    think_end_ids = getattr(
-                        self.tokenizer, "reasoning_think_end_ids", None
-                    )
-                    if think_end_ids:
-                        # Scan output_ids for think_end_ids sequence
-                        end_len = len(think_end_ids)
-                        for idx in range(len(output_ids_) - end_len + 1):
-                            if list(output_ids_[idx : idx + end_len]) == list(
-                                think_end_ids
-                            ):
-                                reasoning_token_count = idx + end_len
-                                break
-                        else:
-                            # No end token found - all tokens are reasoning if request has reasoning enabled
-                            if req.require_reasoning:
-                                reasoning_token_count = len(output_ids_)
-                reasoning_tokens.append(reasoning_token_count)
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))

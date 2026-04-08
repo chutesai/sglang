@@ -2217,6 +2217,10 @@ def _setup_and_run_http_server(
 
     # Use Granian for HTTP/2 server
     if server_args.enable_http2:
+        # Granian binds the port itself, so release our pre-bound socket
+        # to avoid EADDRINUSE.
+        reserved_socket.close()
+
         # Reuse the multi-tokenizer shared memory mechanism to pass
         # init args (port_args, server_args, scheduler_info) to
         # Granian workers, which are independent processes.

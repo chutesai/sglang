@@ -143,8 +143,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UpdateIndexCacheReqInput,
-    UpdateIndexCacheReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1291,7 +1289,6 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
-                (UpdateIndexCacheReqInput, self.update_index_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3041,33 +3038,6 @@ class Scheduler(
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
         return None
-
-    def update_index_cache_wrapped(self, recv_req: UpdateIndexCacheReqInput):
-        """Toggle IndexCache layers between Full/Shared at runtime."""
-        shared_set = set(recv_req.shared_layers)
-        num_toggled = 0
-        try:
-            model = self.tp_worker.model_runner.model
-            inner = model.model if hasattr(model, "model") else model
-            layers = inner.layers if hasattr(inner, "layers") else []
-            for layer in layers:
-                attn = getattr(layer, "self_attn", None)
-                if attn and hasattr(attn, "index_cache_is_shared"):
-                    # Use the attention module's stored layer_id (global),
-                    # not enumerate index (which is local with PP).
-                    new_val = attn.layer_id in shared_set
-                    if attn.index_cache_is_shared != new_val:
-                        num_toggled += 1
-                    attn.index_cache_is_shared = new_val
-                    attn.index_cache_enabled = True
-            logger.info(
-                f"IndexCache updated: {len(shared_set)} Shared layers, "
-                f"{num_toggled} toggled"
-            )
-            return UpdateIndexCacheReqOutput(success=True, num_toggled=num_toggled)
-        except Exception as e:
-            logger.error(f"Failed to update IndexCache: {e}")
-            return UpdateIndexCacheReqOutput(success=False, num_toggled=0)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:

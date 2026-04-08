@@ -79,8 +79,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UpdateIndexCacheReqInput,
-    UpdateIndexCacheReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -212,9 +210,6 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.update_index_cache_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
         self.add_external_corpus_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -326,10 +321,6 @@ class TokenizerCommunicatorMixin:
                 (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
-                ),
-                (
-                    UpdateIndexCacheReqOutput,
-                    self.update_index_cache_communicator.handle_recv,
                 ),
                 (
                     AddExternalCorpusReqOutput,
@@ -468,16 +459,6 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
-
-    async def update_index_cache(
-        self: TokenizerManager, shared_layers: List[int]
-    ) -> UpdateIndexCacheReqOutput:
-        self.auto_create_handle_loop()
-        return (
-            await self.update_index_cache_communicator(
-                UpdateIndexCacheReqInput(shared_layers=shared_layers)
-            )
         )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:

@@ -353,9 +353,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
-    # IndexCache: cached topk_indices from the last Full indexer layer
-    index_cache_topk_indices: Optional[torch.Tensor] = None
-
     # For LoRA
     lora_ids: Optional[List[str]] = None
 

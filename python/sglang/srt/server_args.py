@@ -681,8 +681,6 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
-    index_cache_config: Optional[str] = None
-    index_cache_ratio: Optional[float] = None
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -1779,17 +1777,6 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if (
-                    not self.enable_dp_attention
-                    and self.nnodes == 1
-                    and not self.disable_custom_all_reduce
-                ):
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
             if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
                 # TODO (Hubert): Put this back later
                 # self.enable_aiter_allreduce_fusion = True
@@ -5957,18 +5944,6 @@ class ServerArgs:
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
-        )
-        parser.add_argument(
-            "--index-cache-config",
-            type=str,
-            default=ServerArgs.index_cache_config,
-            help="Path to a JSON file specifying Full/Shared layer assignment for IndexCache (cross-layer index reuse in DSA indexer).",
-        )
-        parser.add_argument(
-            "--index-cache-ratio",
-            type=float,
-            default=ServerArgs.index_cache_ratio,
-            help="Fraction of layers to keep as Full indexer layers (e.g. 0.25 = 25%% Full, 75%% Shared). Uniform spacing. Overridden by --index-cache-config if both provided.",
         )
         parser.add_argument(
             "--enable-prefill-context-parallel",

@@ -403,9 +403,6 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
-    # IndexCache: cross-layer index reuse ratio (e.g. 0.25 = 25% Full layers)
-    SGLANG_INDEX_CACHE_RATIO = EnvFloat(None)
-
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

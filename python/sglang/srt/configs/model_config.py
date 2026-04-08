@@ -125,16 +125,6 @@ def local_or_cached_path(
     return None
 
 
-def handle_rope_parameters(config: PretrainedConfig):
-    if hasattr(config, "rope_scaling"):
-        rope_scaling = config.rope_scaling
-        if isinstance(rope_scaling, dict):
-            for k, v in rope_scaling.items():
-                if not hasattr(config, k):
-                    setattr(config, k, v)
-    return
-
-
 class ModelConfig:
     def __init__(
         self,

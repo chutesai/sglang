@@ -183,8 +183,8 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if self.use_nsa and self.index_cache_is_shared:
-                    topk_indices = forward_batch.index_cache_topk_indices
+                if self.skip_topk:
+                    topk_indices = prev_topk_indices
                 else:
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -193,15 +193,13 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
-                    if self.index_cache_enabled:
-                        forward_batch.index_cache_topk_indices = topk_indices
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    if self.use_nsa and self.index_cache_is_shared:
-                        topk_indices = forward_batch.index_cache_topk_indices
+                    if self.skip_topk:
+                        topk_indices = prev_topk_indices
                     else:
                         topk_indices = self.indexer(
                             x=hidden_states,
@@ -210,8 +208,6 @@ class DeepseekMLAForwardMixin:
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                         )
-                        if self.index_cache_enabled:
-                            forward_batch.index_cache_topk_indices = topk_indices
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim

@@ -18,6 +18,13 @@ from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_lo
 logger = logging.getLogger(__name__)
 
 
+def _remove_suffix(text: str, suffix: str) -> str:
+    """Remove a literal suffix from text (unlike rstrip which removes character sets)."""
+    if suffix and text.endswith(suffix):
+        return text[: -len(suffix)]
+    return text
+
+
 class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek-V3.2 DSML function call format.
@@ -138,7 +145,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if allow_partial:
                 # Remove incomplete invoke end call prefix
                 for token in reversed(self.prefix_invoke_end_call):
-                    stripped_body = stripped_body.rstrip(token)
+                    stripped_body = _remove_suffix(stripped_body, token)
                 return stripped_body
             elif stripped_body.endswith("}"):
                 return stripped_body
@@ -167,7 +174,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if allow_partial:
             remaining = body[last_match_end:]
             for token in reversed(self.prefix_parameter_end_call):
-                remaining = remaining.rstrip(token)
+                remaining = _remove_suffix(remaining, token)
 
             partial_match = self.param_pattern_partial.search(remaining)
             if partial_match and (param_value := partial_match.group("val")):
