@@ -427,7 +427,6 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
         return KimiK25Processor(image_processor=image_processor, tokenizer=tokenizer)
 
-
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, Dict]],

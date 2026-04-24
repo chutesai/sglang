@@ -841,7 +841,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if conflicts:
             raise ValueError(f"Duplicate request IDs detected: {list(conflicts)}")
 
-
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
@@ -1756,10 +1755,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
                     {
-                        "completion_tokens": recv_obj.completion_tokens[i],
                         "reasoning_tokens": getattr(
                             recv_obj, "reasoning_tokens", [0] * len(recv_obj.rids)
                         )[i],
+                        "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
@@ -2132,7 +2131,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # decode each token individually. In v5, batch_decode treats a flat
             # list of ints as a single sequence instead of separate tokens.
             token_texts = self.tokenizer.batch_decode(
-                [[tid] for tid in token_logprobs_idx]
+                [[idx] for idx in token_logprobs_idx]
             )
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 

@@ -955,8 +955,8 @@ class SchedulerOutputProcessorMixin:
         spaces_between_special_tokens = []
         no_stop_trim = []
         prompt_tokens = []
-        completion_tokens = []
         reasoning_tokens = []
+        completion_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
@@ -1190,8 +1190,8 @@ class SchedulerOutputProcessorMixin:
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,
                     prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,

@@ -43,9 +43,9 @@ class UsageProcessor:
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
+            reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
-            reasoning_tokens=reasoning_tokens,
         )
 
     @staticmethod
@@ -76,9 +76,9 @@ class UsageProcessor:
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
+            reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
-            reasoning_tokens=total_reasoning_tokens,
         )
 
     @staticmethod

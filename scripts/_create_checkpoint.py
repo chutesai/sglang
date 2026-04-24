@@ -1,4 +1,5 @@
 """One-time script to create a checkpoint from crash logs."""
+
 import json
 from pathlib import Path
 

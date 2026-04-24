@@ -196,9 +196,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                if self.skip_topk:
-                    topk_indices = prev_topk_indices
-                else:
+                if not self.skip_topk or prev_topk_indices is None:
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -206,14 +204,14 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                else:
+                    topk_indices = prev_topk_indices
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    if self.skip_topk:
-                        topk_indices = prev_topk_indices
-                    else:
+                    if not self.skip_topk or prev_topk_indices is None:
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -221,6 +219,8 @@ class DeepseekMLAForwardMixin:
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                         )
+                    else:
+                        topk_indices = prev_topk_indices
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
