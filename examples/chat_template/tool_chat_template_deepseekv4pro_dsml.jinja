@@ -1,0 +1,237 @@
+{#- DeepSeek-V4-Pro DSML chat template for SGLang.                              -#}
+{#- Covers the OpenAI-compatible subset of encoding_dsv4.py.                    -#}
+{#- Internal-only encoder features not reachable from the SGLang API are        -#}
+{#- omitted: task special tokens, wo_eos, latest_reminder role, and             -#}
+{#- pre-merged content_blocks.  Tool results are rendered in message order;     -#}
+{#- the encoder's sort_tool_results_by_call_order is not replicated (SGLang     -#}
+{#- delivers tool results in call order).                                       -#}
+{%- if thinking is not defined %}{% set thinking = false %}{% endif -%}
+{%- if drop_thinking is not defined %}{% set drop_thinking = true %}{% endif -%}
+{%- if reasoning_effort is not defined %}{% set reasoning_effort = none %}{% endif -%}
+{%- set dsml_token = "｜DSML｜" -%}
+{%- set thinking_start_token = "<think>" -%}
+{%- set thinking_end_token = "</think>" -%}
+{%- set eos_token = "<｜end▁of▁sentence｜>" -%}
+{%- set tool_calls_block_name = "tool_calls" -%}
+
+{#- V4: if tools are present, never drop thinking (matches effective_drop_thinking logic) -#}
+{%- if tools is defined and tools is not none -%}
+  {%- set effective_drop_thinking = false -%}
+{%- else -%}
+  {%- set effective_drop_thinking = drop_thinking -%}
+{%- endif -%}
+
+{#- Identify last user/developer index -#}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+  {%- if message["role"] in ["user", "developer"] -%}
+    {%- set ns.last_user = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- Build system prompt (concatenate all system messages) -#}
+{%- set sp = namespace(text="") -%}
+{%- for message in messages -%}
+  {%- if message["role"] == "system" -%}
+    {%- if sp.text -%}
+      {%- set sp.text = sp.text + "\n\n" + (message["content"] or "") -%}
+    {%- else -%}
+      {%- set sp.text = (message["content"] or "") -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- Tools block if provided globally -#}
+{%- if tools is defined and tools is not none -%}
+  {%- set tool_ns = namespace(text="") -%}
+  {%- for tool in tools -%}
+    {%- set t = tool["function"] if tool.get("function") else tool -%}
+    {%- if loop.first -%}
+      {%- set tool_ns.text = tool_ns.text + (t | tojson) -%}
+    {%- else -%}
+      {%- set tool_ns.text = tool_ns.text + "\n" + (t | tojson) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set tools_block -%}
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{{ dsml_token }}tool_calls>" block like the following:
+
+<{{ dsml_token }}tool_calls>
+<{{ dsml_token }}invoke name="$TOOL_NAME">
+<{{ dsml_token }}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{{ dsml_token }}parameter>
+...
+</{{ dsml_token }}invoke>
+<{{ dsml_token }}invoke name="$TOOL_NAME2">
+...
+</{{ dsml_token }}invoke>
+</{{ dsml_token }}tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by {{ thinking_start_token }}), you MUST output your complete reasoning inside {{ thinking_start_token }}...{{ thinking_end_token }} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {{ thinking_end_token }} with tool calls or final response.
+
+### Available Tool Schemas
+
+{{ tool_ns.text }}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+  {%- endset -%}
+  {#- V4 TOOLS_TEMPLATE has a trailing newline from its triple-quoted string -#}
+  {%- set tools_block = tools_block + "\n" -%}
+  {%- if sp.text -%}
+    {%- set sp.text = sp.text + "\n\n" + tools_block -%}
+  {%- else -%}
+    {%- set sp.text = "\n\n" + tools_block -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Response format on system messages -#}
+{%- for message in messages -%}
+  {%- if message["role"] == "system" and message.get("response_format") -%}
+    {%- set sp.text = sp.text + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- Emit BOS, optional reasoning effort prefix, and system prompt -#}
+{%- if thinking and reasoning_effort == "max" -%}
+{{- bos_token }}Reasoning Effort: Absolute maximum with no shortcuts permitted.
+You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
+Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.
+
+{{ sp.text -}}
+{%- else -%}
+{{- bos_token }}{{ sp.text -}}
+{%- endif -%}
+{#- Render messages -#}
+{%- for message in messages -%}
+  {%- set idx = loop.index0 -%}
+  {%- set role = message["role"] -%}
+  {%- set content = message.get("content", "") if message.get("content") is not none else "" -%}
+
+  {#- V4 _drop_thinking_messages: developer messages before last user are dropped entirely -#}
+  {%- if role == "developer" and thinking and effective_drop_thinking and idx < ns.last_user -%}
+    {#- skip -#}
+
+  {%- elif role == "developer" -%}
+    {#- V4 transition: only add <Assistant> + thinking token when next msg is assistant or this is the last msg -#}
+    {%- set needs_transition = loop.last or messages[idx + 1]["role"] == "assistant" -%}
+    {%- set dev_content = content -%}
+    {%- if message.get("response_format") -%}
+      {%- set dev_content = dev_content + "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" + (message["response_format"] | tojson) -%}
+    {%- endif -%}
+    {{- "<｜User｜>" + dev_content -}}
+    {%- if needs_transition -%}
+      {{- "<｜Assistant｜>" -}}
+      {%- if not effective_drop_thinking and thinking -%}
+        {{- thinking_start_token -}}
+      {%- elif effective_drop_thinking and thinking and idx >= ns.last_user -%}
+        {{- thinking_start_token -}}
+      {%- else -%}
+        {{- thinking_end_token -}}
+      {%- endif -%}
+    {%- endif -%}
+
+  {%- elif role == "user" -%}
+    {#- V4: if previous message was tool, this user is merged into the tool's <User> turn -#}
+    {%- set prev_was_tool = idx > 0 and messages[idx - 1]["role"] == "tool" -%}
+    {%- set needs_transition = loop.last or messages[idx + 1]["role"] == "assistant" -%}
+    {%- if prev_was_tool -%}
+      {{- "\n\n" + content -}}
+    {%- else -%}
+      {{- "<｜User｜>" + content -}}
+    {%- endif -%}
+    {%- if needs_transition -%}
+      {{- "<｜Assistant｜>" -}}
+      {%- if not effective_drop_thinking and thinking -%}
+        {{- thinking_start_token -}}
+      {%- elif effective_drop_thinking and thinking and idx >= ns.last_user -%}
+        {{- thinking_start_token -}}
+      {%- else -%}
+        {{- thinking_end_token -}}
+      {%- endif -%}
+    {%- endif -%}
+
+  {%- elif role == "assistant" -%}
+    {#- V4 thinking: emit reasoning + </think> when thinking is active and not dropped.  -#}
+    {#- The encoder always emits (reasoning_content or "") + </think> in this case,      -#}
+    {#- even when reasoning_content is empty, so the </think> must appear unconditionally -#}
+    {%- if thinking and (not effective_drop_thinking or idx > ns.last_user) -%}
+      {{- (message.get("reasoning_content", "") or "") + thinking_end_token -}}
+    {%- endif -%}
+    {{- content -}}
+    {%- if message.get("tool_calls") -%}
+      {%- set tc = namespace(first=true) -%}
+      {%- for tool in message["tool_calls"] -%}
+        {%- set func = tool["function"] -%}
+        {%- set tool_name = func["name"] -%}
+        {%- set raw_args = func["arguments"] -%}
+        {%- set param_ns = namespace(text="") -%}
+        {%- if raw_args is mapping -%}
+          {%- set parsed = raw_args -%}
+        {%- elif raw_args is string -%}
+          {#- Match encoder: try JSON parse, fall back to {"arguments": raw} on failure. -#}
+          {#- Jinja has no try/except, so strip whitespace and check for object shape.   -#}
+          {%- set trimmed = raw_args.strip() -%}
+          {%- if trimmed[:1] == "{" and trimmed[-1:] == "}" -%}
+            {%- set parsed = trimmed | from_json -%}
+          {%- else -%}
+            {%- set parsed = {"arguments": raw_args} -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set parsed = {} -%}
+        {%- endif -%}
+        {%- for k,v in parsed.items() -%}
+          {%- set is_str = "true" if v is string else "false" -%}
+          {%- if v is string -%}
+            {%- set val = v -%}
+          {%- else -%}
+            {%- set val = v | tojson -%}
+          {%- endif -%}
+          {%- set piece = "<" + dsml_token + "parameter name=\"" + k + "\" string=\"" + is_str + "\">" + val + "</" + dsml_token + "parameter>" -%}
+          {%- if loop.first -%}
+            {%- set param_ns.text = piece -%}
+          {%- else -%}
+            {%- set param_ns.text = param_ns.text + "\n" + piece -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set param_block = param_ns.text -%}
+        {%- if tc.first -%}
+          {{- "\n\n<" + dsml_token + tool_calls_block_name + ">\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" -}}
+          {%- set tc.first = false -%}
+        {%- else -%}
+          {{- "\n" + "<" + dsml_token + "invoke name=\"" + tool_name + "\">\n" + param_block + "\n</" + dsml_token + "invoke>" -}}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- "\n</" + dsml_token + tool_calls_block_name + ">" -}}
+    {%- endif -%}
+    {{- eos_token -}}
+
+  {%- elif role == "tool" -%}
+    {#- V4: tool results become <tool_result> blocks inside a user turn -#}
+    {%- set is_first_tool = idx == 0 or messages[idx - 1]["role"] != "tool" -%}
+    {%- set is_last_tool = loop.last or messages[idx + 1]["role"] != "tool" -%}
+    {%- if is_first_tool -%}
+      {{- "<｜User｜><tool_result>" + content + "</tool_result>" -}}
+    {%- else -%}
+      {{- "\n\n<tool_result>" + content + "</tool_result>" -}}
+    {%- endif -%}
+    {%- if is_last_tool -%}
+      {#- If the next message is a user message, don't close — it will merge -#}
+      {%- if not loop.last and messages[idx + 1]["role"] == "user" -%}
+        {#- Leave open for user content to merge via \n\n -#}
+      {%- else -%}
+        {{- "<｜Assistant｜>" -}}
+        {%- if not effective_drop_thinking and thinking -%}
+          {{- thinking_start_token -}}
+        {%- elif effective_drop_thinking and thinking and idx >= ns.last_user -%}
+          {{- thinking_start_token -}}
+        {%- else -%}
+          {{- thinking_end_token -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
