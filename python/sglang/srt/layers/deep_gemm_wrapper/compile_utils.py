@@ -1,7 +1,7 @@
 import gc
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
 
@@ -12,8 +12,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
+
+_is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -501,8 +504,17 @@ def _compute_deepseek_shapes(config: dict, tp: int, attn_tp: int):
     return shapes
 
 
-@contextmanager
 def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    if _is_musa:
+        return nullcontext()
+
+    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
+
+
+@contextmanager
+def _deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     if m > 0:
