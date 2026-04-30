@@ -920,11 +920,15 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     def _cache_commit_len(self) -> int:
+        # Overlap scheduling can pre-allocate one decode slot before the
+        # previous result marks a request finished. Only accepted tokens are
+        # committed; the lookahead slot must remain overallocated and be freed.
+        commit_len = min(self.kv_committed_len, self.seqlen)
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            return min(commit_len, len(self.origin_input_ids))
+        return commit_len
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
