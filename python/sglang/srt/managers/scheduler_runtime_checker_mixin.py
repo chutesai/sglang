@@ -512,6 +512,43 @@ class SchedulerRuntimeCheckerMixin:
                 f"[Leak Diagnosis] leaked indices (first 50): {sorted_leaked[:50]}"
             )
 
+        # Scan req_to_token to find which request slots still reference leaked indices
+        if leaked:
+            leaked_tensor = torch.tensor(sorted(leaked), dtype=torch.int32, device="cpu")
+            req_to_token = self.req_to_token_pool.req_to_token.cpu()
+            free_req_slots = set(self.req_to_token_pool.free_slots)
+            for slot_idx in range(self.req_to_token_pool.size):
+                if slot_idx in free_req_slots:
+                    continue
+                row = req_to_token[slot_idx]
+                # Check if any leaked index appears in this row
+                matches = torch.isin(row, leaked_tensor)
+                if matches.any():
+                    positions = matches.nonzero(as_tuple=True)[0].tolist()
+                    logger.warning(
+                        f"[Leak Diagnosis] req_pool_idx={slot_idx} holds "
+                        f"{len(positions)} leaked indices at positions "
+                        f"{positions[:20]}{'...' if len(positions) > 20 else ''}"
+                    )
+            # Also check if leaked indices appear in FREE req slots (stale data)
+            stale_count = 0
+            for slot_idx in free_req_slots:
+                row = req_to_token[slot_idx]
+                matches = torch.isin(row, leaked_tensor)
+                if matches.any():
+                    stale_count += 1
+                    if stale_count <= 3:
+                        positions = matches.nonzero(as_tuple=True)[0].tolist()
+                        logger.warning(
+                            f"[Leak Diagnosis] FREE req_pool_idx={slot_idx} has "
+                            f"stale leaked indices at positions "
+                            f"{positions[:20]}{'...' if len(positions) > 20 else ''}"
+                        )
+            if stale_count > 3:
+                logger.warning(
+                    f"[Leak Diagnosis] {stale_count} total FREE slots have stale leaked indices"
+                )
+
     def _check_all_pools(
         self: Scheduler, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:
