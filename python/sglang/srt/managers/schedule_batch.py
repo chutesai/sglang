@@ -2384,6 +2384,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
+        keep_indices_set = set(keep_indices)
+        for i, req in enumerate(self.reqs):
+            if (
+                i not in keep_indices_set
+                and req.finished()
+                and not req.is_retracted
+                and req.req_pool_idx is not None
+            ):
+                release_kv_cache(req, self.tree_cache)
+
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
