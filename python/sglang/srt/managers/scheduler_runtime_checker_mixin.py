@@ -458,12 +458,59 @@ class SchedulerRuntimeCheckerMixin:
 
     def _report_leak(self: Scheduler, pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"
+
+        # One-shot diagnostic: dump exactly which indices are leaked
+        if not getattr(self, "_leak_diagnosed", False):
+            self._leak_diagnosed = True
+            try:
+                self._diagnose_pool_leak()
+            except Exception as e:
+                logger.warning(f"Leak diagnosis failed: {e}")
+
         raise_error_or_warn(
             self,
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
             "count_memory_leak_warnings",
             msg,
         )
+
+    def _diagnose_pool_leak(self: Scheduler):
+        """One-shot diagnostic to identify exactly which KV indices are leaked."""
+        import torch
+
+        alloc = self.token_to_kv_pool_allocator
+        total_size = alloc.size
+        expected = set(range(1, total_size + 1))
+
+        # Indices the allocator thinks are free
+        free_indices = set(alloc.free_pages.tolist())
+        release_indices = set(alloc.release_pages.tolist())
+        allocator_free = free_indices | release_indices
+
+        # Indices the radix tree thinks it holds
+        try:
+            tree_indices = set(self.tree_cache.all_values_flatten().tolist())
+        except Exception:
+            tree_indices = set()
+
+        accounted = allocator_free | tree_indices
+        leaked = expected - accounted
+        double_counted = allocator_free & tree_indices
+
+        logger.warning(
+            f"[Leak Diagnosis] total_slots={total_size}, "
+            f"allocator_free={len(allocator_free)} "
+            f"(free_pages={len(free_indices)}, release_pages={len(release_indices)}), "
+            f"tree_held={len(tree_indices)}, "
+            f"leaked={len(leaked)}, double_counted={len(double_counted)}"
+        )
+        if leaked and len(leaked) <= 50:
+            logger.warning(f"[Leak Diagnosis] leaked indices: {sorted(leaked)}")
+        elif leaked:
+            sorted_leaked = sorted(leaked)
+            logger.warning(
+                f"[Leak Diagnosis] leaked indices (first 50): {sorted_leaked[:50]}"
+            )
 
     def _check_all_pools(
         self: Scheduler, ps: PoolStats, uncached: int = 0
