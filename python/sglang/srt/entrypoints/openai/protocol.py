@@ -653,9 +653,10 @@ class ChatCompletionRequest(BaseModel):
         "Also includes template_sha256 and prompt_sha256 hashes.",
     )
 
-    # SGLang multimodal tiling controls (extensions)
+    # SGLang multimodal controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    use_audio_in_video: bool = False
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
