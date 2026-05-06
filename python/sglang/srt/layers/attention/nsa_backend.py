@@ -647,6 +647,9 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                # deep_gemm requires 2D context_lens [batch, next_n]
+                if seqlens_32.dim() == 1:
+                    seqlens_32 = seqlens_32.unsqueeze(1)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
@@ -932,6 +935,9 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                # deep_gemm requires 2D context_lens [batch, next_n]
+                if seqlens_32.dim() == 1:
+                    seqlens_32 = seqlens_32.unsqueeze(1)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
@@ -969,6 +975,7 @@ class NativeSparseAttnBackend(
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
@@ -1081,6 +1088,9 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
+                # deep_gemm requires 2D context_lens [batch, next_n]
+                if seqlens_32.dim() == 1:
+                    seqlens_32 = seqlens_32.unsqueeze(1)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )

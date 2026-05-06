@@ -35,3 +35,6 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             "<tool_calls",
             "<｜dsml｜tool_calls",
         ]
+
+    def get_structural_tag_name(self) -> str:
+        return "deepseek_v4"
