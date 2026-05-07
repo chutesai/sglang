@@ -74,7 +74,15 @@ fp4_quantize = None
 try:
     if is_sm120_supported():
         try:
-            from flashinfer import fp4_quantize
+            from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
+
+            # Wrap flashinfer's fp4_quantize to prevent torch.compile/Dynamo from
+            # tracing into its lazy JIT module loading code, which calls
+            # subprocess.run and threading.Lock() that Dynamo cannot handle.
+            @torch.compiler.disable
+            def fp4_quantize(x, scale):
+                return _flashinfer_fp4_quantize(x, scale)
+
         except ImportError:
             from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
     else:
