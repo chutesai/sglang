@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
 import torch
@@ -71,18 +71,13 @@ if TYPE_CHECKING:
     from sglang.srt.models.utils import WeightsMapper
 
 fp4_quantize = None
+_raw_flashinfer_fp4_quantize = None
 try:
     if is_sm120_supported():
         try:
-            from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
+            from flashinfer import fp4_quantize as _raw_flashinfer_fp4_quantize
 
-            # Wrap flashinfer's fp4_quantize to prevent torch.compile/Dynamo from
-            # tracing into its lazy JIT module loading code, which calls
-            # subprocess.run and threading.Lock() that Dynamo cannot handle.
-            @torch.compiler.disable
-            def fp4_quantize(x, scale):
-                return _flashinfer_fp4_quantize(x, scale)
-
+            fp4_quantize = _raw_flashinfer_fp4_quantize
         except ImportError:
             from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
     else:
@@ -175,6 +170,31 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
         output, input, output_scale, input_global_scale
     ):
         return
+
+
+# Wrap flashinfer's fp4_quantize as a custom op so torch.compile/Dynamo treats
+# it as an opaque node rather than tracing into its lazy JIT module loading code
+# (which calls subprocess.run and threading.Lock() that Dynamo cannot handle).
+if _raw_flashinfer_fp4_quantize is not None:
+
+    def _flashinfer_fp4_quantize_fake(
+        input: torch.Tensor, input_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        M, N = input.shape
+        x_q = torch.empty(M, N // 2, dtype=torch.uint8, device=input.device)
+        sf = torch.empty(M, N // 16, dtype=torch.uint8, device=input.device)
+        return x_q, sf
+
+    @register_custom_op(
+        op_name="flashinfer_fp4_quantize",
+        fake_impl=_flashinfer_fp4_quantize_fake,
+    )
+    def _flashinfer_fp4_quantize_op(
+        input: torch.Tensor, input_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _raw_flashinfer_fp4_quantize(input, input_scale)
+
+    fp4_quantize = _flashinfer_fp4_quantize_op
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
