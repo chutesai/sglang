@@ -108,13 +108,15 @@ def _generate_and_broadcast_key(tp_rank: int) -> bytes:
     if tp_group.world_size == 1:
         return secrets.token_bytes(32)
 
-    key_tensor = torch.zeros(32, dtype=torch.uint8)
+    key_tensor = torch.zeros(32, dtype=torch.uint8, device="cuda")
     if tp_rank == 0:
         key_bytes = secrets.token_bytes(32)
-        key_tensor[:] = torch.frombuffer(bytearray(key_bytes), dtype=torch.uint8)
+        key_tensor.copy_(
+            torch.frombuffer(bytearray(key_bytes), dtype=torch.uint8)
+        )
 
     tp_group.broadcast(key_tensor, src=0)
-    return bytes(key_tensor.tolist())
+    return bytes(key_tensor.cpu().tolist())
 
 
 # ---------------------------------------------------------------------------
