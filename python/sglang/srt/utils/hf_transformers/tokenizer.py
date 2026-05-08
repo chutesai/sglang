@@ -290,16 +290,21 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
 
     raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None
     loaded_pre = type(backend.pre_tokenizer).__name__ if backend.pre_tokenizer else None
+    raw_dec = type(raw.decoder).__name__ if raw.decoder else None
+    loaded_dec = type(backend.decoder).__name__ if backend.decoder else None
 
-    if raw_pre and loaded_pre and raw_pre != loaded_pre:
+    pre_mismatch = raw_pre and loaded_pre and raw_pre != loaded_pre
+    dec_mismatch = raw_dec and loaded_dec and raw_dec != loaded_dec
+
+    if pre_mismatch or dec_mismatch:
         logger.info(
             "Fixing v5 tokenizer component mismatch for %s: "
             "pre_tokenizer %s -> %s, decoder %s -> %s",
             model_name_or_path,
             loaded_pre,
             raw_pre,
-            type(backend.decoder).__name__ if backend.decoder else None,
-            type(raw.decoder).__name__ if raw.decoder else None,
+            loaded_dec,
+            raw_dec,
         )
         backend.pre_tokenizer = raw.pre_tokenizer
         backend.decoder = raw.decoder
@@ -431,6 +436,46 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     return patch_tokenizer(tokenizer)
 
 
+def _tokenizers_backend_components_ok(tokenizer, model_name_or_path, revision=None):
+    """Check if a TokenizersBackend tokenizer already has correct components.
+
+    When transformers v5+ intentionally maps a model to TokenizersBackend
+    (e.g. DeepSeek uses ByteLevel BPE, not Llama-style Metaspace), resolving
+    to the declared class (LlamaTokenizerFast) would break the tokenizer.
+    Returns True if the backend's pre_tokenizer and decoder already match
+    tokenizer.json, meaning we should keep TokenizersBackend as-is.
+    """
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is None:
+        return False
+
+    try:
+        from tokenizers import Tokenizer as RawTokenizer
+
+        tok_file = _resolve_local_or_cached_file(
+            model_name_or_path, "tokenizer.json", revision
+        )
+        raw = RawTokenizer.from_file(tok_file)
+    except (FileNotFoundError, OSError, ValueError, RuntimeError):
+        return False
+
+    raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None
+    loaded_pre = type(backend.pre_tokenizer).__name__ if backend.pre_tokenizer else None
+    raw_dec = type(raw.decoder).__name__ if raw.decoder else None
+    loaded_dec = type(backend.decoder).__name__ if backend.decoder else None
+
+    components_match = (raw_pre == loaded_pre) and (raw_dec == loaded_dec)
+    if components_match:
+        logger.info(
+            "TokenizersBackend for %s already has correct components "
+            "(pre_tokenizer=%s, decoder=%s), skipping class resolution",
+            model_name_or_path,
+            loaded_pre,
+            loaded_dec,
+        )
+    return components_match
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -507,6 +552,9 @@ def get_tokenizer(
         if (
             type(tokenizer).__name__ == _TOKENIZERS_BACKEND
             and tokenizer_backend != "fastokens"
+            and not _tokenizers_backend_components_ok(
+                tokenizer, tokenizer_name, tokenizer_revision
+            )
         ):
             tokenizer = _resolve_tokenizers_backend(
                 tokenizer_name, *args, **common_kwargs

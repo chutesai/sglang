@@ -1239,12 +1239,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         cached_tokens_details=sglext_details,
                     ),
                 )
-                sglext_chunk.chutes_verification = (
-                    get_chutes_verification_value(
-                        sglext_chunk.id,
-                        sglext_chunk.created,
-                        None,
-                    )
+                sglext_chunk.chutes_verification = get_chutes_verification_value(
+                    sglext_chunk.id,
+                    sglext_chunk.created,
+                    None,
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 

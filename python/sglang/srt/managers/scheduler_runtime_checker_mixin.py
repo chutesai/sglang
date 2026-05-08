@@ -522,7 +522,9 @@ class SchedulerRuntimeCheckerMixin:
 
         # Scan req_to_token to find which request slots still reference leaked indices
         if leaked:
-            leaked_tensor = torch.tensor(sorted(leaked), dtype=torch.int32, device="cpu")
+            leaked_tensor = torch.tensor(
+                sorted(leaked), dtype=torch.int32, device="cpu"
+            )
             req_to_token = self.req_to_token_pool.req_to_token.cpu()
             free_req_slots = set(self.req_to_token_pool.free_slots)
             for slot_idx in range(self.req_to_token_pool.size):

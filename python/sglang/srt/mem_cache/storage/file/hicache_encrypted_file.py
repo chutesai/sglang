@@ -101,7 +101,21 @@ def _decrypt_into(aesgcm, blob: bytes, aad: bytes, target: torch.Tensor) -> None
 
 
 def _generate_and_broadcast_key(tp_rank: int) -> bytes:
-    """Rank 0 generates a 32-byte key; all TP ranks receive it via broadcast."""
+    """Generate or broadcast a 32-byte AES key across the attention TP group.
+
+    In DP-attention mode each scheduler process is its own attention TP group
+    (size 1), so each generates an independent key — no broadcast needed.
+    In normal TP mode, rank 0 generates and broadcasts to the full TP group.
+    """
+    try:
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        if is_dp_attention_enabled():
+            # Each DP-attention worker is independent; no shared key needed.
+            return secrets.token_bytes(32)
+    except ImportError:
+        pass
+
     from sglang.srt.distributed.parallel_state import get_tp_group
 
     tp_group = get_tp_group()
@@ -111,9 +125,7 @@ def _generate_and_broadcast_key(tp_rank: int) -> bytes:
     key_tensor = torch.zeros(32, dtype=torch.uint8, device="cuda")
     if tp_rank == 0:
         key_bytes = secrets.token_bytes(32)
-        key_tensor.copy_(
-            torch.frombuffer(bytearray(key_bytes), dtype=torch.uint8)
-        )
+        key_tensor.copy_(torch.frombuffer(bytearray(key_bytes), dtype=torch.uint8))
 
     tp_group.broadcast(key_tensor, src=0)
     return bytes(key_tensor.cpu().tolist())
@@ -125,11 +137,13 @@ def _generate_and_broadcast_key(tp_rank: int) -> bytes:
 
 
 def _compute_group_dir(storage_config: HiCacheStorageConfig) -> str:
-    """Return a subdirectory name unique to this TP group.
+    """Return a subdirectory name unique to this storage writer group.
 
-    Uses the TP group's first global rank as the identifier.  This is unique
-    per group regardless of the parallelism topology (PP, DP, DP-attention,
-    EP, etc.) and identical across all ranks within the group.
+    Uses the TP group's first global rank as the base identifier, then
+    appends the DP-attention rank when DP-attention is enabled.  In
+    DP-attention mode all ranks share one TP group (for MoE/FFN) but each
+    DP-attention rank runs its own cache controller and must write to its
+    own isolated directory.
     """
     from sglang.srt.distributed.parallel_state import get_tp_group
 
@@ -138,7 +152,20 @@ def _compute_group_dir(storage_config: HiCacheStorageConfig) -> str:
 
     model_name = storage_config.model_name or ""
     model_name_safe = "-".join(model_name.split("/"))
-    return f"{model_name_safe}_g{group_id}"
+    dir_name = f"{model_name_safe}_g{group_id}"
+
+    try:
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            is_dp_attention_enabled,
+        )
+
+        if is_dp_attention_enabled():
+            dir_name += f"_dp{get_attention_dp_rank()}"
+    except ImportError:
+        pass
+
+    return dir_name
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +214,7 @@ class _LRUIndex:
 
             evicted: list[str] = []
             if self._capacity_bytes > 0:
-                overshoot = (
-                    self._total_bytes + estimated_size
-                ) - self._capacity_bytes
+                overshoot = (self._total_bytes + estimated_size) - self._capacity_bytes
                 if overshoot > 0:
                     evicted = self._evict_locked(overshoot)
 
@@ -261,13 +286,9 @@ class HiCacheEncryptedFile(HiCacheStorage):
         enable_pp = storage_config.pp_size > 1
         self.config_suffix = f"_{model_name_safe}"
         if not self._is_mla:
-            self.config_suffix += (
-                f"_{storage_config.tp_rank}_{storage_config.tp_size}"
-            )
+            self.config_suffix += f"_{storage_config.tp_rank}_{storage_config.tp_size}"
         if enable_pp:
-            self.config_suffix += (
-                f"_{storage_config.pp_size}_{storage_config.pp_rank}"
-            )
+            self.config_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
 
         # --- Coordinated startup: rank 0 purges, then broadcast syncs all ---
         if self._tp_rank == 0:
@@ -280,9 +301,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
         if self._tp_rank != 0:
             os.makedirs(self.file_path, exist_ok=True)
             for i in range(256):
-                os.makedirs(
-                    os.path.join(self.file_path, f"{i:02x}"), exist_ok=True
-                )
+                os.makedirs(os.path.join(self.file_path, f"{i:02x}"), exist_ok=True)
 
         # Capacity (per-group budget, divided among writers).
         cap_gb = float(os.environ.get("SGLANG_HICACHE_DISK_CAPACITY_GB", "0"))
@@ -339,9 +358,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
-    def _get_component_key(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
+    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
@@ -353,9 +370,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return self._path_for_suffixed_key(
-            self._get_component_key(key, component_name)
-        )
+        return self._path_for_suffixed_key(self._get_component_key(key, component_name))
 
     def _ensure_shard_dir(self, path: str) -> None:
         d = os.path.dirname(path)
@@ -416,9 +431,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
         try:
             with open(path, "rb") as f:
                 blob = f.read()
-            _decrypt_into(
-                self._aesgcm, blob, self._make_aad(suffixed), target_location
-            )
+            _decrypt_into(self._aesgcm, blob, self._make_aad(suffixed), target_location)
             self._index.touch(suffixed)
             return target_location
         except FileNotFoundError:
@@ -526,8 +539,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
 
         def has_component(page_idx: int, name: str) -> bool:
             return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin"
-                in existing_files
+                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
             )
 
         kv_pages = next(
@@ -557,9 +569,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         has_component(i, name)
-                        for i in range(
-                            max(0, prefix_len - trailing), prefix_len
-                        )
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
                         boundary = prefix_len
                         break
@@ -572,9 +582,7 @@ class HiCacheEncryptedFile(HiCacheStorage):
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
 
-    def _read_page(
-        self, pool_name: str, key: str, host_pool, page_offset: int
-    ) -> bool:
+    def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         storage_key = self._log_key(pool_name, key)
         data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
         if data_page is None:

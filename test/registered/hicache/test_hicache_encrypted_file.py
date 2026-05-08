@@ -379,9 +379,7 @@ class TestMLAExistsFallback(unittest.TestCase):
 
         if global_ranks is None:
             global_ranks = list(range(tp_size))
-        config = _make_config(
-            tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla
-        )
+        config = _make_config(tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla)
         group = _mock_tp_group(world_size=tp_size, ranks=global_ranks)
 
         with patch(
@@ -660,8 +658,9 @@ class TestMultiRankStartup(unittest.TestCase):
         b1 = self._make_backend(tp_rank=0, tp_size=1, global_ranks=[0])
         b2 = self._make_backend(tp_rank=0, tp_size=1, global_ranks=[1])
         self.assertNotEqual(
-            b1.file_path, b2.file_path,
-            "PP groups with different global ranks must have different dirs"
+            b1.file_path,
+            b2.file_path,
+            "PP groups with different global ranks must have different dirs",
         )
 
     def test_non_rank0_creates_dirs_too(self):
