@@ -5869,6 +5869,7 @@ class ServerArgs:
             type=str,
             choices=[
                 "file",
+                "encrypted_file",
                 "mooncake",
                 "hf3fs",
                 "nixl",
@@ -5880,6 +5881,7 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
+            "encrypted_file: AES-256-GCM encrypted file backend (requires pip install 'sglang[encrypted-cache]'). "
             "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
             "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
         )

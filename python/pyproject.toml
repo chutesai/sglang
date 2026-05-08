@@ -90,6 +90,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+encrypted-cache = ["cryptography>=42.0"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "PyYAML==6.0.1",
