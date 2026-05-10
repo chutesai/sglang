@@ -216,6 +216,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -1160,17 +1161,14 @@ class Scheduler(
                     dp_size=self.dp_size,
                     attn_tp_size=self.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
+                    device_group=self.tp_group.device_group,
                     server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector if self.enable_metrics else None
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    device=(
-                        self.tp_group.device
-                        if self.server_args.disable_overlap_schedule
-                        else "cpu"
-                    ),
+                    device=self.tp_group.device,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -1233,6 +1231,11 @@ class Scheduler(
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        # Default to the target model_config so the MetadataBuffers branches
+        # below can always access it; overridden by the draft model_config
+        # when this node runs a spec module.
+        if model_config is None:
+            model_config = self.model_config
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -2481,17 +2484,14 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # output_ids = last generated token, used as input_ids by prepare_for_decode
         batch.output_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
 
-        # Set logprob fields if any request needs them
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        # Build sampling info from scratch for these requests
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
@@ -2709,6 +2709,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            waiting_queue_len=len(self.waiting_queue),
         )
 
         if self.chunked_req is not None:
@@ -3013,16 +3014,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
-
-        # Capture prefill start time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
-            set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
@@ -3136,10 +3134,6 @@ class Scheduler(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
-
-        # Capture prefill end time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
-            set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
         if (
             self.server_args.enable_dp_attention
@@ -3449,7 +3443,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
-        """Flush the memory pool and cache."""
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
@@ -3463,7 +3457,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                torch.cuda.empty_cache()
+                empty_device_cache(self.device_module)
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3581,8 +3575,6 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3716,6 +3708,15 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if recv_req.torch_empty_cache:
+            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            torch.cuda.empty_cache()
+            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            logger.info(
+                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"(freed {before_mb - after_mb:.1f} MB)"
+            )
         self._engine_paused = False
 
     def load_lora_adapter(
@@ -3852,7 +3853,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
 
 def is_health_check_generate_req(recv_req):

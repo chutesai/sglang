@@ -3,8 +3,6 @@ import logging
 import re
 from typing import List
 
-from json_repair import repair_json
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -37,11 +35,16 @@ class KimiK2Detector(BaseFormatDetector):
     """
     Detector for Kimi K2 / K2.5 model function call format.
 
-    Format Structure:
+    Format Structure (standard):
     ```
     <|tool_calls_section_begin|>
     <|tool_call_begin|>functions.{func_name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     <|tool_calls_section_end|>
+    ```
+
+    Format Structure (bare counter — model omits function name):
+    ```
+    <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
 
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
@@ -57,26 +60,96 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_end_token: str = "<|tool_call_end|>"
         self.tool_call_argument_begin_token: str = "<|tool_call_argument_begin|>"
 
-        # Support hyphenated function names (common in MCP tools, e.g. mcp__portal__search-documents)
+        # Capture tool_call_id broadly: the model may emit standard IDs
+        # like "functions.ReadFile:0" or bare call counters like "3".
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*"
-            r"(?P<tool_call_id>(?:functions\.)?(?P<function_name>[\w\.\-]+):(?P<function_idx>\d+))\s*"
-            r"<\|tool_call_argument_begin\|>\s*"
-            r"(?P<function_arguments>\{.*?\})\s*"
-            r"(?:<\|tool_call_end\|>|"
-            r"<\|tool_call_begin\|>|"
-            r"<\|tool_calls_section_end\|>|$)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
             re.DOTALL,
         )
+
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*"
-            r"(?P<tool_call_id>(?:functions\.)?(?P<function_name>[\w\.\-]+):(?P<function_idx>\d+))\s*"
-            r"<\|tool_call_argument_begin\|>\s*"
-            r"(?P<function_arguments>\s*\{.*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
             re.DOTALL,
         )
 
         self._last_arguments = ""
+        self._current_stream_function_name: str | None = None
+
+        # Standard ID: "functions.search:0", "search:0"
+        self.tool_call_id_regex = re.compile(
+            r"^(?:functions\.)?(?P<name>[\w.\-]+):(?P<index>\d+)$"
+        )
+        # Bare call counter: "0", "3" (model uses auto-incrementing counter)
+        self.tool_call_id_counter_regex = re.compile(r"^\d+$")
+
+    def _parse_tool_call_id(
+        self, function_id: str, tools: List[Tool], function_args: str = None
+    ):
+        """Parse a tool call ID into (function_name, call_index).
+
+        Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
+        Bare counter:    "3" → call_index=3, infer name from arguments.
+
+        The bare counter is a conversation-level auto-increment, NOT an index
+        into the tools list. The function name is inferred by matching argument
+        keys against tool parameter schemas.
+        """
+        m = self.tool_call_id_regex.match(function_id)
+        if m:
+            return m.group("name"), int(m.group("index"))
+
+        if self.tool_call_id_counter_regex.match(function_id):
+            call_index = int(function_id)
+            name = self._infer_tool_name(tools, function_args)
+            if name:
+                return name, call_index
+            return None, call_index
+
+        logger.warning("Unexpected tool_call_id format: %s", function_id)
+        return None, 0
+
+    def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
+        """Infer function name when the model omits it (bare counter ID).
+
+        Matches argument keys against tool parameter schemas, preferring the
+        tool whose declared properties best match the actual arguments.
+        """
+        if not tools:
+            return None
+        if len(tools) == 1:
+            return tools[0].function.name
+
+        if not function_args:
+            logger.debug(
+                "No function_args for tool name inference with %d tools", len(tools)
+            )
+            return None
+
+        try:
+            arg_keys = set(json.loads(function_args).keys())
+        except (json.JSONDecodeError, TypeError):
+            logger.debug(
+                "Could not parse function_args for tool name inference "
+                "(may be partial JSON in streaming)"
+            )
+            return None
+
+        # Pick the tool whose properties best match the argument keys.
+        best_name = None
+        best_score = -1
+        for tool in tools:
+            params = tool.function.parameters or {}
+            props = set(params.get("properties", {}).keys())
+            if not props:
+                continue
+            overlap = len(arg_keys & props)
+            extra = len(arg_keys - props)
+            score = overlap - extra
+            if score > best_score:
+                best_score = score
+                best_name = tool.function.name
+
+        return best_name
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -84,66 +157,43 @@ class KimiK2Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
-        One-time parsing with fallback for incomplete tool calls.
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: StreamingParseResult with normal_text (content before tool calls) and calls (parsed items).
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
-
         try:
+            function_call_tuples = self.tool_call_regex.findall(text)
+
+            logger.debug("function_call_tuples: %s", function_call_tuples)
+
             tool_calls = []
-            tool_indices = self._get_tool_indices(tools)
-
-            # Match each tool call individually, both complete and incomplete
-            for match in self.tool_call_regex.finditer(text):
-                function_id = match.group("tool_call_id").strip()
-                function_args = match.group("function_arguments").strip()
-                function_name = match.group("function_name").strip()
-                function_idx = match.group("function_idx").strip()
-
-                if function_name not in tool_indices:
-                    logger.warning(
-                        "Model attempted to call undefined function",
-                    )
+            for match in function_call_tuples:
+                function_id, function_args = match
+                function_name, function_idx = self._parse_tool_call_id(
+                    function_id, tools, function_args
+                )
+                if function_name is None:
                     continue
 
-                # Validate JSON
-                try:
-                    json.loads(function_args)
-                    tool_calls.append(
-                        ToolCallItem(
-                            tool_index=function_idx,
-                            name=function_name,
-                            parameters=function_args,
-                        )
+                logger.debug(f"function_name {function_name}")
+
+                tool_calls.append(
+                    ToolCallItem(
+                        tool_index=function_idx,
+                        name=function_name,
+                        parameters=function_args,
                     )
-                except Exception:
-                    try:
-                        repaired = repair_json(function_args)
-                        if repaired:
-                            json.loads(repaired)
-                            tool_calls.append(
-                                ToolCallItem(
-                                    tool_index=function_idx,
-                                    name=function_name,
-                                    parameters=repaired,
-                                )
-                            )
-                        else:
-                            logger.error(
-                                "Invalid JSON in tool call (%d chars) and failed to repair",
-                                len(function_args),
-                            )
-                    except Exception:
-                        logger.error(
-                            "Invalid JSON in tool call (%d chars), repaired JSON also invalid",
-                            len(function_args),
-                        )
+                )
 
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)
 
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
+            logger.error("Error in detect_and_parse: %s", e, exc_info=True)
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
@@ -174,18 +224,17 @@ class KimiK2Detector(BaseFormatDetector):
             if match:
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
-                function_name = match.group("function_name")
-                if function_name not in self._tool_indices:
-                    logger.warning(
-                        "Model attempted to call undefined function",
+
+                # Reuse cached name for current tool call to avoid repeated
+                # json.loads on partial JSON in _infer_tool_name.
+                if self._current_stream_function_name is not None:
+                    function_name = self._current_stream_function_name
+                else:
+                    function_name, _ = self._parse_tool_call_id(
+                        function_id, tools, function_args
                     )
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = []
-                    self._last_arguments = ""
-                    self.current_tool_name_sent = False
-                    return StreamingParseResult(normal_text="", calls=[])
+                if function_name is None:
+                    return StreamingParseResult(normal_text="", calls=calls)
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -208,6 +257,7 @@ class KimiK2Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
+                    self._current_stream_function_name = function_name
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": function_name,
                         "arguments": {},
@@ -262,12 +312,13 @@ class KimiK2Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
+                        self._current_stream_function_name = None
                         return result
 
             return StreamingParseResult(normal_text="", calls=calls)
 
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
+            logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
 
     def structure_info(self) -> _GetInfoFunc:

@@ -180,13 +180,30 @@ def _compile_deep_gemm_one_type_all(
             logger.info(
                 f"Compiled {num_unique} unique kernels for {kernel_name} N={n} K={k}"
             )
-        else:
-            logger.warning(
-                "deep_gemm.warmup_kernels not available, "
-                "falling back to legacy per-M warmup. "
-                "Update DeepGEMM for faster warmup."
-            )
-            _compile_deep_gemm_legacy(kernel_type, n, k, num_groups, m_list)
+            m_list = [m for m in m_list if m <= max_m]
+
+        # Need some methods to estimate needed memory for warmup
+        executor = _BaseWarmupExecutor.create(
+            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
+
+        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+            deep_gemm, "set_compile_mode"
+        )
+        if has_compile_mode_api:
+            old_compile_mode = deep_gemm.get_compile_mode()
+            deep_gemm.set_compile_mode(1)
+
+        # TODO can use multi thread
+        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+            executor.execute(m=m)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
+
+        # clean up input buffers
+        torch.cuda.current_stream().synchronize()
+        del executor
+        torch.cuda.empty_cache()
     finally:
         # Restore symmetric memory context
         restore_symmetric_memory_context(saved_context)
@@ -434,6 +451,22 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int, server_args) -> None:
         )
 
     logger.info("DeepGEMM precompilation complete")
+
+
+class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            self.m_indices[:m],
+        )
 
 
 def _compute_deepseek_shapes(config: dict, tp: int, attn_tp: int):

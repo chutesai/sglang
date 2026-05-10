@@ -139,10 +139,6 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # Embedding overrides to place at specific token positions.
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
-    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
-    positional_embed_overrides: Any = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -195,6 +191,10 @@ class GenerateReqInput(BaseReq):
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    # Embedding overrides to place at specific token positions.
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    positional_embed_overrides: Any = None
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -1378,7 +1378,26 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
+    # cached by the PyTorch allocator (left over from transient allocs
+    # during post-weight-update processing) back to the driver before
+    # inference resumes, with no race against active streams. Set to
+    # False to skip the empty_cache call.
+    torch_empty_cache: bool = True
+
+
+@dataclass
+class TokenizerWorkerRegistration:
+    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+
+    worker_ipc_name: str
+
+
+@dataclass
+class PauseContinueBroadcast:
+    """Broadcast from router to all workers to set is_pause state."""
+
+    is_pause: bool
 
 
 @dataclass
@@ -1393,7 +1412,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously
     is_async: bool = False
-    # Whether to empty torch cache
+    # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
@@ -1625,6 +1644,7 @@ class CheckWeightsReqInput(BaseReq):
 class CheckWeightsReqOutput(BaseReq):
     success: bool
     message: str
+    payload: Optional[Dict] = None
 
 
 @dataclass
@@ -1743,6 +1763,7 @@ class ConfigureLoggingReq(BaseReq):
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @dataclass
