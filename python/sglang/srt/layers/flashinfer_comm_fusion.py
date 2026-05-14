@@ -340,7 +340,6 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
-        self._init_failed = False
 
     def initialize(
         self,
@@ -354,14 +353,10 @@ class FlashInferWorkspaceManager:
         cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
     ):
         """Initialize workspace"""
-        if self._init_failed:
-            return
-
         if _flashinfer_comm is None:
             logger.warning(
                 "FlashInfer comm not available, skipping workspace initialization"
             )
-            self._init_failed = True
             return
 
         self.cleanup()
@@ -414,7 +409,6 @@ class FlashInferWorkspaceManager:
             )
             self.workspace = None
             self.initialized = False
-            self._init_failed = True
             return
 
         self.world_size = world_size

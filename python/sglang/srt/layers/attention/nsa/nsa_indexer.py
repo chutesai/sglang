@@ -474,9 +474,6 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # deep_gemm requires 2D context_lens [batch, next_n]
-        if seqlens_32.dim() == 1:
-            seqlens_32 = seqlens_32.unsqueeze(1)
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)

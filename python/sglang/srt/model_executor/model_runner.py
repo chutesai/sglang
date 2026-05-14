@@ -524,7 +524,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init mindspore running environment when model impl is "mindspore"
         self.init_mindspore_runner()
 
-        # Update deep gemm configure and precompile kernels before model init.
+        # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
