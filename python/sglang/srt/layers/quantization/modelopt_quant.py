@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
@@ -35,7 +37,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_quantize,
+    get_fp4_gemm_runner_backend,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -52,7 +57,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
@@ -69,21 +74,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.models.utils import WeightsMapper
-
-fp4_quantize = None
-_raw_flashinfer_fp4_quantize = None
-try:
-    if is_sm120_supported():
-        try:
-            from flashinfer import fp4_quantize as _raw_flashinfer_fp4_quantize
-
-            fp4_quantize = _raw_flashinfer_fp4_quantize
-        except ImportError:
-            from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
-    else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
-except ImportError:
-    fp4_quantize = None
 
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
@@ -171,30 +161,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
     ):
         return
 
-
-# Wrap flashinfer's fp4_quantize as a custom op so torch.compile/Dynamo treats
-# it as an opaque node rather than tracing into its lazy JIT module loading code
-# (which calls subprocess.run and threading.Lock() that Dynamo cannot handle).
-if _raw_flashinfer_fp4_quantize is not None:
-
-    def _flashinfer_fp4_quantize_fake(
-        input: torch.Tensor, input_scale: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        M, N = input.shape
-        x_q = torch.empty(M, N // 2, dtype=torch.uint8, device=input.device)
-        sf = torch.empty(M, N // 16, dtype=torch.uint8, device=input.device)
-        return x_q, sf
-
-    @register_custom_op(
-        op_name="flashinfer_fp4_quantize",
-        fake_impl=_flashinfer_fp4_quantize_fake,
-    )
-    def _flashinfer_fp4_quantize_op(
-        input: torch.Tensor, input_scale: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _raw_flashinfer_fp4_quantize(input, input_scale)
-
-    fp4_quantize = _flashinfer_fp4_quantize_op
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
@@ -1398,7 +1364,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        # Keep per-shard scales intact for hot reload; derive scalar params below.
+        # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
+        # the [N_partitions] source slot breaks fused-QKV linears whose
+        # downstream kernels assume scalar input scale.
         copy_or_rebind_param(
             layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
         )
@@ -1455,7 +1423,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
+            alias_or_bind_derived_param(
+                layer, "weight_scale", "weight_scale_interleaved", scale
+            )
             copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
             return
@@ -1487,7 +1457,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale_ndim == 2
             else padded_scales.reshape(B, M_padded, K_padded)
         )
-        copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
+        alias_or_bind_derived_param(
+            layer, "weight_scale", "weight_scale_interleaved", padded_scales
+        )
 
     def apply(
         self,
@@ -1737,7 +1709,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1862,6 +1833,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
+            # placeholders from create_weights.
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1890,8 +1865,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            copy_or_rebind_param(
-                layer, "w13_blockscale_swizzled", w13_blockscale_swizzled
+            alias_or_bind_derived_param(
+                layer,
+                "w13_weight_scale",
+                "w13_blockscale_swizzled",
+                w13_blockscale_swizzled,
             )
 
             w13_weight = layer.w13_weight
@@ -1928,8 +1906,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            copy_or_rebind_param(
-                layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
+            alias_or_bind_derived_param(
+                layer,
+                "w2_weight_scale",
+                "w2_blockscale_swizzled",
+                w2_blockscale_swizzled,
             )
 
             if self._is_cutedsl_v2_standard:
