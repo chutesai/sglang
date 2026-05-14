@@ -521,13 +521,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_mindspore_runner()
 
         # Update deep gemm configure and precompile kernels before model init.
-        # Precompilation runs here (before any forward passes) so each TP rank
-        # compiles independently without blocking others in NCCL collectives.
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
-            deep_gemm_wrapper.precompile_deep_gemm_shapes(
-                self.model_config.hf_config, self.tp_size, server_args
-            )
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
