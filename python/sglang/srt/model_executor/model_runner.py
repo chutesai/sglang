@@ -1319,25 +1319,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
-        # Publish metadata to ModelExpress if running as seed source
-        if self.server_args.modelexpress_source:
-            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
-            # call register_memory_region(). Do it here so weight_info is populated.
-            if (
-                self.remote_instance_transfer_engine_weight_info is None
-                and self.remote_instance_transfer_engine is not None
-            ):
-                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-                    register_memory_region,
-                )
-
-                self.remote_instance_transfer_engine_weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_transfer_engine
-                    )
-                )
-            self._publish_modelexpress_metadata()
-
         if not self.is_draft_worker:
             get_offloader().post_init()
 
