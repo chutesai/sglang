@@ -249,10 +249,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
-    # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    # API key authentication is handled by the main server process middleware;
+    # the multi-tokenizer worker does not need to enforce it independently.
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
