@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import regex as re
 import torch
@@ -160,7 +160,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
         output, input, output_scale, input_global_scale
     ):
         return
-
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32

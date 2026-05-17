@@ -171,7 +171,13 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.auth import (
+    AuthLevel,
+    _get_auth_level_from_app_and_scope,
+    app_has_admin_force_endpoints,
+    auth_level,
+    decide_request_auth,
+)
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -215,6 +221,15 @@ async def _init_granian_worker() -> ServerArgs:
         f"multi_tokenizer_args_{main_pid}"
     )
 
+    # Configure API key auth for the lazy middleware.
+    app.state._auth_api_key = server_args.api_key
+    app.state._auth_admin_api_key = server_args.admin_api_key
+    app.state._auth_enabled = bool(
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(app)
+    )
+
     tokenizer_manager = TokenizerManager(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
@@ -249,8 +264,14 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
-    # API key authentication is handled by the main server process middleware;
-    # the multi-tokenizer worker does not need to enforce it independently.
+    # Configure API key auth for the lazy middleware (reads from app.state).
+    app.state._auth_api_key = server_args.api_key
+    app.state._auth_admin_api_key = server_args.admin_api_key
+    app.state._auth_enabled = bool(
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(app)
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -413,6 +434,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class _LazyApiKeyMiddleware:
+    """ASGI middleware that enforces API key auth once keys are configured.
+
+    Added at module level so it is always in the middleware stack (before app
+    startup).  It reads keys lazily from app.state, which is populated during
+    lifespan for multi-tokenizer workers or before uvicorn.run for single-
+    tokenizer mode.  Until keys are configured, all requests pass through.
+    """
+
+    def __init__(self, app_inner):
+        self.app = app_inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        api_key = getattr(app.state, "_auth_api_key", None)
+        admin_api_key = getattr(app.state, "_auth_admin_api_key", None)
+        auth_enabled = getattr(app.state, "_auth_enabled", False)
+
+        if not api_key and not admin_api_key and not auth_enabled:
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.requests import Request
+
+        request = Request(scope, receive=receive)
+        authz = request.headers.get("Authorization")
+        level = _get_auth_level_from_app_and_scope(app, scope)
+        decision = decide_request_auth(
+            method=request.method,
+            path=request.url.path,
+            authorization_header=authz,
+            api_key=api_key,
+            admin_api_key=admin_api_key,
+            auth_level=level,
+        )
+
+        if not decision.allowed:
+            from fastapi.responses import ORJSONResponse
+
+            response = ORJSONResponse(
+                content={
+                    "error": (
+                        "Unauthorized"
+                        if decision.error_status_code == 401
+                        else "Forbidden"
+                    )
+                },
+                status_code=decision.error_status_code,
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_LazyApiKeyMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -2274,25 +2356,15 @@ def _setup_and_run_http_server(
             execute_warmup_func=execute_warmup_func,
         )
 
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
+        # Configure API key auth (the _LazyApiKeyMiddleware added at module level
+        # reads these from app.state at request time).
+        app.state._auth_api_key = server_args.api_key
+        app.state._auth_admin_api_key = server_args.admin_api_key
+        app.state._auth_enabled = bool(
             server_args.api_key
             or server_args.admin_api_key
             or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
-            )
+        )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
