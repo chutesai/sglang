@@ -690,15 +690,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [
-                    await asyncio.to_thread(self.tokenizer.encode, t)
-                    for t in tokenizer_input
-                ]
+                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
                 token_type_ids = None
             else:
-                encoded = await asyncio.to_thread(
-                    self.tokenizer, tokenizer_input, **tokenizer_kwargs
-                )
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
                 input_ids = encoded["input_ids"]
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
