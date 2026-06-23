@@ -1497,8 +1497,11 @@ class OpenAIServingChat(OpenAIServingBase):
             sglext=response_sglext,
         )
         if choices:
+            verification_text = (
+                choices[0].message.content or choices[0].message.reasoning_content
+            )
             chunk.chutes_verification = get_chutes_verification_value(
-                chunk.id, chunk.created, choices[0].message.content
+                chunk.id, chunk.created, verification_text
             )
         return chunk
 
